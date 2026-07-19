@@ -1,0 +1,46 @@
+[project]
+name = "game-assets-api"
+version = "0.1.0"
+description = "Local-first game asset production backend"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+  "alembic>=1.14,<2",
+  "emperor-adapter",
+  "fastapi>=0.116,<1",
+  "httpx>=0.28,<1",
+  "jsonschema>=4.23,<5",
+  "pillow>=11.2,<12",
+  "pydantic-settings>=2.9,<3",
+  "pyyaml>=6.0,<7",
+  "sqlalchemy>=2.0,<3",
+  "uvicorn[standard]>=0.35,<1",
+]
+
+[tool.uv.sources]
+emperor-adapter = { workspace = true }
+
+[dependency-groups]
+dev = [
+  "pytest>=8.4,<9",
+  "pytest-asyncio>=1.0,<2",
+]
+
+[project.scripts]
+game-assets-api = "game_assets_api.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/game_assets_api"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100

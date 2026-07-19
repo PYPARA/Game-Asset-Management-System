@@ -1,0 +1,403 @@
+from __future__ import annotations
+
+import asyncio
+import base64
+import io
+import ipaddress
+import json
+import socket
+from dataclasses import dataclass
+from typing import Any, Protocol
+from urllib.parse import urlparse
+
+import httpx
+import jsonschema
+from PIL import Image, ImageDraw
+
+from .domain import ErrorCategory, ProviderKind
+from .models import ProviderProfile
+
+
+class ProviderError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        category: ErrorCategory = ErrorCategory.UNKNOWN,
+        *,
+        status_code: int | None = None,
+        retry_after: float | None = None,
+        request_id: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.category = category
+        self.status_code = status_code
+        self.retry_after = retry_after
+        self.request_id = request_id
+
+    @property
+    def retryable(self) -> bool:
+        return self.category in {
+            ErrorCategory.RATE_LIMIT,
+            ErrorCategory.SERVER,
+            ErrorCategory.NETWORK,
+            ErrorCategory.EMPTY,
+        }
+
+
+def classify_http_error(status: int, body: str) -> ErrorCategory:
+    lowered = body.lower()
+    if "moderation_blocked" in lowered or "content_policy" in lowered or "safety system" in lowered:
+        return ErrorCategory.CONTENT_POLICY
+    if status in {401, 403}:
+        return ErrorCategory.AUTH
+    if status == 429:
+        if "billing" in lowered or "credit" in lowered or "payment" in lowered:
+            return ErrorCategory.BILLING
+        if "quota" in lowered:
+            return ErrorCategory.QUOTA
+        return ErrorCategory.RATE_LIMIT
+    if status in {402}:
+        return ErrorCategory.BILLING
+    if status in {408, 409, 425}:
+        return ErrorCategory.NETWORK
+    if status >= 500:
+        return ErrorCategory.SERVER
+    if status in {400, 404, 405, 415, 422}:
+        return ErrorCategory.VALIDATION
+    return ErrorCategory.UNKNOWN
+
+
+def _retry_after(headers: httpx.Headers) -> float | None:
+    value = headers.get("retry-after")
+    if not value:
+        return None
+    try:
+        return max(0.0, min(float(value), 120.0))
+    except ValueError:
+        return None
+
+
+def validate_base_url(base_url: str, *, allow_private_network: bool) -> str:
+    parsed = urlparse(base_url)
+    if parsed.username or parsed.password or not parsed.hostname:
+        raise ValueError("base URL must not contain credentials and must include a hostname")
+    hostname = parsed.hostname.lower()
+    localhost = hostname in {"localhost", "127.0.0.1", "::1"}
+    if parsed.scheme != "https" and not (parsed.scheme == "http" and localhost):
+        raise ValueError("base URL must use HTTPS; only loopback hosts may use HTTP")
+    if parsed.query or parsed.fragment:
+        raise ValueError("base URL must not contain a query or fragment")
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        address = None
+    if address and not address.is_global and not address.is_loopback and not allow_private_network:
+        raise ValueError("private network provider URLs require explicit opt-in")
+    return base_url.rstrip("/")
+
+
+def guard_resolved_host(base_url: str, *, allow_private_network: bool) -> None:
+    if allow_private_network:
+        return
+    hostname = urlparse(base_url).hostname
+    if not hostname or hostname in {"localhost", "127.0.0.1", "::1"}:
+        return
+    try:
+        addresses = {entry[4][0] for entry in socket.getaddrinfo(hostname, None)}
+    except socket.gaierror as exc:
+        raise ProviderError("provider hostname could not be resolved", ErrorCategory.NETWORK) from exc
+    for value in addresses:
+        address = ipaddress.ip_address(value)
+        if not address.is_global:
+            raise ProviderError(
+                "provider hostname resolves to a private address; enable private network access explicitly",
+                ErrorCategory.VALIDATION,
+            )
+
+
+class CredentialVault:
+    """Process-only provider credentials. Values are deliberately never serializable."""
+
+    def __init__(self) -> None:
+        self._keys: dict[str, str] = {}
+
+    def unlock(self, provider_id: str, api_key: str) -> None:
+        self._keys[provider_id] = api_key
+
+    def lock(self, provider_id: str) -> None:
+        self._keys.pop(provider_id, None)
+
+    def get(self, provider_id: str) -> str | None:
+        return self._keys.get(provider_id)
+
+    def is_unlocked(self, provider_id: str) -> bool:
+        return provider_id in self._keys
+
+    def clear(self) -> None:
+        self._keys.clear()
+
+
+@dataclass(slots=True)
+class ProviderResult:
+    value: Any
+    request_id: str | None = None
+
+
+class GenerationProvider(Protocol):
+    requires_credentials: bool
+
+    async def structured_text(self, *, prompt: str, schema: dict[str, Any]) -> ProviderResult: ...
+
+    async def image(
+        self,
+        *,
+        prompt: str,
+        width: int | None,
+        height: int | None,
+        reference: bytes | None = None,
+    ) -> ProviderResult: ...
+
+    async def test_connection(self) -> list[str]: ...
+
+
+def _fake_value(schema: dict[str, Any], name: str = "value") -> Any:
+    if "const" in schema:
+        return schema["const"]
+    if schema.get("enum"):
+        return schema["enum"][0]
+    schema_type = schema.get("type")
+    if isinstance(schema_type, list):
+        schema_type = next((item for item in schema_type if item != "null"), "null")
+    if schema_type == "object" or "properties" in schema:
+        properties = schema.get("properties", {})
+        required = set(schema.get("required", properties.keys()))
+        return {key: _fake_value(value, key) for key, value in properties.items() if key in required}
+    if schema_type == "array":
+        return [_fake_value(schema.get("items", {}), name)] if schema.get("minItems", 0) else []
+    if schema_type == "integer":
+        return int(schema.get("minimum", 1))
+    if schema_type == "number":
+        return float(schema.get("minimum", 1.0))
+    if schema_type == "boolean":
+        return True
+    if schema_type == "null":
+        return None
+    return f"generated-{name}"
+
+
+class FakeProvider:
+    requires_credentials = False
+
+    def __init__(self, profile: ProviderProfile):
+        self.profile = profile
+
+    async def structured_text(self, *, prompt: str, schema: dict[str, Any]) -> ProviderResult:
+        await asyncio.sleep(0)
+        value = _fake_value(schema)
+        if isinstance(value, dict) and "prompt" in schema.get("properties", {}):
+            value["prompt"] = prompt
+        jsonschema.validate(value, schema)
+        return ProviderResult(value=value, request_id="fake-text-request")
+
+    async def image(
+        self,
+        *,
+        prompt: str,
+        width: int | None,
+        height: int | None,
+        reference: bytes | None = None,
+    ) -> ProviderResult:
+        await asyncio.sleep(0)
+        size = (width or 256, height or 256)
+        image = Image.new("RGBA", size, (35, 43, 66, 0))
+        draw = ImageDraw.Draw(image)
+        margin = max(4, min(size) // 8)
+        draw.rounded_rectangle(
+            (margin, margin, size[0] - margin, size[1] - margin),
+            radius=max(2, margin // 2),
+            fill=(91, 143, 249, 255),
+        )
+        draw.text((margin + 4, margin + 4), prompt[:16], fill=(255, 255, 255, 255))
+        output = io.BytesIO()
+        image.save(output, "PNG")
+        return ProviderResult(value=output.getvalue(), request_id="fake-image-request")
+
+    async def test_connection(self) -> list[str]:
+        return [self.profile.text_model, self.profile.image_model]
+
+
+class OpenAICompatibleProvider:
+    requires_credentials = True
+
+    def __init__(self, profile: ProviderProfile, api_key: str):
+        self.profile = profile
+        self.base_url = validate_base_url(
+            profile.base_url, allow_private_network=profile.allow_private_network
+        )
+        self._headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+    async def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        guard_resolved_host(self.base_url, allow_private_network=self.profile.allow_private_network)
+        headers = kwargs.pop("headers", self._headers)
+        try:
+            async with httpx.AsyncClient(timeout=90.0, follow_redirects=False) as client:
+                response = await client.request(
+                    method, f"{self.base_url}/{path.lstrip('/')}", headers=headers, **kwargs
+                )
+        except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            raise ProviderError("provider network request failed", ErrorCategory.NETWORK) from exc
+        if response.status_code >= 400:
+            category = classify_http_error(response.status_code, response.text[:1000])
+            request_id = response.headers.get("x-request-id")
+            raise ProviderError(
+                f"provider returned HTTP {response.status_code}",
+                category,
+                status_code=response.status_code,
+                retry_after=_retry_after(response.headers),
+                request_id=request_id,
+            )
+        return response
+
+    @staticmethod
+    def _content(response: httpx.Response) -> tuple[str, str | None]:
+        try:
+            payload = response.json()
+            content = payload["choices"][0]["message"]["content"]
+            if isinstance(content, list):
+                content = "".join(
+                    str(item.get("text", "")) for item in content if isinstance(item, dict)
+                )
+            if not isinstance(content, str) or not content.strip():
+                raise KeyError("empty content")
+            return content, response.headers.get("x-request-id") or payload.get("id")
+        except (ValueError, KeyError, IndexError, TypeError) as exc:
+            raise ProviderError("provider returned an empty or invalid text response", ErrorCategory.EMPTY) from exc
+
+    async def _chat(self, messages: list[dict[str, str]], response_format: dict[str, Any]) -> ProviderResult:
+        response = await self._request(
+            "POST",
+            "chat/completions",
+            json={
+                "model": self.profile.text_model,
+                "messages": messages,
+                "response_format": response_format,
+            },
+        )
+        content, request_id = self._content(response)
+        try:
+            return ProviderResult(json.loads(content), request_id)
+        except json.JSONDecodeError as exc:
+            raise ProviderError("provider text was not valid JSON", ErrorCategory.INVALID_RESPONSE) from exc
+
+    async def structured_text(self, *, prompt: str, schema: dict[str, Any]) -> ProviderResult:
+        messages = [
+            {"role": "system", "content": "Return only JSON that satisfies the supplied schema."},
+            {"role": "user", "content": prompt},
+        ]
+        try:
+            result = await self._chat(
+                messages,
+                {
+                    "type": "json_schema",
+                    "json_schema": {"name": "asset_candidate", "strict": True, "schema": schema},
+                },
+            )
+        except ProviderError as exc:
+            if exc.status_code not in {400, 404, 422}:
+                raise
+            result = await self._chat(messages, {"type": "json_object"})
+
+        try:
+            jsonschema.validate(result.value, schema)
+            return result
+        except jsonschema.ValidationError:
+            repair_messages = messages + [
+                {"role": "assistant", "content": json.dumps(result.value, ensure_ascii=False)},
+                {
+                    "role": "user",
+                    "content": "Repair the previous JSON so it strictly satisfies this schema:\n"
+                    + json.dumps(schema, ensure_ascii=False),
+                },
+            ]
+            repaired = await self._chat(repair_messages, {"type": "json_object"})
+            try:
+                jsonschema.validate(repaired.value, schema)
+            except jsonschema.ValidationError as exc:
+                raise ProviderError(
+                    "provider JSON did not satisfy the schema after one repair",
+                    ErrorCategory.VALIDATION,
+                ) from exc
+            return repaired
+
+    async def image(
+        self,
+        *,
+        prompt: str,
+        width: int | None,
+        height: int | None,
+        reference: bytes | None = None,
+    ) -> ProviderResult:
+        if reference is not None:
+            guard_resolved_host(self.base_url, allow_private_network=self.profile.allow_private_network)
+            try:
+                async with httpx.AsyncClient(timeout=180.0, follow_redirects=False) as client:
+                    response = await client.post(
+                        f"{self.base_url}/images/edits",
+                        headers={"Authorization": self._headers["Authorization"]},
+                        data={
+                            "model": self.profile.image_model,
+                            "prompt": prompt,
+                            "quality": self.profile.quality,
+                            "size": f"{width}x{height}" if width and height else "auto",
+                        },
+                        files={"image": ("reference.png", reference, "image/png")},
+                    )
+            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                raise ProviderError("provider network request failed", ErrorCategory.NETWORK) from exc
+            if response.status_code >= 400:
+                raise ProviderError(
+                    f"provider returned HTTP {response.status_code}",
+                    classify_http_error(response.status_code, response.text[:1000]),
+                    status_code=response.status_code,
+                    retry_after=_retry_after(response.headers),
+                    request_id=response.headers.get("x-request-id"),
+                )
+        else:
+            response = await self._request(
+                "POST",
+                "images/generations",
+                json={
+                    "model": self.profile.image_model,
+                    "prompt": prompt,
+                    "quality": self.profile.quality,
+                    "size": f"{width}x{height}" if width and height else "auto",
+                },
+            )
+        try:
+            payload = response.json()
+            item = payload["data"][0]
+            request_id = response.headers.get("x-request-id") or payload.get("id")
+            if item.get("b64_json"):
+                return ProviderResult(base64.b64decode(item["b64_json"], validate=True), request_id)
+            raise KeyError("b64_json")
+        except (ValueError, KeyError, IndexError, TypeError) as exc:
+            raise ProviderError(
+                "provider image response must contain base64 image data",
+                ErrorCategory.INVALID_RESPONSE,
+            ) from exc
+
+    async def test_connection(self) -> list[str]:
+        response = await self._request("GET", "models")
+        try:
+            return [str(item["id"]) for item in response.json().get("data", []) if "id" in item]
+        except (ValueError, TypeError) as exc:
+            raise ProviderError("provider returned an invalid models response", ErrorCategory.INVALID_RESPONSE) from exc
+
+
+def build_provider(profile: ProviderProfile, vault: CredentialVault) -> GenerationProvider:
+    if profile.kind == ProviderKind.FAKE.value:
+        return FakeProvider(profile)
+    key = vault.get(profile.id)
+    if not key:
+        raise ProviderError("provider credentials are locked", ErrorCategory.AUTH)
+    return OpenAICompatibleProvider(profile, key)

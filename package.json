@@ -1,0 +1,17 @@
+{
+  "name": "game-asset-management-system",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "npm@11.12.1",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "dev:web": "npm --prefix apps/web run dev",
+    "dev:api": "uv run --project apps/api game-assets-api",
+    "build": "npm --prefix apps/web run build",
+    "test:web": "npm --prefix apps/web test",
+    "test:api": "uv run --project apps/api pytest",
+    "test:emperor": "uv run --project packages/emperor_adapter pytest",
+    "test": "npm run test:web && npm run test:api && npm run test:emperor"
+  }
+}

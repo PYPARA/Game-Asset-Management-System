@@ -1,0 +1,6 @@
+[tool.uv.workspace]
+members = [
+  "apps/api",
+  "packages/emperor_adapter",
+]
+

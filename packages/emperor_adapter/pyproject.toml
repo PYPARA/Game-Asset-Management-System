@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "emperor-adapter"
+version = "0.1.0"
+description = "Read-only Emperor Simulator migration adapter for Game Asset Management System"
+readme = "README.md"
+requires-python = ">=3.13"
+license = { text = "MIT" }
+authors = [{ name = "Game Asset Management System" }]
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8.3"]
+
+[project.scripts]
+emperor-adapter = "emperor_adapter.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/emperor_adapter"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+markers = [
+  "integration: read-only acceptance against a real Emperor-Simulator checkout",
+]
+
