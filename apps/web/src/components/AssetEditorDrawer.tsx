@@ -36,7 +36,7 @@ function validateDraft(asset: GameAsset, baseline: unknown, draft: unknown, asse
     return errors;
   }
   if (!draft || typeof draft !== "object" || Array.isArray(draft)) {
-    return ["JSON 修订必须是对象。"]; 
+    return ["JSON 修订必须是对象。"];
   }
   const record = draft as Record<string, unknown>;
   const base = baseline && typeof baseline === "object" && !Array.isArray(baseline)

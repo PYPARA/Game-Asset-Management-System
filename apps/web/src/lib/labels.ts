@@ -85,4 +85,3 @@ export function fieldLabel(field: string): string {
   };
   return labels[field] ?? field;
 }
-
