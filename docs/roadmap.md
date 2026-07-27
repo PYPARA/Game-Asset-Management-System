@@ -2,7 +2,7 @@
 
 > 文档状态：已确认的目标计划
 > 基线日期：2026-07-27
-> 本文同时记录“当前能力”和“目标能力”。凡标记为“目标”或列入 M1 及以后里程碑的内容，均不得理解为已经实现。
+> 本文同时记录“当前能力”和“目标能力”。只有带“已完成”验收记录的里程碑属于当前能力；其余目标不得理解为已经实现。
 
 ## 产品方向
 
@@ -22,31 +22,31 @@ GAMS 的 v1 目标不是单纯调用图片供应商，而是建立一条可恢�
 | 能力 | 当前状态 | 说明 |
 |---|---|---|
 | 单一 Project 契约 | 已实现 | `project.yaml`、Catalog、不可变修订、审核、批准媒体和 Release 采用统一目录结构。 |
-| Project 发现与扫描 | 已实现 | Project 文件是事实源，SQLite 保存可重建索引和任务状态。 |
+| Project 发现与扫描 | 已实现 | Project 文件是事实源；资产、修订、Artifact、审核、QA、关系和 Release 均可重建 SQLite 索引。 |
 | 资产、关系与修订 API | 已实现 | 支持稳定 Key、类型化关系、候选修订、批准指针和依赖失效。 |
 | 供应商与凭据 | 已实现 | OpenAI 兼容供应商、离线假供应商、浏览器加密缓存和后端内存解锁已经存在。 |
-| 生成后端 | 部分实现 | 已有计划校验、DAG 门控、持久 Job、重试、取消、恢复和事件流；Runner 仍逐项串行执行。 |
+| 生成后端 | 部分实现 | 已有计划校验、DAG 门控、持久 Job、重试、取消、恢复和事件流；硬 QA fail 使用 `qa_failed`，Runner 仍逐项串行执行。 |
 | 生成计划工作台 | 未实现 | Web 尚无计划编辑、成本确认、依赖配置和完整任务管理入口。 |
 | 图片归一化与硬 QA | 部分实现 | 已有尺寸、编码、Alpha、体积和简单色键抠图；没有语义 QA、智能抠图 Worker 或自动返工。 |
-| 人工审核 | 已实现 | 候选与批准版本分离，硬 QA 不通过时拒绝批准。 |
-| Release | 部分实现 | 可生成 Project 内 Manifest 并发布媒体；当前会跳过不合格资产，尚非 fail-closed。 |
+| 人工审核 | 已实现 | 媒体批准会提升耐久 Artifact、创建 promotion 修订并绑定 Artifact/依赖哈希；硬 QA 不通过时拒绝批准。 |
+| Release | 部分实现 | Release v1 已全量预检、fail-closed 且可重建索引；Manifest v2、snapshot hash 与 Delivery 尚未实现。 |
 | 游戏仓库交付 | 未实现 | `project.local.yaml` 已预留 checkout 绑定，但没有 preview/apply/verify/rollback。 |
 | Codex 监督 Agent | 未实现 | 当前没有内嵌会话、结构化 Finding/Action、诊断循环或 ChangeSet 审批。 |
 | 叙事地图 | 未开始 | 类型化关系模型已具备，UI 安排在 v1.1。 |
 
 历史验收快照记录了前端 25 项测试、API 23 项测试和 Emperor Project 扫描通过；这些数字属于 [设计 QA 基线](../design-qa.md)，不是持续监控结果。当前 M0 验收结果见下方带日期的记录。
 
-## 已知缺口与 P0 风险
+## P0 风险状态
 
-### P0-1：批准媒体仍可能依赖 workspace
+### P0-1（M1 已关闭）：批准媒体依赖 workspace
 
-当前生成修订中的 `source_path` 和 `normalized_path` 指向 `workspace/candidates`。批准只移动审核指针；正式媒体通常要到 Release 才复制到 `target_path`。删除 workspace 后，已批准修订可能无法预览、复验或重新发布。
+生成候选仍位于 `workspace/candidates`，但批准时会把原始来源和运行媒体提升到 `production/sources` 与 `approved/objects`，创建只引用耐久对象的 promotion 修订。扫描器拒绝把仍引用 workspace 的修订作为当前批准版本。
 
-目标是批准时就把原始输出和归一化媒体提升到 Git 跟踪、内容寻址的 `production/sources` 与 `approved/objects`。任何正式修订、审核决定和 Release 都不得引用 workspace。
+审核决定绑定准确修订、依赖哈希和来源/运行 Artifact 哈希；删除 workspace 后仍可预览、复验、扫描和 Release。
 
-### P0-2：Job 成功语义早于 QA 结果
+### P0-2（M1 已关闭）：Job 成功语义早于 QA 结果
 
-当前 Runner 在创建候选并执行硬 QA 后，把 Job 标记为 `succeeded`，但没有根据 QA verdict 改变结果。于是“供应商调用成功”和“候选通过 QA”被混为一个状态。
+Runner 会保留供应商 Attempt 的成功事实，但硬 QA fail 的 Job 和资产进入 `qa_failed`，不再表现为 `succeeded`。完整的阶段状态、语义 QA、自动返工和 `awaiting_user` 仍属于 M2。
 
 目标状态必须严格区分：
 
@@ -54,17 +54,17 @@ GAMS 的 v1 目标不是单纯调用图片供应商，而是建立一条可恢�
 
 硬 QA 或语义 QA 失败必须进入诊断、返工或 `awaiting_user`，不能标记为生产闭环成功。
 
-### P0-3：Release 不是 fail-closed
+### P0-3（M1 已关闭）：Release 部分成功
 
-当前 Release 会跳过批准失效、依赖哈希变化或 QA 不通过的资产，并继续写出部分 Manifest。这可能造成调用方误以为整批内容已经发布。
+Release v1 现在先收集完整问题列表；批准失效、依赖变化、QA fail、路径碰撞、Blob 缺失、哈希或体积不符都会阻止整次 Release。
 
-目标是 Release 创建前完成全量预检。缺少任一要求项、路径碰撞、Blob 缺失或哈希不符时，整次 Release 失败，不写部分 Manifest，也不改变资产发布状态。
+预检失败不写 Manifest、不改变资产发布状态；正式文件写入中途失败会恢复 Release 指针、Catalog 和本次 Manifest。
 
-### P0-4：Release 与交付无法只靠 Project 恢复
+### P0-4（Release 部分已关闭）：Project 恢复边界
 
-Manifest 已写入 Project，但 SQLite 中的 Release 记录尚无对应的完整重建流程；外部游戏 checkout 更没有交付收据和 lock 文件。删除 SQLite 后，历史文件仍在，但系统不能完整恢复 Release/Delivery 查询与验证能力。
+Artifact、真实审核决定和 Release 已能从 Project 文件重建 SQLite 索引。外部游戏 checkout 的 Delivery 收据、受管文件哈希和 lock 文件尚未实现，继续由 M3 负责。
 
-目标是让 Release、Delivery 和受管文件哈希都由 Project 文件恢复，SQLite 只作为索引。
+M3 的目标仍是让 Delivery 和受管文件哈希同样由 Project 文件恢复，SQLite 只作为索引。
 
 ### P0-5：并发、租约与预算尚未形成硬约束
 
@@ -86,7 +86,7 @@ flowchart LR
     M6 --> M7["M7 v1.1 叙事地图"]
 ```
 
-M1 是 M2 和 M3 的共同前置条件：如果正式媒体仍依赖 workspace，任何返工、Release 或交付自动化都会建立在不可靠的事实源上。M4 必须建立在 M2 的确定性 Controller 之上，Codex 不直接承担队列、预算或文件事务。
+M1 已满足 M2 和 M3 的共同事实源前置条件。M4 必须建立在 M2 的确定性 Controller 之上，Codex 不直接承担队列、预算或文件事务。
 
 ## 实施里程碑
 
@@ -134,6 +134,17 @@ M1 是 M2 和 M3 的共同前置条件：如果正式媒体仍依赖 workspace�
 - 删除 SQLite 后重新扫描，资产、修订、审核和 Release 可恢复。
 - 任一资产批准失效、QA fail、路径碰撞或 Blob 缺失时，Release 不产生部分 Manifest。
 - 文件提升或 Release 中途失败时，Catalog 指针和正式对象保持原状。
+
+#### M1 验收记录（2026-07-27）
+
+状态：已完成。
+
+- 媒体批准提升来源与运行 Artifact、创建 promotion 修订、重新执行硬 QA，并把审核绑定到准确 Artifact 哈希。
+- 自动化验证覆盖删除 workspace、使用全新 SQLite 重建、批准失效、QA fail、大小写路径碰撞、来源/运行 Blob 缺失或损坏，以及批准/Release 文件故障注入回滚。
+- 前端测试 28 项、API 测试 30 项全部通过；生产构建和 Python 编译检查通过。
+- 真实 `Emperor-Simulator` Project 兼容扫描通过：1,144 个资产、1,144 个修订、189 个 rendition、1 个历史 Release，0 个扫描错误。
+- 浏览器回归通过：1,144 个资产的分类计数与 186 项 2D 媒体可见，当前 1920×1080 已批准预览和固定任务栏正常加载，控制台无 warning/error。
+- Release 仍使用 v1 Manifest；Manifest v2、snapshot hash、外部 Delivery 与完整生产状态机明确留在 M2/M3。
 
 ### M2：确定性生产闭环
 

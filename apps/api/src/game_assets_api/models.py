@@ -122,6 +122,28 @@ class Rendition(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class Artifact(Base):
+    __tablename__ = "artifacts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    revision_id: Mapped[str] = mapped_column(ForeignKey("asset_revisions.id", ondelete="CASCADE"), index=True)
+    role: Mapped[str] = mapped_column(String(40), index=True)
+    kind: Mapped[str] = mapped_column(String(80))
+    media_type: Mapped[str] = mapped_column(String(100))
+    path: Mapped[str] = mapped_column(Text)
+    sha256: Mapped[str] = mapped_column(String(64), index=True)
+    byte_size: Mapped[int] = mapped_column(Integer)
+    width: Mapped[int | None] = mapped_column(Integer)
+    height: Mapped[int | None] = mapped_column(Integer)
+    parent_artifact_id: Mapped[str | None] = mapped_column(
+        ForeignKey("artifacts.id"), nullable=True
+    )
+    tool_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    file_path: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class ProviderProfile(Base):
     __tablename__ = "provider_profiles"
 
@@ -212,6 +234,29 @@ class ReviewDecision(Base):
     dependency_hash: Mapped[str] = mapped_column(String(64))
     is_valid: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    artifact_bindings: Mapped[list[ReviewArtifact]] = relationship(
+        back_populates="review", cascade="all, delete-orphan"
+    )
+
+
+class ReviewArtifact(Base):
+    __tablename__ = "review_artifacts"
+    __table_args__ = (
+        UniqueConstraint("review_id", "artifact_id", "role", name="uq_review_artifact_role"),
+    )
+
+    id: Mapped[str] = mapped_column(String(48), primary_key=True, default=new_id)
+    review_id: Mapped[str] = mapped_column(
+        ForeignKey("review_decisions.id", ondelete="CASCADE"), index=True
+    )
+    artifact_id: Mapped[str] = mapped_column(
+        ForeignKey("artifacts.id", ondelete="CASCADE"), index=True
+    )
+    role: Mapped[str] = mapped_column(String(40))
+    sha256: Mapped[str] = mapped_column(String(64))
+
+    review: Mapped[ReviewDecision] = relationship(back_populates="artifact_bindings")
 
 
 class Release(Base):

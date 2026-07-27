@@ -727,9 +727,9 @@ export function Workbench() {
         <div className="task-label"><strong>近期任务</strong><span /></div>
         <div className="task-copy">
           <strong>{isError ? "后台任务服务不可用" : job.name}</strong>
-          <span>{isError ? "等待重新连接" : job.status === "completed" ? "已完成" : job.status === "credentials_locked" ? "等待凭据" : "处理中"}</span>
+          <span>{isError ? "等待重新连接" : job.status === "completed" ? "已完成" : job.status === "credentials_locked" ? "等待凭据" : job.status === "qa_failed" ? "硬 QA 未通过" : job.status === "paused" ? "已暂停" : "处理中"}</span>
         </div>
-        <span className={`job-status ${job.status}`}>{isError ? "错误" : job.status === "completed" ? "已完成" : `${job.progress}%`}</span>
+        <span className={`job-status ${job.status}`}>{isError ? "错误" : job.status === "completed" ? "已完成" : job.status === "qa_failed" ? "QA 未通过" : job.status === "paused" ? "已暂停" : `${job.progress}%`}</span>
         <div className="job-previews">{job.previewImages.map((image, index) => <img key={`${image}-${index}`} src={image} alt="" />)}</div>
         <div className="job-metrics"><span>{isError ? "任务数据不可用" : `共生成 ${job.total} 项`}</span><strong>{isError ? "—" : `通过 QA ${job.passed} 项`}</strong></div>
         <div className="job-output"><small>输出位置</small><span title={job.outputPath}>{isError ? "—" : job.outputPath}</span></div>

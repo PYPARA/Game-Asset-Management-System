@@ -95,7 +95,7 @@ export interface GameAsset {
 export interface JobSummary {
   id: string;
   name: string;
-  status: "queued" | "running" | "completed" | "paused" | "credentials_locked";
+  status: "queued" | "running" | "completed" | "paused" | "credentials_locked" | "qa_failed";
   progress: number;
   completed: number;
   total: number;

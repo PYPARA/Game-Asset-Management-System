@@ -28,6 +28,7 @@ Project 内所有磁盘字段使用 `snake_case`。稳定 Key 表示业务身份
 默认数据库位于本机 `~/Library/Application Support/Game-Asset-Management-System/index.sqlite3`，不进入 iCloud，只保存：
 
 - 从 Project 扫描得到的资产、修订、rendition、QA 和关系索引；
+- 从 Project 扫描得到的 Artifact、审核决定和 Release 索引；
 - 生成计划、任务、尝试次数和运行进度；
 - 本机服务运行所需的关联状态。
 
@@ -50,9 +51,11 @@ Web 只连接 `127.0.0.1` API。API 负责目录边界校验、原子写入、Pr
 
 - 读取 `catalog/**/*.json` 中的资产描述与 `catalog/relations.json`；
 - 读取 `history/objects/<prefix>/<hash>.json` 中的修订；
+- 区分并验证同一对象库中的 Artifact 元数据，复核 `production/sources` 与 `approved/objects` Blob 哈希；
 - 从媒体修订的 `content.rendition` 派生 SQLite rendition；
 - 校验媒体路径仍在 Project 内、文件存在且 SHA-256 一致；
-- 读取 QA 与审核记录并恢复当前状态；
+- 读取 QA 与真实审核记录，按最新决定和当前依赖哈希恢复有效性，不从 Catalog 指针推测审核；
+- 读取 `releases/*/manifest.json` 并恢复 Release 索引；
 - 在完整扫描无错误时删除 SQLite 中已经不在 Project 文件里的过期索引。
 
 发现与扫描不会复制正式媒体，也不会创建第二套 Project 元数据。
@@ -79,9 +82,12 @@ Catalog 保存“现在有哪些资产”以及每项资产的当前状态。每
 {
   "rendition": {
     "media_type": "image/webp",
-    "source_path": "production/sources/.../source.png",
-    "normalized_path": "approved/assets/.../asset.webp",
-    "target_path": "approved/assets/.../asset.webp",
+    "source_path": "production/sources/ab/ab....png",
+    "source_sha256": "...",
+    "source_artifact_id": "artifact_...",
+    "normalized_path": "approved/objects/cd/cd....webp",
+    "artifact_id": "artifact_...",
+    "target_path": "public/assets/.../asset.webp",
     "sha256": "...",
     "width": 1024,
     "height": 1536,
@@ -90,9 +96,10 @@ Catalog 保存“现在有哪些资产”以及每项资产的当前状态。每
 }
 ```
 
-- `source_path` 是 Project 内的制作来源；
-- `normalized_path` 是用于检查和发布的归一化文件；
-- `target_path` 是批准时在当前 Project 内写入的正式目标；
+- `source_path` 是 Project 内内容寻址的耐久制作来源；
+- `normalized_path` 是用于检查和 Release 的内容寻址批准对象；
+- `source_artifact_id` 与 `artifact_id` 绑定不可变 Artifact 元数据、父子关系和工具版本；
+- `target_path` 是后续 Delivery 使用的逻辑目标，Release 不直接写该位置；
 - 哈希、尺寸和字节数用于扫描与 QA。
 
 SQLite rendition ID 由修订和内容哈希确定性派生。前端统一通过 `/api/renditions/{id}/content` 预览；接口再次验证实际文件属于当前 Project，不接受任意绝对路径。
@@ -108,7 +115,7 @@ SQLite rendition ID 由修订和内容哈希确定性派生。前端统一通过
 5. 图片运行硬 QA，报告同时写入 Project 历史与 workspace 工作区；
 6. 服务重启时，运行中的任务回到 queued 或 credentials_locked，而不是伪装为完成。
 
-当前 Job 的 `succeeded` 只表示供应商输出已处理并产生候选，不代表批准或发布。当前实现还会在硬 QA verdict 为 fail 时把 Job 标为 `succeeded`；这是 [路线图](roadmap.md) 的 P0 状态语义缺口，而不是目标行为。
+当前 Job 的 `succeeded` 表示供应商输出已处理、硬 QA 没有 fail 且已产生候选，不代表人工批准或发布。硬 QA fail 会保留候选证据并进入 `qa_failed`，供应商 Attempt 仍可单独记录为 `succeeded`，从而不再混淆“收到输出”和“通过 QA”。完整的多阶段 Controller 状态机仍属于 M2。
 
 ## 目标生产状态机（未实现）
 
@@ -141,11 +148,12 @@ Provider 返回只会进入 `output_received`。硬 QA、语义 QA 或预算不�
 
 图片 QA 检查解码、尺寸、Alpha、字节大小等硬性条件。媒体候选没有最新 QA，或最新 QA 为 fail 时，API 拒绝批准。
 
-批准时系统会：
+批准媒体时系统会：
 
-- 写入不可变审核决定；
-- 将修订标记为 approved；
-- 更新 Catalog 的 `current_revision_id`；
+- 把原始输出和归一化媒体分别提升为来源 Artifact 与运行 Artifact；
+- 创建只引用耐久 Artifact 的 promotion 修订并重新执行硬 QA；
+- 写入绑定准确修订、依赖哈希和两个 Artifact 哈希的不可变审核决定；
+- 最后更新 Catalog 的 `current_revision_id`；
 - 把资产状态变为 approved/ready；
 - 同步当前内容产生的正式关系；
 - 使依赖旧版本的已有批准决定失效，并阻止其直接发布。
@@ -154,16 +162,19 @@ Provider 返回只会进入 `output_received`。硬 QA、语义 QA 或预算不�
 
 ## 当前 Release 与游戏仓库
 
-当前 Release 遍历已批准资产，只把同时满足以下条件的当前修订加入 Manifest：
+当前 Release 对全部已批准资产执行一次预检，要求：
 
 - 资产处于 approved；
 - 存在仍有效的批准决定；
 - 批准时记录的依赖哈希与当前依赖一致；
-- 所有媒体 rendition 都有通过的最新硬 QA。
+- 所有媒体 rendition 都有通过的最新硬 QA；
+- 正式媒体不引用 workspace，耐久 Blob 存在且哈希/体积一致；
+- 新 promotion 修订的 Artifact 与审核绑定一致；
+- 所有逻辑目标路径合法且没有大小写碰撞。
 
-发布媒体时，API 从 Project 内的归一化文件原子写入 Project 内的 `target_path`。Release Manifest 记录稳定 Key、修订、内容哈希、媒体哈希和最终路径。
+只要存在一个阻塞问题，Release 就返回完整预检错误，不写 Manifest、不改变 `publication_status`。成功时以一个文件事务写入不可变 Manifest、当前 Release 指针和 Catalog 发布状态；写入中途失败会恢复原状态。
 
-当前实现会跳过不满足条件的资产并继续创建部分 Release，而不是使整次 Release 失败；这属于 P0 缺口。当前批准修订也可能仍引用 `workspace/candidates`，删除 workspace 后不保证可重新发布。
+Release Manifest v1 记录稳定 Key、修订、内容哈希、依赖哈希、Artifact、媒体哈希、耐久 Project 路径和逻辑 `target_path`。Release 不向外部 checkout 或逻辑目标复制媒体；这一动作属于 M3 Delivery。
 
 `project.yaml` 中的 `export` 只声明游戏仓库内的内容、Manifest 和资源目标；当前 Release API 不会写任意外部 checkout。把 Release 同步到游戏仓库属于显式导出步骤。游戏仓库接收确定性生成内容与发布资源后，应能脱离 GAMS 独立构建和运行。
 

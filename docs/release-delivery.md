@@ -1,8 +1,8 @@
 # Release 与游戏项目交付
 
-> 文档状态：目标契约，尚未实现
+> 文档状态：M1 已实现候选提升、Artifact 绑定、Release v1 fail-closed 与 Release 索引重建；Manifest v2 和 Delivery 仍是目标契约
 > 基线日期：2026-07-27
-> 当前代码只支持 Project 内的 Release v1；本文中的候选提升、Manifest v2、外部导出、Delivery、`gams-lock.json` 和回滚均为后续里程碑。
+> 当前代码只支持 Project 内的 Release v1；本文中的 Manifest v2、外部导出、Delivery、`gams-lock.json` 和回滚仍属于后续里程碑。
 
 ## 目标
 
@@ -17,10 +17,10 @@ Release 与 Delivery 是两个不同动作：
 
 | 环节 | 当前实现 | 目标契约 |
 |---|---|---|
-| 候选存储 | 生成结果和归一化图位于 `workspace/candidates` | workspace 仅保存临时候选；审批前提升为内容寻址耐久对象 |
-| 批准 | 审核绑定修订并更新 `current_revision_id` | 审核同时绑定耐久 Artifact 哈希，正式修订不引用 workspace |
-| Release | v1 Manifest；跳过不合格资产后仍可创建 | Manifest v2；全量预检，任一项失败则整次失败 |
-| 恢复 | Manifest 在 Project，Release DB 索引不能完整重建 | Release 与 Delivery 均能从 Project 文件重建索引 |
+| 候选存储 | workspace 只保存临时候选；批准时提升到内容寻址耐久对象 | 已达到 M1 契约 |
+| 批准 | 审核绑定 promotion 修订、依赖哈希和耐久 Artifact 哈希；正式修订不引用 workspace | 已达到 M1 契约 |
+| Release | v1 Manifest；全量预检，任一项失败则整次失败 | M3 升级为 Manifest v2 和 snapshot hash |
+| 恢复 | Artifact、审核和 Release 可从 Project 文件重建 SQLite 索引 | M3 继续增加 Delivery 收据重建 |
 | 外部导出 | 未实现 | preview、stage、verify、apply、rollback 和幂等检测 |
 | 游戏侧状态 | 无受管文件边界 | `gams-lock.json` 记录版本与所有受管文件哈希 |
 | Git | 不自动操作 | 保持不自动操作，只展示 Project 与游戏仓库 diff |
@@ -36,7 +36,7 @@ Release 与 Delivery 是两个不同动作：
 7. `gams-lock.json` 最后写入；它存在即表示受管文件已经全部应用并验证成功。
 8. 回滚是重新交付一个旧 Release，不修改或删除任何历史 Release。
 
-## 候选提升与批准媒体
+## 候选提升与批准媒体（M1 已实现）
 
 ### 存储分层
 
@@ -66,7 +66,7 @@ history/reviews/...                      不可变审核决定
 
 驳回不会提升候选。需要保留的驳回证据可继续位于 `workspace/rejected`，也可由用户显式封存为历史 Artifact。
 
-## Release Manifest v2
+## Release Manifest v2（M3 目标）
 
 ### 创建前预检
 

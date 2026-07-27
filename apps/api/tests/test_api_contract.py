@@ -3,8 +3,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 import yaml
 from fastapi.testclient import TestClient
+
+from game_assets_api import storage as storage_module
 
 from .conftest import create_asset, create_project
 
@@ -146,6 +149,92 @@ def test_relation_change_invalidates_dependent_approval(
     ).status_code == 201
     reviews = client.get("/api/reviews", params={"asset_id": scene["id"]}).json()
     assert reviews[0]["is_valid"] is False
+
+
+def test_release_preflight_is_fail_closed(
+    client: TestClient, project_root: Path
+) -> None:
+    project = create_project(client, project_root)
+    healthy = create_asset(
+        client,
+        project["id"],
+        key="content.scene.healthy",
+        kind="content",
+        subtype="scene",
+    )
+    stale = create_asset(
+        client,
+        project["id"],
+        key="content.scene.stale",
+        kind="content",
+        subtype="scene",
+    )
+    dependency = create_asset(
+        client,
+        project["id"],
+        key="entity.character.dependency",
+    )
+    for asset in (healthy, stale):
+        revision = client.post(
+            "/api/revisions",
+            json={"asset_id": asset["id"], "content": {"title": asset["title"]}},
+        ).json()
+        assert client.post(
+            "/api/reviews", json={"revision_id": revision["id"], "verdict": "approve"}
+        ).status_code == 201
+    assert client.post(
+        "/api/relations",
+        json={
+            "project_id": project["id"],
+            "source_asset_id": stale["id"],
+            "target_asset_id": dependency["id"],
+            "relation_type": "depends_on",
+        },
+    ).status_code == 201
+
+    response = client.post(
+        "/api/releases", json={"project_id": project["id"], "name": "must-fail"}
+    )
+
+    assert response.status_code == 409
+    assert "content.scene.stale" in response.json()["detail"]
+    assert not list((project_root / "releases").glob("*/manifest.json"))
+    assert not (project_root / "release.json").exists()
+    assert client.get(f"/api/assets/{healthy['id']}").json()["publication_status"] == "ready"
+    assert client.get(f"/api/assets/{stale['id']}").json()["publication_status"] == "ready"
+
+
+def test_release_file_failure_rolls_back_manifest_and_catalog(
+    client: TestClient,
+    project_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = create_project(client, project_root)
+    asset = create_asset(client, project["id"])
+    revision = client.post(
+        "/api/revisions", json={"asset_id": asset["id"], "content": {"name": "stable"}}
+    ).json()
+    assert client.post(
+        "/api/reviews", json={"revision_id": revision["id"], "verdict": "approve"}
+    ).status_code == 201
+    original_write = storage_module.atomic_write_json
+
+    def fail_current_pointer(path: Path, content: object, *, immutable: bool = False) -> str:
+        if path == project_root / "release.json":
+            raise OSError("injected release pointer failure")
+        return original_write(path, content, immutable=immutable)
+
+    monkeypatch.setattr(storage_module, "atomic_write_json", fail_current_pointer)
+
+    with pytest.raises(OSError, match="injected release pointer failure"):
+        client.post(
+            "/api/releases", json={"project_id": project["id"], "name": "broken-release"}
+        )
+
+    assert not list((project_root / "releases").glob("*/manifest.json"))
+    assert not (project_root / "release.json").exists()
+    collection = json.loads((project_root / "catalog/entities/characters.json").read_text())
+    assert collection["assets"][0]["publication_status"] == "ready"
 
 
 def test_security_headers_and_provider_key_are_not_persisted(

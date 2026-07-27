@@ -257,7 +257,7 @@ function normalizeJob(value: unknown): JobSummary {
     return emptyJob;
   }
   const rawStatus = String(value.status ?? "paused");
-  const status = ["queued", "running", "completed", "paused", "credentials_locked"].includes(rawStatus)
+  const status = ["queued", "running", "completed", "paused", "credentials_locked", "qa_failed"].includes(rawStatus)
     ? rawStatus
     : rawStatus === "succeeded"
       ? "completed"

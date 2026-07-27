@@ -12,6 +12,7 @@ from .domain import (
     ErrorCategory,
     GenerationStatus,
     QARunCreate,
+    QAVerdict,
     RevisionCreate,
     RevisionFormat,
     TaskKind,
@@ -114,6 +115,7 @@ class JobRunner:
                     for task_id in dependencies
                     if statuses.get(task_id)
                     in {
+                        GenerationStatus.QA_FAILED.value,
                         GenerationStatus.FAILED.value,
                         GenerationStatus.CANCELLED.value,
                     }
@@ -195,13 +197,13 @@ class JobRunner:
 
                 result = await self._invoke(provider, job_id=job_id, request=request, schema=schema)
                 self._finish_attempt(attempt_id, result=result)
-                revision_id = self._stage_result(
+                revision_id, qa_verdict = self._stage_result(
                     job_id=job_id,
                     attempt_number=attempt_number,
                     result=result,
                     schema=schema,
                 )
-                self._complete_job(job_id, revision_id)
+                self._complete_job(job_id, revision_id, qa_verdict=qa_verdict)
                 return True
             except ProviderError as exc:
                 last_error = exc
@@ -303,7 +305,7 @@ class JobRunner:
         attempt_number: int,
         result: ProviderResult,
         schema: dict[str, Any] | None,
-    ) -> str:
+    ) -> tuple[str, str | None]:
         with self.sessions() as session:
             job = session.get(GenerationJob, job_id)
             if job is None:
@@ -333,7 +335,7 @@ class JobRunner:
                         provider_snapshot=provider_snapshot,
                     ),
                 )
-                return revision.id
+                return revision.id, None
 
             if not isinstance(result.value, bytes):
                 raise ServiceError(422, "image provider did not return bytes")
@@ -383,7 +385,7 @@ class JobRunner:
             session.add(rendition)
             session.flush()
             session.commit()
-            run_qa(
+            qa = run_qa(
                 session,
                 QARunCreate(
                     rendition_id=rendition.id,
@@ -392,9 +394,11 @@ class JobRunner:
                     require_alpha=bool(job.request_json.get("transparent")),
                 ),
             )
-            return revision.id
+            return revision.id, qa.verdict
 
-    def _complete_job(self, job_id: str, revision_id: str) -> None:
+    def _complete_job(
+        self, job_id: str, revision_id: str, *, qa_verdict: str | None
+    ) -> None:
         with self.sessions() as session:
             job = session.get(GenerationJob, job_id)
             if job is None:
@@ -406,6 +410,10 @@ class JobRunner:
                 job.status = GenerationStatus.CANCELLED.value
                 job.error_category = ErrorCategory.CANCELLED.value
                 job.error_message = "provider call completed and candidate was staged after cancellation"
+            elif qa_verdict == QAVerdict.FAIL.value:
+                job.status = GenerationStatus.QA_FAILED.value
+                job.error_category = ErrorCategory.VALIDATION.value
+                job.error_message = "provider output was staged but failed hard QA"
             else:
                 job.status = GenerationStatus.SUCCEEDED.value
                 job.error_category = None

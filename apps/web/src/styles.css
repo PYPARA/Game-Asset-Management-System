@@ -963,6 +963,11 @@ input[type="checkbox"] {
   color: #df8b84;
 }
 
+.job-status.qa_failed {
+  background: var(--red-dark);
+  color: #df8b84;
+}
+
 .status-badge.generating,
 .job-status.running,
 .job-status.queued {

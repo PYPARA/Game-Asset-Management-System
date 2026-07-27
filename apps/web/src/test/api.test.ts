@@ -36,6 +36,41 @@ describe("真实 API 契约", () => {
     await expect(fetchWorkbench()).rejects.toThrow("backend offline");
   });
 
+  it("保留硬 QA 失败任务状态", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url === "/api/projects") return json([{ id: "project-1", name: "真实项目" }]);
+        if (url === "/api/projects/project-1/scan") return json({ errors: [] });
+        if (url.startsWith("/api/assets?")) return json([]);
+        if (url.startsWith("/api/relations?")) return json([]);
+        if (url.startsWith("/api/jobs?")) {
+          return json([
+            {
+              id: "job-qa-failed",
+              task_id: "draw-invalid",
+              status: "qa_failed",
+              progress: 1,
+              result_revision_id: "revision-invalid",
+            },
+          ]);
+        }
+        throw new Error(`unexpected request: ${url}`);
+      }),
+    );
+
+    const result = await fetchWorkbench();
+
+    expect(result.job).toMatchObject({
+      id: "job-qa-failed",
+      name: "draw-invalid",
+      status: "qa_failed",
+      completed: 0,
+      passed: 0,
+    });
+  });
+
   it("严格区分待审候选与已批准修订", async () => {
     vi.stubGlobal(
       "fetch",

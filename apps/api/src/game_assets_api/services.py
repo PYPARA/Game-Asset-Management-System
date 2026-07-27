@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import shutil
 import threading
 from datetime import datetime
@@ -7,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import jsonschema
+from PIL import Image, UnidentifiedImageError
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -33,6 +35,7 @@ from .models import (
     Asset,
     AssetRelation,
     AssetRevision,
+    Artifact,
     GenerationJob,
     GenerationPlan,
     Project,
@@ -40,6 +43,7 @@ from .models import (
     QARun,
     Release,
     Rendition,
+    ReviewArtifact,
     ReviewDecision,
     new_id,
     utcnow,
@@ -53,6 +57,7 @@ from .storage import (
     relative_to_root,
     safe_join,
     sha256_bytes,
+    sha256_file,
     stable_id,
 )
 
@@ -539,7 +544,16 @@ def scan_project(session: Session, project: Project) -> ScanReport:
 
 def _scan_project(session: Session, project: Project) -> ScanReport:
     store = ProjectStore(project.root_path)
-    assets, revisions, renditions, qa_runs, relations, errors = store.scan()
+    scanned = store.scan_full()
+    assets = scanned.assets
+    revisions = scanned.revisions
+    renditions = scanned.renditions
+    qa_runs = scanned.qa_runs
+    relations = scanned.relations
+    artifacts = scanned.artifacts
+    reviews = scanned.reviews
+    releases = scanned.releases
+    errors = scanned.errors
     indexed_assets = 0
     indexed_revisions = 0
     known_asset_ids: set[str] = set()
@@ -547,6 +561,9 @@ def _scan_project(session: Session, project: Project) -> ScanReport:
     known_rendition_ids: set[str] = set()
     known_qa_ids: set[str] = set()
     known_relation_ids: set[str] = set()
+    known_artifact_ids: set[str] = set()
+    known_review_ids: set[str] = set()
+    known_release_ids: set[str] = set()
     for data in assets:
         try:
             identifier = str(data["id"])
@@ -617,7 +634,10 @@ def _scan_project(session: Session, project: Project) -> ScanReport:
             for revision in superseded:
                 session.delete(revision)
             session.flush()
-    for data in revisions:
+    for data in sorted(
+        revisions,
+        key=lambda item: (str(item.get("asset_id", "")), int(item.get("sequence", 0))),
+    ):
         try:
             asset_id = str(data["asset_id"])
             if session.get(Asset, asset_id) is None:
@@ -643,9 +663,9 @@ def _scan_project(session: Session, project: Project) -> ScanReport:
             revision.reviewed_at = _parse_datetime(data["reviewed_at"]) if data.get("reviewed_at") else None
             revision.created_at = _parse_datetime(data.get("created_at"))
             indexed_revisions += 1
+            session.flush()
         except (KeyError, TypeError, ValueError) as exc:
             errors.append(f"revision {data.get('id', '<unknown>')}: {exc}")
-    session.flush()
     for data in renditions:
         try:
             revision_id = str(data["revision_id"])
@@ -669,6 +689,54 @@ def _scan_project(session: Session, project: Project) -> ScanReport:
         except (KeyError, TypeError, ValueError) as exc:
             errors.append(f"rendition {data.get('id', '<unknown>')}: {exc}")
     session.flush()
+
+    artifact_parents: dict[str, str | None] = {}
+    for data in artifacts:
+        try:
+            revision_id = str(data["revision_id"])
+            if session.get(AssetRevision, revision_id) is None:
+                raise ValueError("artifact references an unknown revision")
+            identifier = str(data["id"])
+            known_artifact_ids.add(identifier)
+            artifact = session.get(Artifact, identifier)
+            if artifact is None:
+                artifact = Artifact(id=identifier, project_id=project.id, revision_id=revision_id)
+                session.add(artifact)
+            artifact.project_id = project.id
+            artifact.revision_id = revision_id
+            artifact.role = str(data["role"])
+            artifact.kind = str(data["kind"])
+            artifact.media_type = str(data["media_type"])
+            artifact.path = str(data["path"])
+            artifact.sha256 = str(data["sha256"])
+            artifact.byte_size = int(data["byte_size"])
+            artifact.width = int(data["width"]) if data.get("width") is not None else None
+            artifact.height = int(data["height"]) if data.get("height") is not None else None
+            artifact.parent_artifact_id = None
+            artifact.tool_json = dict(data.get("tool", {}))
+            artifact.file_path = str(data["file_path"])
+            artifact.created_at = _parse_datetime(data.get("created_at"))
+            artifact_parents[identifier] = (
+                str(data["parent_artifact_id"]) if data.get("parent_artifact_id") else None
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            errors.append(f"artifact {data.get('id', '<unknown>')}: {exc}")
+    session.flush()
+    for artifact_id, parent_id in artifact_parents.items():
+        artifact = session.get(Artifact, artifact_id)
+        if artifact is None or parent_id is None:
+            continue
+        parent = session.get(Artifact, parent_id)
+        if (
+            parent is None
+            or parent.id == artifact.id
+            or parent.project_id != artifact.project_id
+            or parent.revision_id != artifact.revision_id
+        ):
+            errors.append(f"artifact {artifact_id}: invalid parent artifact {parent_id}")
+            continue
+        artifact.parent_artifact_id = parent_id
+
     for data in qa_runs:
         try:
             rendition_id = str(data["rendition_id"])
@@ -684,13 +752,9 @@ def _scan_project(session: Session, project: Project) -> ScanReport:
             qa_run.verdict = str(data["verdict"])
             qa_run.checks_json = list(data.get("checks", []))
             qa_run.report_path = data.get("report_path")
+            qa_run.created_at = _parse_datetime(data.get("created_at"))
         except (KeyError, TypeError, ValueError) as exc:
             errors.append(f"QA run {data.get('id', '<unknown>')}: {exc}")
-    assets_by_key = {
-        asset.key: asset
-        for asset in session.scalars(select(Asset).where(Asset.project_id == project.id)).all()
-        if asset.id in known_asset_ids
-    }
     for data in relations:
         try:
             source = session.get(Asset, str(data["source_asset_id"]))
@@ -711,31 +775,103 @@ def _scan_project(session: Session, project: Project) -> ScanReport:
         except (KeyError, TypeError, ValueError) as exc:
             errors.append(f"relation {data.get('id', '<unknown>')}: {exc}")
     session.flush()
-    for asset in session.scalars(
-        select(Asset).where(
-            Asset.project_id == project.id,
-            Asset.current_revision_id.is_not(None),
-        )
-    ).all():
-        revision = session.get(AssetRevision, asset.current_revision_id)
-        if revision is None or revision.review_status != "approved":
-            continue
-        existing_decision = session.scalar(
-            select(ReviewDecision).where(ReviewDecision.revision_id == revision.id).limit(1)
-        )
-        if existing_decision is None:
-            session.add(
-                ReviewDecision(
-                    id=stable_id("review", revision.id, "approve"),
-                    revision_id=revision.id,
-                    asset_id=asset.id,
-                    verdict=ReviewVerdict.APPROVE.value,
-                    notes="Verified project baseline",
-                    dependency_hash=dependency_hash(session, revision),
-                    is_valid=True,
-                    created_at=revision.reviewed_at or utcnow(),
+
+    scanned_decisions: list[ReviewDecision] = []
+    for data in reviews:
+        try:
+            revision = session.get(AssetRevision, str(data["revision_id"]))
+            if revision is None:
+                raise ValueError("review references an unknown revision")
+            asset = session.get(Asset, revision.asset_id)
+            if asset is None or asset.project_id != project.id:
+                raise ValueError("review references an asset outside the project")
+            if data.get("asset_id") and str(data["asset_id"]) != asset.id:
+                raise ValueError("review asset does not match its revision")
+            identifier = str(data["id"])
+            known_review_ids.add(identifier)
+            decision = session.get(ReviewDecision, identifier)
+            if decision is None:
+                decision = ReviewDecision(id=identifier, revision_id=revision.id, asset_id=asset.id)
+                session.add(decision)
+            decision.revision_id = revision.id
+            decision.asset_id = asset.id
+            decision.verdict = str(data["verdict"])
+            decision.notes = data.get("notes")
+            decision.dependency_hash = str(data["dependency_hash"])
+            decision.is_valid = False
+            decision.created_at = _parse_datetime(data.get("created_at"))
+            for binding in list(decision.artifact_bindings):
+                session.delete(binding)
+            for binding_data in data.get("artifacts", []):
+                if not isinstance(binding_data, dict):
+                    raise ValueError("review artifact bindings must be objects")
+                artifact = session.get(Artifact, str(binding_data["artifact_id"]))
+                if artifact is None or artifact.project_id != project.id:
+                    raise ValueError("review references an unknown artifact")
+                role = str(binding_data["role"])
+                if artifact.revision_id != revision.id or artifact.role != role:
+                    raise ValueError("review artifact does not match its revision or role")
+                binding_hash = str(binding_data["sha256"])
+                if artifact.sha256 != binding_hash:
+                    raise ValueError("review artifact hash does not match its metadata")
+                decision.artifact_bindings.append(
+                    ReviewArtifact(
+                        id=stable_id(
+                            "review_artifact",
+                            identifier,
+                            artifact.id,
+                            role,
+                        ),
+                        artifact_id=artifact.id,
+                        role=role,
+                        sha256=binding_hash,
+                    )
                 )
-            )
+            scanned_decisions.append(decision)
+        except (KeyError, TypeError, ValueError) as exc:
+            errors.append(f"review {data.get('id', '<unknown>')}: {exc}")
+    session.flush()
+
+    latest_by_asset: dict[str, ReviewDecision] = {}
+    for decision in scanned_decisions:
+        previous = latest_by_asset.get(decision.asset_id)
+        if previous is None or (decision.created_at, decision.id) > (
+            previous.created_at,
+            previous.id,
+        ):
+            latest_by_asset[decision.asset_id] = decision
+    for asset_id, decision in latest_by_asset.items():
+        revision = session.get(AssetRevision, decision.revision_id)
+        asset = session.get(Asset, asset_id)
+        if revision is None or asset is None:
+            continue
+        decision.is_valid = decision.verdict == ReviewVerdict.REJECT.value or (
+            asset.current_revision_id == revision.id
+            and decision.dependency_hash == dependency_hash(session, revision)
+        )
+        if (
+            decision.verdict == ReviewVerdict.APPROVE.value
+            and not decision.is_valid
+            and asset.current_revision_id == revision.id
+        ):
+            asset.publication_status = PublicationStatus.BLOCKED.value
+
+    for data in releases:
+        try:
+            identifier = str(data["id"])
+            known_release_ids.add(identifier)
+            release = session.get(Release, identifier)
+            if release is None:
+                release = Release(id=identifier, project_id=project.id)
+                session.add(release)
+            release.project_id = project.id
+            release.name = str(data["name"])
+            release.manifest_path = str(data["manifest_path"])
+            release.manifest_hash = str(data["manifest_hash"])
+            release.asset_count = int(data["asset_count"])
+            release.created_at = _parse_datetime(data.get("created_at"))
+        except (KeyError, TypeError, ValueError) as exc:
+            errors.append(f"release {data.get('id', '<unknown>')}: {exc}")
     if not errors:
         project_assets = list(
             session.scalars(select(Asset).where(Asset.project_id == project.id)).all()
@@ -764,6 +900,27 @@ def _scan_project(session: Session, project: Project) -> ScanReport:
         stale_revision_ids = project_revision_ids - known_revision_ids
         stale_asset_ids = project_asset_ids - known_asset_ids
 
+        for decision in session.scalars(
+            select(ReviewDecision).where(ReviewDecision.asset_id.in_(project_asset_ids))
+        ).all():
+            if decision.id not in known_review_ids:
+                session.delete(decision)
+        stale_artifacts = [
+            artifact
+            for artifact in session.scalars(
+                select(Artifact).where(Artifact.project_id == project.id)
+            ).all()
+            if artifact.id not in known_artifact_ids
+        ]
+        for artifact in sorted(
+            stale_artifacts, key=lambda item: item.parent_artifact_id is None
+        ):
+            session.delete(artifact)
+        for release in session.scalars(
+            select(Release).where(Release.project_id == project.id)
+        ).all():
+            if release.id not in known_release_ids:
+                session.delete(release)
         for relation in session.scalars(
             select(AssetRelation).where(AssetRelation.project_id == project.id)
         ).all():
@@ -929,10 +1086,353 @@ def dependency_hash(session: Session, revision: AssetRevision) -> str:
     )
 
 
+def _image_source_metadata(path: Path) -> tuple[str, str, int, int]:
+    formats = {
+        "PNG": ("png", "image/png"),
+        "JPEG": ("jpg", "image/jpeg"),
+        "WEBP": ("webp", "image/webp"),
+        "GIF": ("gif", "image/gif"),
+    }
+    try:
+        with Image.open(path) as image:
+            image.load()
+            extension, media_type = formats.get(str(image.format), ("bin", "application/octet-stream"))
+            return extension, media_type, image.width, image.height
+    except (UnidentifiedImageError, OSError) as exc:
+        raise ServiceError(409, "candidate source image is not decodable") from exc
+
+
+def _runtime_extension(media_type: str) -> str:
+    return {
+        "image/webp": "webp",
+        "image/png": "png",
+        "image/jpeg": "jpg",
+        "image/gif": "gif",
+    }.get(media_type, "bin")
+
+
+def _approve_media_revision(
+    session: Session,
+    *,
+    revision: AssetRevision,
+    asset: Asset,
+    project: Project,
+    payload: ReviewCreate,
+) -> ReviewDecision:
+    renditions = list(
+        session.scalars(select(Rendition).where(Rendition.revision_id == revision.id)).all()
+    )
+    if len(renditions) != 1:
+        raise ServiceError(409, "a media revision must contain exactly one rendition")
+    candidate_rendition = renditions[0]
+    latest_qa = session.scalar(
+        select(QARun)
+        .where(QARun.rendition_id == candidate_rendition.id)
+        .order_by(QARun.created_at.desc())
+        .limit(1)
+    )
+    if latest_qa is None or latest_qa.verdict not in {
+        QAVerdict.PASS.value,
+        QAVerdict.WARNING.value,
+    }:
+        raise ServiceError(409, "hard QA must pass before approving a media revision")
+
+    store = ProjectStore(project.root_path)
+    source_candidate = safe_join(store.root, candidate_rendition.source_path)
+    runtime_candidate = safe_join(
+        store.root, candidate_rendition.normalized_path or candidate_rendition.source_path
+    )
+    source_extension, source_media_type, source_width, source_height = _image_source_metadata(
+        source_candidate
+    )
+    source_hash = sha256_file(source_candidate)
+    source_path, source_hash, source_size = store.promote_blob(
+        source_candidate,
+        directory="production/sources",
+        extension=source_extension,
+        expected_hash=source_hash,
+    )
+    runtime_path, runtime_hash, runtime_size = store.promote_blob(
+        runtime_candidate,
+        directory="approved/objects",
+        extension=_runtime_extension(candidate_rendition.media_type),
+        expected_hash=candidate_rendition.sha256,
+    )
+    revalidated_verdict, revalidated_checks = inspect_image(
+        safe_join(store.root, runtime_path),
+        expected_width=candidate_rendition.width,
+        expected_height=candidate_rendition.height,
+        max_bytes=runtime_size,
+    )
+    if revalidated_verdict == QAVerdict.FAIL.value:
+        raise ServiceError(409, "promoted media failed hard QA revalidation")
+
+    promoted_revision_id = stable_id(
+        "revision", revision.id, "promotion", source_hash, runtime_hash
+    )
+    source_artifact_id = stable_id("artifact", promoted_revision_id, "source", source_hash)
+    runtime_artifact_id = stable_id("artifact", promoted_revision_id, "runtime", runtime_hash)
+    promoted_rendition_id = stable_id("rendition", promoted_revision_id, runtime_hash)
+    now = utcnow()
+    sequence = (
+        session.scalar(
+            select(func.max(AssetRevision.sequence)).where(AssetRevision.asset_id == asset.id)
+        )
+        or 0
+    ) + 1
+
+    promoted_content = copy.deepcopy(revision.content_json)
+    if not isinstance(promoted_content, dict) or not isinstance(
+        promoted_content.get("rendition"), dict
+    ):
+        raise ServiceError(409, "media revision is missing rendition content")
+    promoted_rendition_data = dict(promoted_content["rendition"])
+    promoted_rendition_data.update(
+        {
+            "source_path": source_path,
+            "source_sha256": source_hash,
+            "source_artifact_id": source_artifact_id,
+            "normalized_path": runtime_path,
+            "artifact_id": runtime_artifact_id,
+            "sha256": runtime_hash,
+            "byte_size": runtime_size,
+        }
+    )
+    promoted_content["rendition"] = promoted_rendition_data
+    promoted_revision = AssetRevision(
+        id=promoted_revision_id,
+        asset_id=asset.id,
+        sequence=sequence,
+        format=revision.format,
+        content_json=promoted_content,
+        content_hash=sha256_bytes(canonical_json(promoted_content)),
+        parent_revision_id=revision.id,
+        input_hash=revision.input_hash,
+        style_revision=revision.style_revision,
+        prompt_recipe=revision.prompt_recipe,
+        provider_snapshot=revision.provider_snapshot,
+        file_path="pending",
+        review_status="approved",
+        reviewed_at=now,
+        created_at=now,
+    )
+
+    source_artifact = Artifact(
+        id=source_artifact_id,
+        project_id=project.id,
+        revision_id=promoted_revision_id,
+        role="source",
+        kind="provider_output",
+        media_type=source_media_type,
+        path=source_path,
+        sha256=source_hash,
+        byte_size=source_size,
+        width=source_width,
+        height=source_height,
+        parent_artifact_id=None,
+        tool_json={
+            "name": "provider",
+            "version": str(
+                revision.provider_snapshot.get("image_model")
+                or revision.provider_snapshot.get("kind")
+                or "unknown"
+            ),
+        },
+        file_path="pending",
+        created_at=now,
+    )
+    runtime_artifact = Artifact(
+        id=runtime_artifact_id,
+        project_id=project.id,
+        revision_id=promoted_revision_id,
+        role="runtime",
+        kind="normalized_media",
+        media_type=candidate_rendition.media_type,
+        path=runtime_path,
+        sha256=runtime_hash,
+        byte_size=runtime_size,
+        width=candidate_rendition.width,
+        height=candidate_rendition.height,
+        parent_artifact_id=source_artifact_id,
+        tool_json={"name": "gams.normalize_image", "version": "1"},
+        file_path="pending",
+        created_at=now,
+    )
+    promoted_rendition = Rendition(
+        id=promoted_rendition_id,
+        revision_id=promoted_revision_id,
+        media_type=candidate_rendition.media_type,
+        source_path=source_path,
+        normalized_path=runtime_path,
+        target_path=candidate_rendition.target_path,
+        sha256=runtime_hash,
+        width=candidate_rendition.width,
+        height=candidate_rendition.height,
+        byte_size=runtime_size,
+        created_at=now,
+    )
+    promoted_qa_id = stable_id("qa", promoted_rendition_id, runtime_hash, latest_qa.id)
+    promoted_qa = QARun(
+        id=promoted_qa_id,
+        rendition_id=promoted_rendition_id,
+        verdict=revalidated_verdict,
+        checks_json=revalidated_checks,
+        report_path=f"history/qa/{promoted_qa_id}.json",
+        created_at=now,
+    )
+    decision = ReviewDecision(
+        id=new_id(),
+        revision_id=promoted_revision_id,
+        asset_id=asset.id,
+        verdict=ReviewVerdict.APPROVE.value,
+        notes=payload.notes,
+        dependency_hash=dependency_hash(session, promoted_revision),
+        is_valid=True,
+        created_at=now,
+    )
+    artifact_bindings = [
+        {"artifact_id": source_artifact.id, "role": "source", "sha256": source_artifact.sha256},
+        {"artifact_id": runtime_artifact.id, "role": "runtime", "sha256": runtime_artifact.sha256},
+    ]
+    artifact_records = [
+        {
+            "object_type": "artifact",
+            "format_version": 1,
+            "id": artifact.id,
+            "project_id": artifact.project_id,
+            "revision_id": artifact.revision_id,
+            "role": artifact.role,
+            "kind": artifact.kind,
+            "media_type": artifact.media_type,
+            "path": artifact.path,
+            "sha256": artifact.sha256,
+            "byte_size": artifact.byte_size,
+            "width": artifact.width,
+            "height": artifact.height,
+            "parent_artifact_id": artifact.parent_artifact_id,
+            "tool": artifact.tool_json,
+            "created_at": artifact.created_at.isoformat(),
+        }
+        for artifact in (source_artifact, runtime_artifact)
+    ]
+    revision_record = _revision_file(promoted_revision)
+    revision_record["promotion_of_revision_id"] = revision.id
+    qa_record = {
+        "id": promoted_qa.id,
+        "rendition_id": promoted_qa.rendition_id,
+        "verdict": promoted_qa.verdict,
+        "checks": promoted_qa.checks_json,
+        "report_path": promoted_qa.report_path,
+        "created_at": promoted_qa.created_at.isoformat(),
+    }
+    review_record = {
+        "id": decision.id,
+        "asset_id": asset.id,
+        "revision_id": decision.revision_id,
+        "source_revision_id": revision.id,
+        "verdict": decision.verdict,
+        "notes": decision.notes,
+        "dependency_hash": decision.dependency_hash,
+        "artifacts": artifact_bindings,
+        "created_at": decision.created_at.isoformat(),
+    }
+    next_candidate_id = session.scalar(
+        select(AssetRevision.id)
+        .where(
+            AssetRevision.asset_id == asset.id,
+            AssetRevision.review_status == "pending",
+            AssetRevision.id != revision.id,
+        )
+        .order_by(AssetRevision.sequence.desc())
+        .limit(1)
+    )
+    title = _revision_title(asset, promoted_content)
+    written = store.commit_media_approval(
+        key=asset.key,
+        history_records=[*artifact_records, revision_record],
+        qa_record=qa_record,
+        review=review_record,
+        asset_updates={
+            "title": title,
+            "content_status": ContentStatus.APPROVED.value,
+            "publication_status": PublicationStatus.READY.value,
+            "current_revision_id": promoted_revision.id,
+            "latest_candidate_revision_id": next_candidate_id,
+            "updated_at": now.isoformat(),
+        },
+        superseded_revision_ids=[revision.id],
+    )
+    promoted_revision.file_path = written[promoted_revision.id]
+    source_artifact.file_path = written[source_artifact.id]
+    runtime_artifact.file_path = written[runtime_artifact.id]
+
+    session.execute(
+        ReviewDecision.__table__.update()
+        .where(ReviewDecision.asset_id == asset.id, ReviewDecision.is_valid.is_(True))
+        .values(is_valid=False)
+    )
+    revision.review_status = "superseded"
+    asset.current_revision_id = promoted_revision.id
+    asset.latest_candidate_revision_id = next_candidate_id
+    asset.content_status = ContentStatus.APPROVED.value
+    asset.publication_status = PublicationStatus.READY.value
+    asset.title = title
+    asset.updated_at = now
+    session.add(promoted_revision)
+    session.flush()
+    session.add(source_artifact)
+    session.flush()
+    session.add(runtime_artifact)
+    session.add(promoted_rendition)
+    session.flush()
+    session.add(promoted_qa)
+    session.add(decision)
+    session.flush()
+    for binding in artifact_bindings:
+        session.add(
+            ReviewArtifact(
+                id=stable_id(
+                    "review_artifact",
+                    decision.id,
+                    str(binding["artifact_id"]),
+                    str(binding["role"]),
+                ),
+                review_id=decision.id,
+                artifact_id=str(binding["artifact_id"]),
+                role=str(binding["role"]),
+                sha256=str(binding["sha256"]),
+            )
+        )
+    dependent_assets = session.scalars(
+        select(Asset)
+        .join(AssetRelation, AssetRelation.source_asset_id == Asset.id)
+        .where(AssetRelation.target_asset_id == asset.id)
+    ).all()
+    for dependent in dependent_assets:
+        session.execute(
+            ReviewDecision.__table__.update()
+            .where(ReviewDecision.asset_id == dependent.id, ReviewDecision.is_valid.is_(True))
+            .values(is_valid=False)
+        )
+        dependent.publication_status = PublicationStatus.BLOCKED.value
+    session.commit()
+    return decision
+
+
 def create_review(session: Session, payload: ReviewCreate) -> ReviewDecision:
     revision = require(session, AssetRevision, payload.revision_id, "revision")
     asset = require(session, Asset, revision.asset_id, "asset")
     project = require(session, Project, asset.project_id, "project")
+    if revision.review_status != "pending":
+        raise ServiceError(409, "only a pending candidate revision can be reviewed")
+    if payload.verdict == ReviewVerdict.APPROVE and revision.format == "media":
+        return _approve_media_revision(
+            session,
+            revision=revision,
+            asset=asset,
+            project=project,
+            payload=payload,
+        )
     if payload.verdict == ReviewVerdict.APPROVE:
         renditions = session.scalars(select(Rendition).where(Rendition.revision_id == revision.id)).all()
         for rendition in renditions:
@@ -942,7 +1442,10 @@ def create_review(session: Session, payload: ReviewCreate) -> ReviewDecision:
                 .order_by(QARun.created_at.desc())
                 .limit(1)
             )
-            if latest_qa is None or latest_qa.verdict == QAVerdict.FAIL.value:
+            if latest_qa is None or latest_qa.verdict not in {
+                QAVerdict.PASS.value,
+                QAVerdict.WARNING.value,
+            }:
                 raise ServiceError(409, "hard QA must pass before approving a media revision")
         _sync_approved_relations(session, project=project, asset=asset, content=revision.content_json)
     session.execute(
@@ -1012,10 +1515,12 @@ def create_review(session: Session, payload: ReviewCreate) -> ReviewDecision:
         key=asset.key,
         review={
             "id": decision.id,
+            "asset_id": asset.id,
             "revision_id": decision.revision_id,
             "verdict": decision.verdict,
             "notes": decision.notes,
             "dependency_hash": decision.dependency_hash,
+            "artifacts": [],
             "created_at": decision.created_at.isoformat(),
         },
     )
@@ -1096,21 +1601,34 @@ def run_qa(session: Session, payload: QARunCreate) -> QARun:
     return qa
 
 
-def create_release(session: Session, payload: ReleaseCreate) -> Release:
-    project = require(session, Project, payload.project_id, "project")
+def _release_preflight(
+    session: Session, *, project: Project
+) -> tuple[list[dict[str, Any]], list[Asset], list[str]]:
     store = ProjectStore(project.root_path)
-    assets = session.scalars(
-        select(Asset).where(
-            Asset.project_id == project.id,
-            Asset.current_revision_id.is_not(None),
-            Asset.content_status == ContentStatus.APPROVED.value,
-        )
-    ).all()
+    assets = list(
+        session.scalars(
+            select(Asset)
+            .where(
+                Asset.project_id == project.id,
+                Asset.content_status == ContentStatus.APPROVED.value,
+            )
+            .order_by(Asset.key)
+        ).all()
+    )
     entries: list[dict[str, Any]] = []
-    released_assets: list[Asset] = []
+    valid_assets: list[Asset] = []
+    issues: list[str] = []
+    target_owners: dict[str, str] = {}
+    if not assets:
+        issues.append("the project has no approved assets")
+
     for asset in assets:
+        if not asset.current_revision_id:
+            issues.append(f"{asset.key}: approved asset has no current revision")
+            continue
         revision = session.get(AssetRevision, asset.current_revision_id)
-        if revision is None:
+        if revision is None or revision.asset_id != asset.id:
+            issues.append(f"{asset.key}: current revision is missing or belongs to another asset")
             continue
         approval = session.scalar(
             select(ReviewDecision)
@@ -1122,40 +1640,203 @@ def create_release(session: Session, payload: ReleaseCreate) -> Release:
             .order_by(ReviewDecision.created_at.desc())
             .limit(1)
         )
-        if approval is None or approval.dependency_hash != dependency_hash(session, revision):
-            asset.publication_status = PublicationStatus.BLOCKED.value
+        if approval is None:
+            issues.append(f"{asset.key}: current revision has no valid approval")
             continue
+        if approval.dependency_hash != dependency_hash(session, revision):
+            issues.append(f"{asset.key}: approved dependency hash is stale")
+            continue
+
+        content_rendition = (
+            revision.content_json.get("rendition")
+            if isinstance(revision.content_json, dict)
+            else None
+        )
+        renditions = list(
+            session.scalars(select(Rendition).where(Rendition.revision_id == revision.id)).all()
+        )
+        if revision.format == "media" and len(renditions) != 1:
+            issues.append(f"{asset.key}: media revision must have exactly one rendition")
+            continue
+
         rendition_entries: list[dict[str, Any]] = []
-        renditions = session.scalars(select(Rendition).where(Rendition.revision_id == revision.id)).all()
-        hard_failure = False
+        asset_failed = False
+        bindings_by_role: dict[str, list[ReviewArtifact]] = {}
+        for binding in approval.artifact_bindings:
+            bindings_by_role.setdefault(binding.role, []).append(binding)
         for rendition in renditions:
-            qa = session.scalar(
+            source_path = rendition.source_path
+            runtime_path = rendition.normalized_path or source_path
+            if source_path.startswith("workspace/") or runtime_path.startswith("workspace/"):
+                issues.append(f"{asset.key}: approved rendition still references workspace")
+                asset_failed = True
+                continue
+            try:
+                source_file = safe_join(store.root, source_path)
+                runtime_file = safe_join(store.root, runtime_path)
+            except StorageError as exc:
+                issues.append(f"{asset.key}: {exc}")
+                asset_failed = True
+                continue
+
+            source_facts: tuple[str, int] | None = None
+            if not source_file.is_file():
+                issues.append(f"{asset.key}: source blob is missing: {source_path}")
+                asset_failed = True
+            else:
+                try:
+                    source_facts = (sha256_file(source_file), source_file.stat().st_size)
+                except OSError as exc:
+                    issues.append(f"{asset.key}: source blob cannot be verified: {exc}")
+                    asset_failed = True
+
+            runtime_facts: tuple[str, int] | None = None
+            if not runtime_file.is_file():
+                issues.append(f"{asset.key}: runtime blob is missing: {runtime_path}")
+                asset_failed = True
+            else:
+                try:
+                    runtime_facts = (sha256_file(runtime_file), runtime_file.stat().st_size)
+                except OSError as exc:
+                    issues.append(f"{asset.key}: runtime blob cannot be verified: {exc}")
+                    asset_failed = True
+                else:
+                    if runtime_facts[0] != rendition.sha256:
+                        issues.append(
+                            f"{asset.key}: runtime blob hash does not match its rendition"
+                        )
+                        asset_failed = True
+                    if runtime_facts[1] != rendition.byte_size:
+                        issues.append(
+                            f"{asset.key}: runtime blob byte size does not match its rendition"
+                        )
+                        asset_failed = True
+
+            if revision.format == "media":
+                expected_rendition = {
+                    "media_type": rendition.media_type,
+                    "source_path": source_path,
+                    "normalized_path": rendition.normalized_path,
+                    "target_path": rendition.target_path,
+                    "sha256": rendition.sha256,
+                    "width": rendition.width,
+                    "height": rendition.height,
+                    "byte_size": rendition.byte_size,
+                }
+                if not isinstance(content_rendition, dict) or any(
+                    content_rendition.get(field) != value
+                    for field, value in expected_rendition.items()
+                ):
+                    issues.append(f"{asset.key}: revision content does not match its rendition")
+                    asset_failed = True
+
+            latest_qa = session.scalar(
                 select(QARun)
                 .where(QARun.rendition_id == rendition.id)
                 .order_by(QARun.created_at.desc())
                 .limit(1)
             )
-            if qa is None or qa.verdict == QAVerdict.FAIL.value:
-                hard_failure = True
-                break
-            published_path = rendition.normalized_path or rendition.source_path
-            backup_path = None
-            if payload.publish_media and rendition.target_path:
-                candidate = safe_join(store.root, rendition.normalized_path or rendition.source_path)
-                published_path, backup_path = store.atomic_publish(candidate, rendition.target_path)
+            if latest_qa is None or latest_qa.verdict not in {
+                QAVerdict.PASS.value,
+                QAVerdict.WARNING.value,
+            }:
+                issues.append(f"{asset.key}: latest hard QA does not pass")
+                asset_failed = True
+
+            artifact_id = (
+                content_rendition.get("artifact_id")
+                if isinstance(content_rendition, dict)
+                else None
+            )
+            source_artifact_id = (
+                content_rendition.get("source_artifact_id")
+                if isinstance(content_rendition, dict)
+                else None
+            )
+            artifact_ids = (source_artifact_id, artifact_id)
+            if any(artifact_ids) and not all(artifact_ids):
+                issues.append(f"{asset.key}: promoted rendition has incomplete artifact metadata")
+                asset_failed = True
+            elif not any(artifact_ids) and approval.artifact_bindings:
+                issues.append(f"{asset.key}: review has artifacts but the revision does not")
+                asset_failed = True
+
+            source_sha256 = (
+                content_rendition.get("source_sha256")
+                if isinstance(content_rendition, dict)
+                else None
+            )
+            for role, expected_id, expected_path, expected_hash, expected_size, facts in (
+                ("source", source_artifact_id, source_path, source_sha256, None, source_facts),
+                (
+                    "runtime",
+                    artifact_id,
+                    runtime_path,
+                    rendition.sha256,
+                    rendition.byte_size,
+                    runtime_facts,
+                ),
+            ):
+                if not expected_id:
+                    continue
+                artifact = session.get(Artifact, str(expected_id))
+                role_bindings = bindings_by_role.get(role, [])
+                expected_parent_id = None if role == "source" else source_artifact_id
+                if (
+                    artifact is None
+                    or artifact.project_id != project.id
+                    or artifact.revision_id != revision.id
+                    or artifact.role != role
+                    or artifact.path != expected_path
+                    or artifact.sha256 != expected_hash
+                    or artifact.parent_artifact_id != expected_parent_id
+                    or (expected_size is not None and artifact.byte_size != expected_size)
+                    or len(role_bindings) != 1
+                ):
+                    issues.append(f"{asset.key}: {role} artifact binding is invalid")
+                    asset_failed = True
+                    continue
+                binding = role_bindings[0]
+                if binding.artifact_id != artifact.id or binding.sha256 != artifact.sha256:
+                    issues.append(f"{asset.key}: {role} artifact binding is invalid")
+                    asset_failed = True
+                if facts is not None and facts != (artifact.sha256, artifact.byte_size):
+                    issues.append(
+                        f"{asset.key}: {role} artifact blob hash or byte size is invalid"
+                    )
+                    asset_failed = True
+
+            if rendition.target_path:
+                try:
+                    safe_join(store.root, rendition.target_path)
+                except StorageError as exc:
+                    issues.append(f"{asset.key}: invalid target path: {exc}")
+                    asset_failed = True
+                target_key = rendition.target_path.casefold()
+                owner = target_owners.get(target_key)
+                if owner is not None and owner != asset.key:
+                    issues.append(
+                        f"{asset.key}: target path collides with {owner}: {rendition.target_path}"
+                    )
+                    asset_failed = True
+                else:
+                    target_owners[target_key] = asset.key
+
             rendition_entries.append(
                 {
                     "id": rendition.id,
+                    "artifact_id": artifact_id,
+                    "source_artifact_id": source_artifact_id,
                     "media_type": rendition.media_type,
-                    "path": published_path,
+                    "path": runtime_path,
+                    "target_path": rendition.target_path,
                     "sha256": rendition.sha256,
                     "width": rendition.width,
                     "height": rendition.height,
-                    "backup_path": backup_path,
+                    "byte_size": rendition.byte_size,
                 }
             )
-        if hard_failure:
-            asset.publication_status = PublicationStatus.BLOCKED.value
+        if asset_failed:
             continue
         entries.append(
             {
@@ -1164,11 +1845,22 @@ def create_release(session: Session, payload: ReleaseCreate) -> Release:
                 "subtype": asset.subtype,
                 "revision_id": revision.id,
                 "content_hash": revision.content_hash,
+                "dependency_hash": approval.dependency_hash,
                 "content": revision.content_json,
                 "renditions": rendition_entries,
             }
         )
-        released_assets.append(asset)
+        valid_assets.append(asset)
+    return entries, valid_assets, issues
+
+
+def create_release(session: Session, payload: ReleaseCreate) -> Release:
+    project = require(session, Project, payload.project_id, "project")
+    entries, released_assets, issues = _release_preflight(session, project=project)
+    if issues:
+        raise ServiceError(409, "release preflight failed:\n- " + "\n- ".join(issues))
+
+    store = ProjectStore(project.root_path)
     release = Release(
         id=new_id(),
         project_id=project.id,
@@ -1186,17 +1878,20 @@ def create_release(session: Session, payload: ReleaseCreate) -> Release:
         "created_at": release.created_at.isoformat(),
         "assets": sorted(entries, key=lambda entry: entry["key"]),
     }
-    release.manifest_path, release.manifest_hash = store.write_release(release.id, manifest)
     session.add(release)
+    session.flush()
+    release.manifest_path, release.manifest_hash = store.commit_release(
+        release.id,
+        manifest,
+        {
+            asset.key: {
+                "publication_status": PublicationStatus.PUBLISHED.value,
+                "updated_at": asset.updated_at.isoformat(),
+            }
+            for asset in released_assets
+        },
+    )
     for asset in released_assets:
         asset.publication_status = PublicationStatus.PUBLISHED.value
-        store.update_asset_state(
-            kind=asset.kind,
-            key=asset.key,
-            content_status=asset.content_status,
-            publication_status=asset.publication_status,
-            current_revision_id=asset.current_revision_id,
-            latest_candidate_revision_id=asset.latest_candidate_revision_id,
-        )
     session.commit()
     return release

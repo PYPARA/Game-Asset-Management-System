@@ -8,9 +8,9 @@ Project 根目录的 `project.yaml` 是识别入口，当前且唯一的 `format
 
 ```text
 catalog/       可变的当前资产描述，按内容领域和媒体类别分组
-history/       内容寻址的不可变修订与审核记录
-production/    风格圣经、Prompt 配方和制作母版
-approved/      已批准的精确媒体字节
+history/       内容寻址的不可变修订、Artifact 元数据、QA 与审核记录
+production/    风格圣经、Prompt 配方、制作母版和内容寻址原始来源
+approved/      内容寻址的已批准运行媒体
 releases/      不可变发布 Manifest
 workspace/     候选、驳回、QA 报告、缓存和日志
 ```
@@ -21,11 +21,12 @@ workspace/     候选、驳回、QA 报告、缓存和日志
 
 1. Catalog 描述稳定 Key、类型、关系和当前/候选修订指针。
 2. 新修订以规范 JSON 哈希写入 `history/objects/<prefix>/<hash>.json`；媒体 rendition 内嵌在媒体修订中。
-3. 媒体生成先写入 `workspace/candidates`，归一化并完成硬 QA。
-4. 人工审核把准确修订设为当前版本，审核记录写入 `history/reviews`。
-5. Release 尝试收集有效批准修订，并将批准媒体原子发布到 Project 内目标路径；当前实现会跳过不合格资产，尚未达到目标的 fail-closed 语义。
+3. 媒体生成先写入 `workspace/candidates`，归一化并完成硬 QA；QA fail 的 Job 进入 `qa_failed`，不再标记为 `succeeded`。
+4. 人工批准媒体时，把原始来源提升到 `production/sources/<hash>`、运行媒体提升到 `approved/objects/<hash>`，写入 Artifact 元数据和只引用耐久对象的 promotion 修订，最后更新 Catalog 指针。
+5. 审核记录绑定准确修订、依赖哈希以及来源/运行 Artifact 哈希。文件事务失败时恢复 Catalog 和本次正式记录；正确但孤立的内容寻址 Blob 可由后续垃圾回收处理。
+6. Release v1 对全部已批准资产执行 fail-closed 预检，成功后写不可变 Manifest；`target_path` 仅作为后续 Delivery 的逻辑目标，Release 不再从 workspace 发布媒体。
 
-SQLite 是可重建索引。项目扫描会按磁盘权威状态重建资产、修订、rendition、QA 和关系；任务队列等本地运行状态继续保存在 SQLite。
+SQLite 是可重建索引。项目扫描会按磁盘权威状态重建资产、修订、Artifact、rendition、QA、审核、关系和 Release；任务队列等本地运行状态继续保存在 SQLite。
 
 ## 目标四层架构
 

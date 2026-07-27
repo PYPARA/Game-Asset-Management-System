@@ -14,6 +14,7 @@ from .database import Database
 from .domain import (
     AssetCreate,
     AssetRead,
+    ArtifactRead,
     GenerationAttemptRead,
     GenerationJobRead,
     GenerationPlanCreate,
@@ -46,6 +47,7 @@ from .models import (
     Asset,
     AssetRelation,
     AssetRevision,
+    Artifact,
     GenerationAttempt,
     GenerationJob,
     GenerationPlan,
@@ -242,6 +244,25 @@ def get_revision(revision_id: str, session: Session = Depends(db)) -> AssetRevis
 @router.get("/revisions/{revision_id}/renditions", response_model=list[RenditionRead])
 def revision_renditions(revision_id: str, session: Session = Depends(db)) -> list[Rendition]:
     return list(session.scalars(select(Rendition).where(Rendition.revision_id == revision_id)).all())
+
+
+@router.get("/artifacts", response_model=list[ArtifactRead])
+def list_artifacts(
+    project_id: str | None = None,
+    revision_id: str | None = None,
+    session: Session = Depends(db),
+) -> list[Artifact]:
+    statement = select(Artifact)
+    if project_id:
+        statement = statement.where(Artifact.project_id == project_id)
+    if revision_id:
+        statement = statement.where(Artifact.revision_id == revision_id)
+    return list(session.scalars(statement.order_by(Artifact.created_at, Artifact.id)).all())
+
+
+@router.get("/artifacts/{artifact_id}", response_model=ArtifactRead)
+def get_artifact(artifact_id: str, session: Session = Depends(db)) -> Artifact:
+    return require(session, Artifact, artifact_id, "artifact")
 
 
 @router.get("/renditions/{rendition_id}/content", response_class=FileResponse)
@@ -525,11 +546,14 @@ def resume_job(
 ) -> GenerationJob:
     job = require(session, GenerationJob, job_id, "generation job")
     if job.status not in {
+        GenerationStatus.QA_FAILED.value,
         GenerationStatus.FAILED.value,
         GenerationStatus.CANCELLED.value,
         GenerationStatus.CREDENTIALS_LOCKED.value,
     }:
-        raise ServiceError(409, "only failed, cancelled, or credentials-locked jobs can resume")
+        raise ServiceError(
+            409, "only QA-failed, failed, cancelled, or credentials-locked jobs can resume"
+        )
     profile = require(session, ProviderProfile, job.provider_profile_id, "provider profile")
     job.status = (
         GenerationStatus.QUEUED.value

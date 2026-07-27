@@ -32,6 +32,7 @@ class GenerationStatus(StrEnum):
     QUEUED = "queued"
     RUNNING = "running"
     SUCCEEDED = "succeeded"
+    QA_FAILED = "qa_failed"
     FAILED = "failed"
     CANCELLED = "cancelled"
     CREDENTIALS_LOCKED = "credentials_locked"
@@ -235,6 +236,24 @@ class RenditionRead(ORMModel):
     created_at: datetime
 
 
+class ArtifactRead(ORMModel):
+    id: str
+    project_id: str
+    revision_id: str
+    role: str
+    kind: str
+    media_type: str
+    path: str
+    sha256: str
+    byte_size: int
+    width: int | None
+    height: int | None
+    parent_artifact_id: str | None
+    tool: dict[str, Any] = Field(validation_alias="tool_json")
+    file_path: str
+    created_at: datetime
+
+
 class ProviderCreate(BaseModel):
     name: str
     kind: ProviderKind = ProviderKind.OPENAI_COMPATIBLE
@@ -358,6 +377,12 @@ class ReviewCreate(BaseModel):
     notes: str | None = None
 
 
+class ReviewArtifactRead(ORMModel):
+    artifact_id: str
+    role: str
+    sha256: str
+
+
 class ReviewRead(ORMModel):
     id: str
     revision_id: str
@@ -366,13 +391,20 @@ class ReviewRead(ORMModel):
     notes: str | None
     dependency_hash: str
     is_valid: bool
+    artifacts: list[ReviewArtifactRead] = Field(
+        default_factory=list, validation_alias="artifact_bindings"
+    )
     created_at: datetime
 
 
 class ReleaseCreate(BaseModel):
     project_id: str
     name: str
-    publish_media: bool = True
+    publish_media: bool = Field(
+        default=True,
+        deprecated=True,
+        description="Compatibility field; Release v1 records durable objects and never performs Delivery.",
+    )
 
 
 class ReleaseRead(ORMModel):

@@ -8,6 +8,7 @@ import tempfile
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,19 @@ class UnsafePathError(StorageError):
 
 class ImmutableRevisionError(StorageError):
     pass
+
+
+@dataclass(slots=True)
+class ProjectScanResult:
+    assets: list[dict[str, Any]]
+    revisions: list[dict[str, Any]]
+    renditions: list[dict[str, Any]]
+    qa_runs: list[dict[str, Any]]
+    relations: list[dict[str, Any]]
+    artifacts: list[dict[str, Any]]
+    reviews: list[dict[str, Any]]
+    releases: list[dict[str, Any]]
+    errors: list[str]
 
 
 def canonical_json(value: Any) -> bytes:
@@ -173,6 +187,7 @@ class ProjectStore:
                 "production/prompt-recipes",
                 "production/sources",
                 "approved/assets",
+                "approved/objects",
                 "history/objects",
                 "history/reviews",
                 "history/qa",
@@ -445,18 +460,74 @@ class ProjectStore:
                 },
             )
 
-    def write_revision(self, *, kind: str, key: str, revision: dict[str, Any]) -> str:
-        object_hash = sha256_bytes(canonical_json(revision))
-        path = self.history / "objects" / object_hash[:2] / f"{object_hash}.json"
+    def history_object_path(self, record: dict[str, Any]) -> Path:
+        object_hash = sha256_bytes(canonical_json(record))
+        return self.history / "objects" / object_hash[:2] / f"{object_hash}.json"
+
+    def _write_history_object(self, record: dict[str, Any]) -> tuple[str, bool]:
+        path = self.history_object_path(record)
+        created = False
         with self.lock():
             if path.exists():
-                if self.read_json(path) != revision:
+                if self.read_json(path) != record:
                     raise ImmutableRevisionError(f"history object hash collision: {path}")
             else:
-                atomic_write_json(path, revision, immutable=True)
-        return relative_to_root(self.root, path)
+                atomic_write_json(path, record, immutable=True)
+                created = True
+        return relative_to_root(self.root, path), created
 
-    def write_review(self, *, kind: str, key: str, review: dict[str, Any]) -> str:
+    def write_revision(self, *, kind: str, key: str, revision: dict[str, Any]) -> str:
+        path, _created = self._write_history_object(revision)
+        return path
+
+    def write_artifact(self, artifact: dict[str, Any]) -> tuple[str, bool]:
+        if artifact.get("object_type") != "artifact":
+            raise StorageError("artifact history objects must declare object_type=artifact")
+        return self._write_history_object(artifact)
+
+    def promote_blob(
+        self,
+        source: Path,
+        *,
+        directory: str,
+        extension: str,
+        expected_hash: str | None = None,
+    ) -> tuple[str, str, int]:
+        if directory not in {"production/sources", "approved/objects"}:
+            raise StorageError("unsupported durable artifact directory")
+        extension = extension.lower().lstrip(".")
+        if not extension or not extension.isalnum():
+            raise StorageError("artifact extension must be alphanumeric")
+        relative_to_root(self.root, source)
+        if not source.is_file():
+            raise StorageError(f"artifact source does not exist: {source}")
+        digest = sha256_file(source)
+        if expected_hash is not None and digest != expected_hash:
+            raise StorageError("artifact source hash changed during promotion")
+        target = safe_join(self.root, f"{directory}/{digest[:2]}/{digest}.{extension}")
+        with self.lock():
+            if target.exists():
+                if not target.is_file() or sha256_file(target) != digest:
+                    raise StorageError(f"content-addressed artifact is corrupt: {target}")
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                descriptor, temp_name = tempfile.mkstemp(
+                    prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
+                )
+                os.close(descriptor)
+                try:
+                    shutil.copy2(source, temp_name)
+                    if sha256_file(Path(temp_name)) != digest:
+                        raise StorageError("artifact changed while it was copied")
+                    with open(temp_name, "rb") as staged:
+                        os.fsync(staged.fileno())
+                    os.replace(temp_name, target)
+                finally:
+                    if os.path.exists(temp_name):
+                        os.unlink(temp_name)
+        return relative_to_root(self.root, target), digest, target.stat().st_size
+
+    def review_path(self, review: dict[str, Any]) -> Path:
         review_id = str(review["id"])
         if "/" in review_id or "\\" in review_id or review_id in {".", ".."}:
             raise StorageError("invalid review id")
@@ -465,7 +536,10 @@ class ProjectStore:
             date = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
         except ValueError as exc:
             raise StorageError("review created_at must be an ISO timestamp") from exc
-        path = self.history / "reviews" / f"{date.year:04d}" / f"{date.month:02d}" / f"{review_id}.json"
+        return self.history / "reviews" / f"{date.year:04d}" / f"{date.month:02d}" / f"{review_id}.json"
+
+    def write_review(self, *, kind: str, key: str, review: dict[str, Any]) -> str:
+        path = self.review_path(review)
         with self.lock():
             atomic_write_json(path, review, immutable=True)
         return relative_to_root(self.root, path)
@@ -473,8 +547,84 @@ class ProjectStore:
     def write_qa_record(self, record: dict[str, Any]) -> str:
         path = self.history / "qa" / f"{record['id']}.json"
         with self.lock():
-            atomic_write_json(path, record)
+            if path.exists():
+                if self.read_json(path) != record:
+                    raise ImmutableRevisionError(f"immutable QA record already exists: {path}")
+            else:
+                atomic_write_json(path, record, immutable=True)
         return relative_to_root(self.root, path)
+
+    def commit_media_approval(
+        self,
+        *,
+        key: str,
+        history_records: list[dict[str, Any]],
+        qa_record: dict[str, Any],
+        review: dict[str, Any],
+        asset_updates: dict[str, Any],
+        superseded_revision_ids: list[str],
+    ) -> dict[str, str]:
+        """Commit formal approval records and the Catalog pointer as one file transaction.
+
+        Durable content-addressed blobs are promoted before this method. If any formal
+        record or Catalog write fails, newly created history records are removed and the
+        previous Catalog bytes are restored. Correct shared blobs may remain orphaned.
+        """
+
+        with self.lock():
+            catalog_path, collection, descriptor = self._find_asset(key)
+            original_catalog = catalog_path.read_bytes()
+            created_paths: list[Path] = []
+            written: dict[str, str] = {}
+            qa_path = self.history / "qa" / f"{qa_record['id']}.json"
+            review_path = self.review_path(review)
+            try:
+                for record in history_records:
+                    object_path = self.history_object_path(record)
+                    if object_path.exists():
+                        if self.read_json(object_path) != record:
+                            raise ImmutableRevisionError(
+                                f"history object hash collision: {object_path}"
+                            )
+                    else:
+                        atomic_write_json(object_path, record, immutable=True)
+                        created_paths.append(object_path)
+                    written[str(record["id"])] = relative_to_root(self.root, object_path)
+
+                if qa_path.exists():
+                    if self.read_json(qa_path) != qa_record:
+                        raise ImmutableRevisionError(
+                            f"immutable QA record already exists: {qa_path}"
+                        )
+                else:
+                    atomic_write_json(qa_path, qa_record, immutable=True)
+                    created_paths.append(qa_path)
+                written[str(qa_record["id"])] = relative_to_root(self.root, qa_path)
+
+                atomic_write_json(review_path, review, immutable=True)
+                created_paths.append(review_path)
+                written[str(review["id"])] = relative_to_root(self.root, review_path)
+
+                existing_superseded = {
+                    str(value) for value in descriptor.get("superseded_revision_ids", []) if value
+                }
+                descriptor.update(asset_updates)
+                descriptor["superseded_revision_ids"] = sorted(
+                    existing_superseded | set(superseded_revision_ids)
+                )
+                collection["assets"] = sorted(
+                    collection["assets"], key=lambda item: str(item["key"])
+                )
+                atomic_write_json(catalog_path, collection)
+            except Exception:
+                atomic_write_bytes(catalog_path, original_catalog)
+                for created_path in reversed(created_paths):
+                    try:
+                        created_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                raise
+        return written
 
     def read_schema(self, schema_ref: str | None) -> dict[str, Any] | None:
         if not schema_ref:
@@ -501,15 +651,48 @@ class ProjectStore:
         list[dict[str, Any]],
         list[str],
     ]:
+        result = self.scan_full()
+        return (
+            result.assets,
+            result.revisions,
+            result.renditions,
+            result.qa_runs,
+            result.relations,
+            result.errors,
+        )
+
+    def scan_full(self) -> ProjectScanResult:
         assets: list[dict[str, Any]] = []
         revisions: list[dict[str, Any]] = []
         renditions: list[dict[str, Any]] = []
         qa_runs: list[dict[str, Any]] = []
         relations: list[dict[str, Any]] = []
+        artifacts: list[dict[str, Any]] = []
+        review_records: list[dict[str, Any]] = []
+        releases: list[dict[str, Any]] = []
         errors: list[str] = []
         superseded_revision_ids: set[str] = set()
+        current_revision_ids: set[str] = set()
+        candidate_revision_ids: set[str] = set()
         if not (self.root / "project.yaml").is_file():
-            return assets, revisions, renditions, qa_runs, relations, ["project.yaml is missing"]
+            return ProjectScanResult(
+                assets,
+                revisions,
+                renditions,
+                qa_runs,
+                relations,
+                artifacts,
+                review_records,
+                releases,
+                ["project.yaml is missing"],
+            )
+
+        try:
+            contract = self.read_yaml(self.root / "project.yaml")
+            project_id = str(contract["id"])
+        except (StorageError, KeyError, TypeError, ValueError) as exc:
+            project_id = ""
+            errors.append(f"project.yaml: {exc}")
 
         for collection_path in sorted(self.catalog.rglob("*.json")):
             try:
@@ -526,6 +709,10 @@ class ProjectStore:
                     if self.collection_path(descriptor) != collection_path:
                         raise StorageError("asset kind/subtype does not match collection path")
                     assets.append(descriptor)
+                    if descriptor.get("current_revision_id"):
+                        current_revision_ids.add(str(descriptor["current_revision_id"]))
+                    if descriptor.get("latest_candidate_revision_id"):
+                        candidate_revision_ids.add(str(descriptor["latest_candidate_revision_id"]))
                     superseded_revision_ids.update(
                         str(value)
                         for value in descriptor.get("superseded_revision_ids", [])
@@ -536,7 +723,58 @@ class ProjectStore:
 
         for path in sorted((self.history / "objects").glob("*/*.json")):
             try:
-                revision = self.read_json(path)
+                record = self.read_json(path)
+                if self.history_object_path(record) != path:
+                    raise StorageError("history object path does not match its content hash")
+                if record.get("object_type") == "artifact":
+                    required = {
+                        "id",
+                        "project_id",
+                        "revision_id",
+                        "role",
+                        "kind",
+                        "media_type",
+                        "path",
+                        "sha256",
+                        "byte_size",
+                        "tool",
+                        "created_at",
+                    }
+                    missing = sorted(required - record.keys())
+                    if missing:
+                        raise StorageError(f"artifact is missing: {', '.join(missing)}")
+                    artifact_path = str(record["path"])
+                    role = str(record["role"])
+                    if str(record["project_id"]) != project_id:
+                        raise StorageError("artifact belongs to a different project")
+                    expected_prefix = (
+                        "production/sources/" if role == "source" else "approved/objects/"
+                    )
+                    if role not in {"source", "runtime"} or not artifact_path.startswith(
+                        expected_prefix
+                    ):
+                        raise StorageError("artifact role does not match its durable path")
+                    blob = safe_join(self.root, artifact_path)
+                    if not blob.is_file():
+                        raise StorageError(f"artifact blob is missing: {artifact_path}")
+                    expected_hash = str(record["sha256"])
+                    artifact_relative = Path(artifact_path)
+                    if (
+                        artifact_relative.parent.name != expected_hash[:2]
+                        or artifact_relative.stem != expected_hash
+                    ):
+                        raise StorageError("artifact path is not content addressed by its hash")
+                    if sha256_file(blob) != expected_hash:
+                        raise StorageError(f"artifact hash mismatch: {artifact_path}")
+                    if blob.stat().st_size != int(record["byte_size"]):
+                        raise StorageError(f"artifact byte size mismatch: {artifact_path}")
+                    artifact = dict(record)
+                    artifact["file_path"] = relative_to_root(self.root, path)
+                    artifacts.append(artifact)
+                    continue
+
+                revision = record
+                revision_id = str(revision.get("id", ""))
                 if str(revision.get("id", "")) in superseded_revision_ids:
                     revision["review_status"] = "superseded"
                 revision["file_path"] = relative_to_root(self.root, path)
@@ -560,8 +798,23 @@ class ProjectStore:
                     source_path = str(rendition["source_path"])
                     normalized_path = rendition.get("normalized_path")
                     preview_path = str(normalized_path or source_path)
+                    if revision_id in current_revision_ids and (
+                        source_path.startswith("workspace/") or preview_path.startswith("workspace/")
+                    ):
+                        raise StorageError("approved rendition references disposable workspace")
                     source_file = safe_join(self.root, source_path)
                     preview_file = safe_join(self.root, preview_path)
+                    inactive_workspace = (
+                        revision_id not in current_revision_ids | candidate_revision_ids
+                        and (
+                            source_path.startswith("workspace/")
+                            or preview_path.startswith("workspace/")
+                        )
+                    )
+                    if inactive_workspace and (
+                        not source_file.is_file() or not preview_file.is_file()
+                    ):
+                        continue
                     if not source_file.is_file():
                         raise StorageError(f"rendition source is missing: {source_path}")
                     if not preview_file.is_file():
@@ -569,7 +822,8 @@ class ProjectStore:
                     expected_hash = str(rendition["sha256"])
                     if sha256_file(preview_file) != expected_hash:
                         raise StorageError(f"rendition hash mismatch: {preview_path}")
-                    revision_id = str(revision["id"])
+                    if preview_file.stat().st_size != int(rendition["byte_size"]):
+                        raise StorageError(f"rendition byte size mismatch: {preview_path}")
                     renditions.append(
                         {
                             "id": stable_id("rendition", revision_id, expected_hash),
@@ -586,27 +840,142 @@ class ProjectStore:
                     )
             except (StorageError, KeyError, TypeError, ValueError) as exc:
                 errors.append(f"{relative_to_root(self.root, path)}: {exc}")
+
+        artifacts_by_id = {str(artifact["id"]): artifact for artifact in artifacts}
+        revision_ids = {str(revision.get("id", "")) for revision in revisions}
+        for artifact in artifacts:
+            revision_id = str(artifact["revision_id"])
+            if revision_id not in revision_ids:
+                errors.append(
+                    f"{artifact['file_path']}: artifact revision is missing: {revision_id}"
+                )
+            parent_id = artifact.get("parent_artifact_id")
+            if parent_id:
+                parent = artifacts_by_id.get(str(parent_id))
+                if parent is None:
+                    errors.append(
+                        f"{artifact['file_path']}: parent artifact is missing: {parent_id}"
+                    )
+                elif str(parent_id) == str(artifact["id"]):
+                    errors.append(f"{artifact['file_path']}: artifact cannot parent itself")
+                elif str(parent["revision_id"]) != revision_id:
+                    errors.append(
+                        f"{artifact['file_path']}: parent artifact belongs to another revision"
+                    )
+        for revision in revisions:
+            content = revision.get("content")
+            rendition = content.get("rendition") if isinstance(content, dict) else None
+            if not isinstance(rendition, dict):
+                continue
+            for id_field, path_field, hash_field in (
+                ("source_artifact_id", "source_path", "source_sha256"),
+                ("artifact_id", "normalized_path", "sha256"),
+            ):
+                artifact_id = rendition.get(id_field)
+                if not artifact_id:
+                    continue
+                artifact = artifacts_by_id.get(str(artifact_id))
+                if artifact is None:
+                    errors.append(
+                        f"{revision['file_path']}: referenced artifact is missing: {artifact_id}"
+                    )
+                    continue
+                expected_role = "source" if id_field == "source_artifact_id" else "runtime"
+                expected_path = rendition.get(path_field) or rendition.get("source_path")
+                expected_hash = rendition.get(hash_field)
+                if (
+                    str(artifact.get("revision_id", "")) != str(revision.get("id", ""))
+                    or artifact.get("role") != expected_role
+                    or artifact.get("path") != expected_path
+                    or (expected_hash and artifact.get("sha256") != expected_hash)
+                ):
+                    errors.append(
+                        f"{revision['file_path']}: artifact metadata does not match rendition"
+                    )
+
+        known_rendition_ids = {str(rendition["id"]) for rendition in renditions}
         for path in sorted((self.history / "qa").glob("*.json")):
             try:
-                qa_runs.append(self.read_json(path))
-            except StorageError as exc:
+                qa = self.read_json(path)
+                if path != self.history / "qa" / f"{qa['id']}.json":
+                    raise StorageError("QA record path does not match its id")
+                if str(qa.get("rendition_id", "")) in known_rendition_ids:
+                    required = {"id", "rendition_id", "verdict", "checks", "created_at"}
+                    missing = sorted(required - qa.keys())
+                    if missing:
+                        raise StorageError(f"QA record is missing: {', '.join(missing)}")
+                    if qa.get("verdict") not in {"pass", "warning", "fail"}:
+                        raise StorageError("unsupported QA verdict")
+                    qa_runs.append(qa)
+            except (StorageError, KeyError, TypeError, ValueError) as exc:
                 errors.append(f"{relative_to_root(self.root, path)}: {exc}")
 
-        reviews: dict[str, dict[str, Any]] = {}
+        reviews_by_revision: dict[str, dict[str, Any]] = {}
         for path in sorted((self.history / "reviews").glob("*/*/*.json")):
             try:
                 review = self.read_json(path)
-                reviews[str(review.get("revision_id", ""))] = review
-            except StorageError as exc:
+                required = {"id", "revision_id", "verdict", "dependency_hash", "created_at"}
+                missing = sorted(required - review.keys())
+                if missing:
+                    raise StorageError(f"review is missing: {', '.join(missing)}")
+                if review.get("verdict") not in {"approve", "reject"}:
+                    raise StorageError("unsupported review verdict")
+                if self.review_path(review) != path:
+                    raise StorageError("review path does not match its id or creation date")
+                review["file_path"] = relative_to_root(self.root, path)
+                review_records.append(review)
+                revision_id = str(review["revision_id"])
+                previous = reviews_by_revision.get(revision_id)
+                if previous is None or str(review["created_at"]) >= str(previous["created_at"]):
+                    reviews_by_revision[revision_id] = review
+            except (StorageError, KeyError, TypeError, ValueError) as exc:
                 errors.append(f"{relative_to_root(self.root, path)}: {exc}")
         for revision in revisions:
-            review = reviews.get(str(revision.get("id", "")))
-            if review:
+            revision_id = str(revision.get("id", ""))
+            review = reviews_by_revision.get(revision_id)
+            if review and revision_id not in superseded_revision_ids:
                 revision["review_status"] = (
                     "approved" if review.get("verdict") == "approve" else "rejected"
                 )
                 revision["reviewed_at"] = review.get("created_at")
-        return assets, revisions, renditions, qa_runs, relations, errors
+
+        for manifest_path in sorted((self.root / "releases").glob("*/manifest.json")):
+            try:
+                manifest = self.read_json(manifest_path)
+                release_id = str(manifest["release_id"])
+                if release_id != manifest_path.parent.name:
+                    raise StorageError("release id does not match its directory")
+                if manifest.get("format_version") != 1:
+                    raise StorageError("unsupported release manifest format")
+                if str(manifest.get("project_id", "")) != project_id:
+                    raise StorageError("release belongs to a different project")
+                if not isinstance(manifest.get("assets"), list):
+                    raise StorageError("release assets must be a list")
+                releases.append(
+                    {
+                        "id": release_id,
+                        "project_id": project_id,
+                        "name": str(manifest.get("name") or release_id),
+                        "manifest_path": relative_to_root(self.root, manifest_path),
+                        "manifest_hash": sha256_file(manifest_path),
+                        "asset_count": len(manifest["assets"]),
+                        "created_at": manifest.get("created_at"),
+                    }
+                )
+            except (StorageError, KeyError, TypeError, ValueError) as exc:
+                errors.append(f"{relative_to_root(self.root, manifest_path)}: {exc}")
+
+        return ProjectScanResult(
+            assets,
+            revisions,
+            renditions,
+            qa_runs,
+            relations,
+            artifacts,
+            review_records,
+            releases,
+            errors,
+        )
 
     def resolve_rendition_path(self, stored_path: str) -> Path:
         return safe_join(self.root, stored_path)
@@ -620,11 +989,76 @@ class ProjectStore:
         return safe_join(self.workspace / "qa", f"{qa_id}.json")
 
     def write_release(self, release_id: str, manifest: dict[str, Any]) -> tuple[str, str]:
+        """Compatibility wrapper for callers that do not update Catalog state."""
+
+        return self.commit_release(release_id, manifest, {})
+
+    def commit_release(
+        self,
+        release_id: str,
+        manifest: dict[str, Any],
+        asset_updates: dict[str, dict[str, Any]],
+    ) -> tuple[str, str]:
         release_dir = safe_join(self.root / "releases", release_id)
         versioned = release_dir / "manifest.json"
+        pointer = self.root / "release.json"
         with self.lock():
-            digest = atomic_write_json(versioned, manifest, immutable=True)
-            atomic_write_json(self.root / "release.json", manifest)
+            if versioned.exists():
+                raise ImmutableRevisionError(f"immutable release already exists: {versioned}")
+
+            remaining = set(asset_updates)
+            catalog_updates: dict[Path, dict[str, Any]] = {}
+            catalog_originals: dict[Path, bytes] = {}
+            for path in sorted(self.catalog.rglob("*.json")):
+                if path.name == "relations.json":
+                    continue
+                collection = self._read_collection(path)
+                changed = False
+                for descriptor in collection["assets"]:
+                    key = str(descriptor.get("key", ""))
+                    if key in asset_updates:
+                        descriptor.update(asset_updates[key])
+                        remaining.discard(key)
+                        changed = True
+                if changed:
+                    collection["assets"] = sorted(
+                        collection["assets"], key=lambda item: str(item["key"])
+                    )
+                    catalog_updates[path] = collection
+                    catalog_originals[path] = path.read_bytes()
+            if remaining:
+                raise StorageError(
+                    f"release assets disappeared from Catalog: {', '.join(sorted(remaining))}"
+                )
+
+            pointer_original = pointer.read_bytes() if pointer.exists() else None
+            versioned_created = False
+            try:
+                digest = atomic_write_json(versioned, manifest, immutable=True)
+                versioned_created = True
+                atomic_write_json(pointer, manifest)
+                for path, collection in catalog_updates.items():
+                    atomic_write_json(path, collection)
+            except Exception:
+                for path, original in catalog_originals.items():
+                    try:
+                        atomic_write_bytes(path, original)
+                    except OSError:
+                        pass
+                try:
+                    if pointer_original is None:
+                        pointer.unlink(missing_ok=True)
+                    else:
+                        atomic_write_bytes(pointer, pointer_original)
+                except OSError:
+                    pass
+                if versioned_created:
+                    try:
+                        versioned.unlink(missing_ok=True)
+                        versioned.parent.rmdir()
+                    except OSError:
+                        pass
+                raise
         return relative_to_root(self.root, versioned), digest
 
     def atomic_publish(self, candidate: Path, target_relative: str) -> tuple[str, str | None]:
