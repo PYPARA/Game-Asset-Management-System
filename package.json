@@ -11,7 +11,6 @@
     "build": "npm --prefix apps/web run build",
     "test:web": "npm --prefix apps/web test",
     "test:api": "uv run --project apps/api pytest",
-    "test:emperor": "uv run --project packages/emperor_adapter pytest",
-    "test": "npm run test:web && npm run test:api && npm run test:emperor"
+    "test": "npm run test:web && npm run test:api"
   }
 }

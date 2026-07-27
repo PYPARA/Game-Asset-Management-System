@@ -1,13 +1,15 @@
-# Prototype Instructions
+# 原型开发说明
 
-Run the local server yourself and open the preview in the browser available to this environment. Do not give the user server-start instructions when you can run it.
+请自行运行本地服务，并在当前环境提供的浏览器中打开预览。能够直接运行时，不要只向用户提供启动服务器的操作说明。
 
-Before making substantial visual changes, use the Product Design plugin's `get-context` skill when the visual source is unclear or no longer matches the current goal. When the user gives durable prototype-specific design feedback, preferences, or decisions, record them in `AGENTS.md`.
+进行大幅视觉调整前，如果视觉基准不明确或已不再符合当前目标，请使用 Product Design 插件的 `get-context` 技能。当用户提出需要长期保留的原型设计反馈、偏好或决策时，请将它们记录到 `AGENTS.md`。
 
-When implementing from a selected generated mock, treat that image as the source of truth for layout, component anatomy, density, spacing, color, typography, visible content, and hierarchy.
+依据选定的生成式设计稿进行实现时，应将该图片视为布局、组件结构、信息密度、间距、颜色、字体、可见内容和视觉层级的基准。
 
-## Durable product decisions
+## 长期产品决策
 
-- The v1 workbench visual source of truth is `docs/design/reference-workbench.png`: a dense charcoal three-column production desk with project/library navigation, batch asset review, a revision/Prompt/QA inspector, and a persistent task strip.
-- `docs/design/reference-narrative-atlas.png` is reserved for the post-v1 Narrative Atlas workspace; do not merge that scene-map layout into the v1 production desk.
-- Interface icons use Phosphor Icons. Do not introduce hand-authored SVG icons, decorative gradients, or emoji.
+- v1 制作台的视觉基准是 `docs/design/reference-workbench.png`：一个信息密集的炭灰色三栏生产工作台，包含项目/资源库导航、批量资产审核、修订/Prompt/QA 检查器，以及固定显示的任务栏。
+- `docs/design/reference-narrative-atlas.png` 留待 v1 之后的“叙事地图”工作台使用；不要将该场景地图布局并入 v1 生产制作台。
+- 界面图标使用 Phosphor Icons。不要引入手工绘制的 SVG 图标、装饰性渐变或表情符号。
+- 右侧检查器按资产语义切换：媒体使用版本/QA 视图，叙事与设计文档使用案卷式阅读视图，角色与物品使用关联媒体画廊；长内容编辑使用宽抽屉并保存为不可变候选。
+- 用户可见的资产类型与领域统一显示中文，英文 subtype、kind 和稳定 Key 只作为内部标识或 tooltip 信息。

@@ -1,4 +1,3 @@
-# Design source
+# 设计来源
 
-The production workbench mock in this directory is the visual source of truth for the v1 desktop UI. The relationship-first Narrative Atlas concept is reserved for the v1.1 scene workspace; v1 still stores the typed relations needed by that view.
-
+此目录中的生产制作台设计稿是 v1 桌面端界面的视觉基准。以关系为核心的“叙事地图”概念留待 v1.1 的场景工作台实现；v1 仍会保存该视图所需的类型化关系。

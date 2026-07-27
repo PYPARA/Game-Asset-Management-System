@@ -52,7 +52,7 @@ def test_structured_text_job_creates_schema_valid_candidate(client: TestClient, 
     assert job["status"] == "succeeded", job
     revision = client.get(f"/api/revisions/{job['result_revision_id']}").json()
     assert revision["content"] == {"name": "generated-name", "rarity": "legendary"}
-    assert revision["provider_snapshot"]["requestId"] == "fake-text-request"
+    assert revision["provider_snapshot"]["request_id"] == "fake-text-request"
 
 
 def test_image_job_runs_normalization_qa_review_and_atomic_publish(client: TestClient, project_root: Path) -> None:

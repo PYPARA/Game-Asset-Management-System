@@ -82,7 +82,6 @@ class AssetRevision(Base):
     prompt_recipe: Mapped[str | None] = mapped_column(String(240))
     provider_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     file_path: Mapped[str] = mapped_column(Text)
-    candidate_path: Mapped[str | None] = mapped_column(Text)
     review_status: Mapped[str] = mapped_column(String(40), default="pending", index=True)
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

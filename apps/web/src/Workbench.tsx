@@ -26,6 +26,7 @@ import {
   Notebook,
   Package,
   Palette,
+  PencilSimple,
   Plus,
   SealCheck,
   SlidersHorizontal,
@@ -39,51 +40,88 @@ import {
   WarningCircle,
   X,
 } from "@phosphor-icons/react";
-import { ImportDialog } from "./components/ImportDialog";
+import { ProjectDialog } from "./components/ProjectDialog";
+import { AssetEditorDrawer } from "./components/AssetEditorDrawer";
 import { Inspector } from "./components/Inspector";
 import { SettingsDrawer } from "./components/SettingsDrawer";
-import { demoPayload } from "./demo-data";
-import { fetchWorkbench, submitReview, subscribeToJobEvents } from "./lib/api";
-import type { GameAsset, JobSummary, ReviewStatus } from "./types";
+import {
+  emptyWorkbenchPayload,
+  createAssetRevision,
+  fetchAssetDetails,
+  fetchWorkbench,
+  submitReview,
+  subscribeToJobEvents,
+} from "./lib/api";
+import { assetSubtypeLabel } from "./lib/labels";
+import type { GameAsset, JobSummary, ProjectSummary, ReviewStatus } from "./types";
 
 const libraryItems = [
-  { id: "content", label: "叙事文档", count: 48, icon: Article },
-  { id: "design", label: "设计文档", count: 31, icon: Notebook },
-  { id: "characters", label: "角色", count: 132, icon: UsersThree },
-  { id: "items", label: "物品", count: 512, icon: Package },
-  { id: "locations", label: "地点", count: 86, icon: MapPin },
-  { id: "2d-media", label: "2D 媒体", count: 342, icon: ImagesSquare },
-  { id: "materials", label: "材质", count: 184, icon: Palette },
-  { id: "audio", label: "音频", count: 97, icon: SpeakerHigh },
+  { id: "content", label: "叙事内容", icon: Article },
+  { id: "design", label: "设计文档", icon: Notebook },
+  { id: "characters", label: "角色", icon: UsersThree },
+  { id: "items", label: "物品", icon: Package },
+  { id: "locations", label: "地点", icon: MapPin },
+  { id: "achievements", label: "成就", icon: SealCheck },
+  { id: "2d-media", label: "2D 媒体", icon: ImagesSquare },
+  { id: "production", label: "生产资料", icon: Palette },
+  { id: "audio", label: "音频", icon: SpeakerHigh },
 ];
 
 const workspaceItems = [
-  { id: "review", label: "待审查", count: 24, icon: Tray },
+  { id: "review", label: "待审查", icon: Tray },
   { id: "mine", label: "我创建的", icon: UserCircle },
   { id: "following", label: "已关注", icon: Star },
   { id: "released", label: "已发布", icon: SealCheck },
 ];
 
 const statusCopy: Record<ReviewStatus, string> = {
-  pending: "待审查",
+  pending: "待本系统确认",
   approved: "已审查",
   rejected: "已驳回",
   generating: "生成中",
 };
 
+const productionStageCopy: Record<string, string> = {
+  planned: "已规划",
+  generated: "已生成",
+  normalized: "已归一化",
+  reviewed: "旧系统已审核",
+  integrated: "已集成",
+  approved: "已批准",
+  imported: "已导入",
+};
+
 function matchesSearch(asset: GameAsset, search: string) {
   const value = search.trim().toLocaleLowerCase();
   if (!value) return true;
-  return [asset.key, asset.name, asset.subtype, ...asset.tags]
+  return [asset.key, asset.name, asset.subtype, asset.subtypeLabel, ...asset.tags]
     .join(" ")
     .toLocaleLowerCase()
     .includes(value);
 }
 
 function AssetPreview({ asset }: { asset: GameAsset }) {
+  if (asset.preview.kind === "content") {
+    return (
+      <div className="asset-preview-card content-preview-card">
+        <FileText size={22} weight="duotone" />
+        <span><strong>{asset.preview.label}</strong><small>{asset.preview.meta}</small></span>
+        <p>{asset.preview.summary}</p>
+      </div>
+    );
+  }
+  if (asset.preview.kind === "placeholder") {
+    const Icon = asset.subtype === "character" ? UserCircle : asset.subtype === "achievement" ? SealCheck : Package;
+    return (
+      <div className="asset-preview-card placeholder-preview-card">
+        <Icon size={24} weight="duotone" />
+        <span><strong>{asset.preview.label}</strong><small>{asset.preview.detail}</small></span>
+      </div>
+    );
+  }
   return (
-    <div className={`asset-preview ${asset.thumbnails.length === 1 ? "wide" : ""}`}>
-      {asset.thumbnails.map((image, index) => (
+    <div className={`asset-preview ${asset.preview.images.length === 1 ? "wide" : ""}`} aria-label={asset.preview.label}>
+      {asset.preview.images.map((image, index) => (
         <img key={`${image}-${index}`} src={image} alt="" loading="lazy" />
       ))}
     </div>
@@ -91,12 +129,13 @@ function AssetPreview({ asset }: { asset: GameAsset }) {
 }
 
 export function Workbench() {
-  const { data = demoPayload, isLoading } = useQuery({
+  const { data: queryData, error, isError, isFetching, isLoading, refetch } = useQuery({
     queryKey: ["workbench"],
     queryFn: fetchWorkbench,
   });
-  const [assets, setAssets] = useState<GameAsset[]>(demoPayload.assets);
-  const [job, setJob] = useState<JobSummary>(demoPayload.job);
+  const data = isError ? emptyWorkbenchPayload : (queryData ?? emptyWorkbenchPayload);
+  const [assets, setAssets] = useState<GameAsset[]>([]);
+  const [job, setJob] = useState<JobSummary>(emptyWorkbenchPayload.job);
   const [streamConnected, setStreamConnected] = useState(false);
   const [activeCategory, setActiveCategory] = useState("2d-media");
   const [search, setSearch] = useState("");
@@ -105,23 +144,37 @@ export function Workbench() {
   const [viewMode, setViewMode] = useState<"thumbnails" | "compact">("thumbnails");
   const [sorting, setSorting] = useState<SortingState>([{ id: "updatedAt", desc: true }]);
   const [rowSelection, setRowSelection] = useState<RowSelectionState>({});
-  const [selectedAssetId, setSelectedAssetId] = useState<string | null>(demoPayload.assets[0]?.id ?? null);
+  const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [importOpen, setImportOpen] = useState(false);
+  const [projectDialogOpen, setProjectDialogOpen] = useState(false);
+  const [projectToEdit, setProjectToEdit] = useState<ProjectSummary | null>(null);
   const [toast, setToast] = useState("");
   const [reviewBusy, setReviewBusy] = useState(false);
   const [visibleLimit, setVisibleLimit] = useState(60);
+  const [editingAssetId, setEditingAssetId] = useState<string | null>(null);
+
+  const openProjectDialog = (project: ProjectSummary | null = null) => {
+    setProjectToEdit(project);
+    setProjectDialogOpen(true);
+  };
+
+  const closeProjectDialog = () => {
+    setProjectDialogOpen(false);
+    setProjectToEdit(null);
+  };
 
   useEffect(() => {
     setAssets(data.assets);
     setJob(data.job);
     setSelectedAssetId((current) =>
-      current && data.assets.some((asset) => asset.id === current) ? current : (data.assets[0]?.id ?? null),
+      current && data.assets.some((asset) => asset.id === current && asset.category === activeCategory)
+        ? current
+        : (data.assets.find((asset) => asset.category === activeCategory)?.id ?? null),
     );
-  }, [data.assets, data.job]);
+  }, [activeCategory, data.assets, data.job]);
 
   useEffect(() => {
-    if (data.source !== "api" || !data.project.id) {
+    if (!data.project.id) {
       setStreamConnected(false);
       return;
     }
@@ -130,12 +183,14 @@ export function Workbench() {
       (event) => setJob((current) => ({ ...current, ...event })),
       setStreamConnected,
     );
-  }, [data.project.id, data.source]);
+  }, [data.project.id]);
 
   useEffect(() => {
     setRowSelection({});
     setVisibleLimit(60);
   }, [activeCategory, search, statusFilter, typeFilter]);
+
+  useEffect(() => setTypeFilter("all"), [activeCategory]);
 
   useEffect(() => {
     if (!toast) return;
@@ -144,7 +199,22 @@ export function Workbench() {
   }, [toast]);
 
   const subtypes = useMemo(
-    () => Array.from(new Set(assets.map((asset) => asset.subtype))).sort(),
+    () => Array.from(new Set(assets.filter((asset) => activeCategory === "all" || asset.category === activeCategory).map((asset) => asset.subtype)))
+      .sort((left, right) => assetSubtypeLabel(assets.find((asset) => asset.subtype === left)?.kind ?? "content", left).localeCompare(assetSubtypeLabel(assets.find((asset) => asset.subtype === right)?.kind ?? "content", right), "zh-CN")),
+    [activeCategory, assets],
+  );
+  const categoryCounts = useMemo(
+    () =>
+      Object.fromEntries(
+        libraryItems.map((item) => [
+          item.id,
+          assets.filter((asset) => asset.category === item.id).length,
+        ]),
+      ),
+    [assets],
+  );
+  const pendingCount = useMemo(
+    () => assets.filter((asset) => asset.reviewStatus === "pending").length,
     [assets],
   );
 
@@ -203,7 +273,7 @@ export function Workbench() {
             <div className="asset-copy">
               <strong>{row.original.key}</strong>
               <span>{row.original.name}</span>
-              <small>{row.original.subtype}</small>
+              <small title={row.original.subtype}>{row.original.subtypeLabel}</small>
             </div>
           </button>
         ),
@@ -211,17 +281,26 @@ export function Workbench() {
       {
         accessorKey: "reviewStatus",
         header: "状态",
-        size: 92,
-        cell: ({ getValue }) => {
+        size: 116,
+        cell: ({ row, getValue }) => {
           const status = getValue<ReviewStatus>();
-          return <span className={`status-badge ${status}`}>{statusCopy[status]}</span>;
+          return (
+            <div className="asset-stage-cell">
+              <span className={`production-stage ${row.original.productionStage}`}>
+                {productionStageCopy[row.original.productionStage] ?? row.original.productionStage}
+              </span>
+              <small>{statusCopy[status]}</small>
+            </div>
+          );
         },
       },
       {
         id: "qa",
         header: "硬 QA",
         size: 96,
-        cell: ({ row }) => (
+        cell: ({ row }) => row.original.kind !== "media" && row.original.kind !== "production" ? (
+          <div className="qa-cell neutral"><span>不适用<small>非媒体资产</small></span></div>
+        ) : (
           <div className={row.original.qaPassed === row.original.qaTotal ? "qa-cell pass" : "qa-cell warn"}>
             {row.original.qaPassed === row.original.qaTotal ? (
               <CheckCircle size={17} weight="fill" />
@@ -263,14 +342,33 @@ export function Workbench() {
   });
 
   const selectedAsset = assets.find((asset) => asset.id === selectedAssetId) ?? null;
+  useEffect(() => {
+    if (!selectedAsset || selectedAsset.detailsLoaded) return;
+    if (!selectedAsset.candidateRevisionId && !selectedAsset.approvedRevisionId) return;
+    let cancelled = false;
+    void fetchAssetDetails(selectedAsset)
+      .then((details) => {
+        if (cancelled) return;
+        setAssets((current) => current.map((asset) => asset.id === details.id ? details : asset));
+      })
+      .catch((detailError: unknown) => {
+        if (cancelled) return;
+        setAssets((current) => current.map((asset) => asset.id === selectedAsset.id ? {
+          ...asset,
+          detailsLoaded: true,
+          reviewReady: false,
+          reviewBlockReason: detailError instanceof Error ? `资产详情加载失败：${detailError.message}` : "资产详情加载失败。",
+        } : asset));
+      });
+    return () => { cancelled = true; };
+  }, [selectedAsset?.detailsLoaded, selectedAsset?.id]);
   const selectedIds = Object.entries(rowSelection).filter(([, selected]) => selected).map(([id]) => id);
   const selectedAssets = assets.filter((asset) => selectedIds.includes(asset.id));
   const selectionReviewable =
     selectedIds.length > 0 &&
-    (data.source === "demo" ||
-      selectedAssets.every(
-        (asset) => Boolean(asset.candidateRevisionId) && asset.reviewReady === true,
-      ));
+    selectedAssets.every(
+      (asset) => Boolean(asset.candidateRevisionId) && asset.reviewReady === true,
+    );
 
   const reviewAssets = async (
     decision: "approve" | "reject" | "regenerate",
@@ -287,18 +385,6 @@ export function Workbench() {
     }
 
     const targets = assets.filter((asset) => ids.includes(asset.id));
-    if (data.source === "demo") {
-      const nextStatus: ReviewStatus = decision === "approve" ? "approved" : "rejected";
-      setAssets((current) =>
-        current.map((asset) =>
-          ids.includes(asset.id) ? { ...asset, reviewStatus: nextStatus } : asset,
-        ),
-      );
-      setRowSelection({});
-      setToast(`演示状态已更新 ${ids.length} 项；不会写入项目文件。`);
-      return;
-    }
-
     const blocked = targets.filter(
       (asset) => !asset.candidateRevisionId || asset.reviewReady !== true,
     );
@@ -349,9 +435,23 @@ export function Workbench() {
           `${result.succeeded.length} 项成功，${result.failed.length} 项失败：${result.failed[0].message}`,
         );
       }
+      if (result.succeeded.length > 0) void refetch();
     } finally {
       setReviewBusy(false);
     }
+  };
+
+  const saveAssetRevision = async (asset: GameAsset, content: unknown) => {
+    const updated = await createAssetRevision(asset, content);
+    setAssets((current) => current.map((item) => item.id === updated.id ? updated : item));
+    setToast(`已将 ${asset.name} 保存为新的候选修订。`);
+  };
+
+  const navigateToAsset = (assetId: string) => {
+    const target = assets.find((asset) => asset.id === assetId);
+    if (!target) return;
+    setActiveCategory(target.category);
+    setSelectedAssetId(target.id);
   };
 
   return (
@@ -361,15 +461,28 @@ export function Workbench() {
           <span className="brand-mark"><CrownSimple size={23} weight="duotone" /></span>
           <strong>游戏资产制作台</strong>
         </div>
-        <button className="project-switcher" type="button">
-          皇帝模拟器 <CaretDown size={14} />
+        <button className="project-switcher" type="button" disabled={isError} onClick={() => openProjectDialog(data.project.id ? data.project : null)}>
+          {isError ? "项目状态不可用" : data.project.name} <CaretDown size={14} />
         </button>
         <div className="topbar-spacer" />
-        <div className={`connection-state ${data.source === "api" ? "online" : "demo"}`}>
+        <div className={`connection-state ${isError ? "error" : isLoading ? "connecting" : "online"}`}>
           <span />
-          <div><strong>{data.source === "api" ? "本地模式" : "离线演示"}</strong><small>{data.source === "api" ? (streamConnected ? "SSE 已连接" : "localhost") : "后端启动后自动切换"}</small></div>
+          <div>
+            <strong>{isError ? "服务异常" : isLoading ? "正在连接" : "本地模式"}</strong>
+            <small>
+              {isError
+                ? "无法连接本地后端"
+                : isLoading
+                  ? "正在读取项目"
+                  : data.project.id
+                    ? streamConnected
+                      ? "SSE 已连接"
+                      : "后端已连接"
+                    : "等待创建 Project"}
+            </small>
+          </div>
         </div>
-        <button className="icon-button" type="button" onClick={() => setImportOpen(true)} aria-label="导入项目"><FolderOpen size={19} /></button>
+        <button className="icon-button" type="button" onClick={() => openProjectDialog()} aria-label="新建 Project" disabled={isError}><FolderOpen size={19} /></button>
         <button className="icon-button" type="button" onClick={() => setSettingsOpen(true)} aria-label="供应商设置"><GearSix size={19} /></button>
         <div className="local-user"><span>本</span><strong>本机用户</strong></div>
       </header>
@@ -378,12 +491,24 @@ export function Workbench() {
         <nav className="sidebar" aria-label="资产导航">
           <div className="sidebar-scroll">
             <section className="project-section">
-              <div className="sidebar-heading"><span>项目</span><button type="button" aria-label="添加项目"><Plus size={15} /></button></div>
-              <button className="project-card" type="button">
-                <img src={data.project.thumbnail} alt="皇帝模拟器项目缩略图" />
-                <span><strong>{data.project.name}</strong><small>{data.project.path}</small><em>{data.project.branch ?? "main"}</em></span>
-              </button>
-              <button className="import-entry" type="button" onClick={() => setImportOpen(true)}><UploadSimple size={16} /> 登记本地项目</button>
+              <div className="sidebar-heading"><span>项目</span><button type="button" aria-label="新建 Project" onClick={() => openProjectDialog()}><Plus size={15} /></button></div>
+              {isError ? (
+                <div className="project-card project-card-error">
+                  <WarningCircle size={18} weight="fill" />
+                  <span><strong>项目状态不可用</strong><small>本地后端连接失败</small></span>
+                </div>
+              ) : data.project.id ? (
+                <button className={`project-card ${data.project.thumbnail ? "" : "no-thumbnail"}`} type="button" onClick={() => openProjectDialog(data.project)} aria-label={`编辑项目 ${data.project.name}`} title="编辑项目名称">
+                  {data.project.thumbnail && <img src={data.project.thumbnail} alt="项目缩略图" />}
+                  <span><strong>{data.project.name}</strong><small>{data.project.path}</small><em>{data.project.branch ?? "local"}</em></span>
+                  <PencilSimple className="project-edit-icon" size={15} aria-hidden="true" />
+                </button>
+              ) : (
+                <button className="project-card project-card-empty" type="button" onClick={() => openProjectDialog()}>
+                  <span><strong>尚无 Project</strong><small>Game-Projects 中没有可用项目</small></span>
+                </button>
+              )}
+              <button className="import-entry" type="button" onClick={() => openProjectDialog()} disabled={isError}><Plus size={16} /> 新建 Project</button>
             </section>
 
             <section className="nav-section">
@@ -398,7 +523,7 @@ export function Workbench() {
                         type="button"
                         onClick={() => setActiveCategory(item.id)}
                       >
-                        <Icon size={18} /> <span>{item.label}</span><small>{item.count}</small>
+                        <Icon size={18} /> <span>{item.label}</span><small>{categoryCounts[item.id] ?? 0}</small>
                       </button>
                     </li>
                   );
@@ -414,7 +539,7 @@ export function Workbench() {
                   return (
                     <li key={item.id}>
                       <button type="button" onClick={() => item.id === "review" && setStatusFilter("pending")}>
-                        <Icon size={18} /> <span>{item.label}</span>{item.count && <small className="alert-count">{item.count}</small>}
+                        <Icon size={18} /> <span>{item.label}</span>{item.id === "review" && pendingCount > 0 && <small className="alert-count">{pendingCount}</small>}
                       </button>
                     </li>
                   );
@@ -460,7 +585,10 @@ export function Workbench() {
             <label className="select-control asset-type-filter">
               <select aria-label="按资产类型筛选" value={typeFilter} onChange={(event) => setTypeFilter(event.target.value)}>
                 <option value="all">资产类型</option>
-                {subtypes.map((subtype) => <option key={subtype} value={subtype}>{subtype}</option>)}
+                {subtypes.map((subtype) => {
+                  const matching = assets.find((asset) => asset.subtype === subtype && (activeCategory === "all" || asset.category === activeCategory));
+                  return <option key={subtype} value={subtype}>{assetSubtypeLabel(matching?.kind ?? "content", subtype)}</option>;
+                })}
               </select>
             </label>
             <label className="search-control">
@@ -492,7 +620,21 @@ export function Workbench() {
           </div>
 
           <div className={`asset-table-wrap ${viewMode}`}>
-            {filteredAssets.length > 0 ? (
+            {isError ? (
+              <div className="empty-assets error-state" role="alert">
+                <WarningCircle size={34} weight="fill" />
+                <strong>无法加载资产数据</strong>
+                <p>{error instanceof Error ? error.message : "本地后端发生未知错误。"}</p>
+                <button
+                  className="button secondary"
+                  type="button"
+                  onClick={() => void refetch()}
+                  disabled={isFetching}
+                >
+                  {isFetching ? "正在重试…" : "重试连接"}
+                </button>
+              </div>
+            ) : filteredAssets.length > 0 ? (
               <>
                 <table className="asset-table">
                 <thead>
@@ -532,9 +674,23 @@ export function Workbench() {
             ) : (
               <div className="empty-assets">
                 <FileText size={31} />
-                <strong>这个筛选下没有资产</strong>
-                <p>调整分类、状态或搜索内容。</p>
-                <button className="button secondary" type="button" onClick={() => { setActiveCategory("2d-media"); setStatusFilter("all"); setSearch(""); }}>查看 2D 媒体</button>
+                <strong>{data.project.id ? "这个筛选下没有资产" : "Game-Projects 中尚无 Project"}</strong>
+                <p>{data.project.id ? "调整分类、状态或搜索内容。" : "新建 Project，或把有效 Project 放入 Game-Projects 后刷新。"}</p>
+                <button
+                  className="button secondary"
+                  type="button"
+                  onClick={() => {
+                    if (data.project.id) {
+                      setActiveCategory("2d-media");
+                      setStatusFilter("all");
+                      setSearch("");
+                    } else {
+                      openProjectDialog();
+                    }
+                  }}
+                >
+                  {data.project.id ? "查看 2D 媒体" : "新建 Project"}
+                </button>
               </div>
             )}
           </div>
@@ -550,24 +706,45 @@ export function Workbench() {
           </footer>
         </main>
 
-        <Inspector asset={selectedAsset} onClose={() => setSelectedAssetId(null)} onReview={reviewAssets} />
+        <Inspector
+          asset={selectedAsset}
+          allAssets={assets}
+          onClose={() => setSelectedAssetId(null)}
+          onEdit={(asset) => setEditingAssetId(asset.id)}
+          onNavigate={navigateToAsset}
+          onReview={reviewAssets}
+        />
       </div>
+
+      <AssetEditorDrawer
+        asset={assets.find((asset) => asset.id === editingAssetId) ?? null}
+        allAssets={assets}
+        onClose={() => setEditingAssetId(null)}
+        onSave={saveAssetRevision}
+      />
 
       <footer className="task-strip" aria-label="后台任务">
         <div className="task-label"><strong>近期任务</strong><span /></div>
         <div className="task-copy">
-          <strong>{job.name}</strong>
-          <span>{job.status === "completed" ? "已完成" : job.status === "credentials_locked" ? "等待凭据" : "处理中"}</span>
+          <strong>{isError ? "后台任务服务不可用" : job.name}</strong>
+          <span>{isError ? "等待重新连接" : job.status === "completed" ? "已完成" : job.status === "credentials_locked" ? "等待凭据" : "处理中"}</span>
         </div>
-        <span className={`job-status ${job.status}`}>{job.status === "completed" ? "已完成" : `${job.progress}%`}</span>
+        <span className={`job-status ${job.status}`}>{isError ? "错误" : job.status === "completed" ? "已完成" : `${job.progress}%`}</span>
         <div className="job-previews">{job.previewImages.map((image, index) => <img key={`${image}-${index}`} src={image} alt="" />)}</div>
-        <div className="job-metrics"><span>共生成 {job.total} 项</span><strong>通过 QA {job.passed} 项</strong></div>
-        <div className="job-output"><small>输出位置</small><span title={job.outputPath}>{job.outputPath}</span></div>
+        <div className="job-metrics"><span>{isError ? "任务数据不可用" : `共生成 ${job.total} 项`}</span><strong>{isError ? "—" : `通过 QA ${job.passed} 项`}</strong></div>
+        <div className="job-output"><small>输出位置</small><span title={job.outputPath}>{isError ? "—" : job.outputPath}</span></div>
         <button className="button secondary" type="button" disabled title="本地文件夹桥接尚未接入"><FolderOpen size={17} /> 打开文件夹</button>
       </footer>
 
       <SettingsDrawer open={settingsOpen} onClose={() => setSettingsOpen(false)} />
-      <ImportDialog open={importOpen} onClose={() => setImportOpen(false)} />
+      <ProjectDialog
+        open={projectDialogOpen}
+        project={projectToEdit}
+        onClose={closeProjectDialog}
+        onSaved={async () => {
+          await refetch();
+        }}
+      />
       <div className={`toast ${toast ? "visible" : ""}`} role="status" aria-live="polite">{toast}</div>
     </div>
   );

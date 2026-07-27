@@ -1,28 +1,20 @@
-# Game Assets API
+# API 后端
 
-本地优先的游戏资产制作后端。项目目录中的 `.game-assets/` 是权威数据源，SQLite
-仅保存可重建索引、持久任务和本地操作记录。
+FastAPI 后端只监听本机回环地址。Project 根目录文件是权威数据；Project 默认从 iCloud Drive 的 `Game-Projects` 发现，SQLite 则保存在本机 `~/Library/Application Support/Game-Asset-Management-System`，避免同步数据库文件。
 
-## 启动
+## Project 契约
+
+- 根目录必须包含 `format_version: 1` 的 `project.yaml`。
+- Catalog 使用分组 JSON 集合和统一 `snake_case` 字段。
+- History 保存内容寻址修订、审核、rendition 和 QA 索引。
+- Workspace 保存被忽略的候选、驳回、QA 报告与缓存。
+- 系统不支持其他项目布局或外部媒体路径协议。
+
+## 常用命令
 
 ```bash
-uv sync --all-packages
 uv run --project apps/api game-assets-api
-```
-
-服务只监听 `127.0.0.1:8787`，机器可读的 OpenAPI 文档位于
-`http://127.0.0.1:8787/openapi.json`（为满足无第三方 CDN 的 CSP，不启用 Swagger CDN）。
-可通过环境变量覆盖数据目录和端口：
-
-```bash
-GAME_ASSETS_DATA_DIR=/path/to/local-data GAME_ASSETS_PORT=8787 uv run game-assets-api
-```
-
-## 测试
-
-```bash
 uv run --project apps/api pytest
 ```
 
-API Key 只通过 `/api/providers/{id}/unlock` 进入进程内存；它不会进入 SQLite、
-项目文件或 API 响应。后端重启后必须重新解锁。
+OpenAPI 在服务启动后位于 `http://127.0.0.1:8787/openapi.json`。

@@ -51,6 +51,7 @@ class RelationType(StrEnum):
     DEPENDS_ON = "depends_on"
     APPEARS_IN = "appears_in"
     REFERENCES = "references"
+    CONTAINS = "contains"
 
 
 class RevisionFormat(StrEnum):
@@ -101,9 +102,30 @@ class ORMModel(BaseModel):
 
 
 class ProjectCreate(BaseModel):
-    root_path: str
-    name: str | None = None
-    initialize: bool = True
+    directory_name: str = Field(min_length=1, max_length=160)
+    name: str = Field(min_length=1, max_length=200)
+    default_language: str = Field(default="zh-CN", min_length=2, max_length=20)
+
+    @field_validator("directory_name")
+    @classmethod
+    def safe_directory_name(cls, value: str) -> str:
+        if value in {".", "..", "local-state"} or not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]*", value
+        ):
+            raise ValueError("directory_name must be one safe directory segment")
+        return value
+
+
+class ProjectUpdate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+
+    @field_validator("name")
+    @classmethod
+    def non_empty_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("name must not be blank")
+        return value
 
 
 class ProjectRead(ORMModel):
@@ -161,7 +183,6 @@ class RevisionCreate(BaseModel):
     style_revision: str | None = None
     prompt_recipe: str | None = None
     provider_snapshot: dict[str, Any] = {}
-    candidate_path: str | None = None
 
 
 class RevisionRead(ORMModel):
@@ -177,7 +198,6 @@ class RevisionRead(ORMModel):
     prompt_recipe: str | None
     provider_snapshot: dict[str, Any]
     file_path: str
-    candidate_path: str | None
     review_status: str
     reviewed_at: datetime | None
     created_at: datetime
@@ -372,18 +392,15 @@ class ScanReport(BaseModel):
     errors: list[str]
 
 
+class SystemInfo(BaseModel):
+    projects_root: str
+    state_dir: str
+    project_workspace: str = "<project>/workspace"
+    credential_store: str = "browser IndexedDB"
+
+
 class Message(BaseModel):
     detail: str
-
-
-class EmperorPreviewRequest(BaseModel):
-    source_root: str
-
-
-class EmperorImportRequest(BaseModel):
-    source_root: str
-    destination_path: str | None = None
-    apply: bool = False
 
 
 class ProviderCapabilities(BaseModel):

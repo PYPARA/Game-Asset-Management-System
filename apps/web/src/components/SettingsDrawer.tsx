@@ -1,15 +1,18 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   CheckCircle,
+  Database,
   Eye,
   EyeSlash,
+  FolderOpen,
   Key,
   LockKeyOpen,
   ShieldWarning,
   Trash,
   X,
 } from "@phosphor-icons/react";
-import { ensureProviderProfile, lockProvider, testProvider, unlockProvider } from "../lib/api";
+import { ensureProviderProfile, fetchSystemInfo, lockProvider, testProvider, unlockProvider } from "../lib/api";
+import type { SystemInfo } from "../lib/api";
 import {
   deleteCredential,
   hasCredential,
@@ -75,6 +78,7 @@ export function SettingsDrawer({ open, onClose }: SettingsDrawerProps) {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const [messageTone, setMessageTone] = useState<"success" | "warning" | "error">("success");
+  const [systemInfo, setSystemInfo] = useState<SystemInfo | null>(null);
 
   useEffect(() => {
     onCloseRef.current = onClose;
@@ -83,6 +87,7 @@ export function SettingsDrawer({ open, onClose }: SettingsDrawerProps) {
   useEffect(() => {
     if (!open) return;
     hasCredential(profile.id).then(setCredentialStored).catch(() => setCredentialStored(false));
+    fetchSystemInfo().then(setSystemInfo).catch(() => setSystemInfo(null));
   }, [open, profile.id]);
 
   useEffect(() => {
@@ -402,6 +407,19 @@ export function SettingsDrawer({ open, onClose }: SettingsDrawerProps) {
                 <small>仅在你信任目标服务时开启。本机 localhost HTTP 始终允许。</small>
               </span>
             </label>
+          </section>
+
+          <section className="drawer-section local-data-section">
+            <div className="local-data-heading">
+              <Database size={19} weight="duotone" />
+              <div><strong>本机数据位置</strong><p>正式成果属于 Project；索引和凭据不会进入 Git。</p></div>
+            </div>
+            <dl className="local-data-list">
+              <div><dt><FolderOpen size={15} /> Projects</dt><dd title={systemInfo?.projects_root}>{systemInfo?.projects_root ?? "正在读取…"}</dd></div>
+              <div><dt><Database size={15} /> 运行索引</dt><dd title={systemInfo?.state_dir}>{systemInfo?.state_dir ?? "正在读取…"}</dd></div>
+              <div><dt>候选与 QA</dt><dd>{systemInfo?.project_workspace ?? "<project>/workspace"}</dd></div>
+              <div><dt>供应商凭据</dt><dd>{systemInfo?.credential_store ?? "browser IndexedDB"}</dd></div>
+            </dl>
           </section>
 
           <section className="security-note">

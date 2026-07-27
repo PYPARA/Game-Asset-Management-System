@@ -6,7 +6,6 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
   "alembic>=1.14,<2",
-  "emperor-adapter",
   "fastapi>=0.116,<1",
   "httpx>=0.28,<1",
   "jsonschema>=4.23,<5",
@@ -16,9 +15,6 @@ dependencies = [
   "sqlalchemy>=2.0,<3",
   "uvicorn[standard]>=0.35,<1",
 ]
-
-[tool.uv.sources]
-emperor-adapter = { workspace = true }
 
 [dependency-groups]
 dev = [

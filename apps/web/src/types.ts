@@ -2,6 +2,29 @@ export type ReviewStatus = "pending" | "approved" | "rejected" | "generating";
 
 export type AssetKind = "content" | "design" | "entity" | "media" | "production";
 
+export type AssetPreview =
+  | { kind: "image"; images: string[]; label: string }
+  | { kind: "content"; label: string; meta: string; summary: string }
+  | { kind: "placeholder"; label: string; detail: string };
+
+export interface LinkedMedia {
+  assetId: string;
+  key: string;
+  name: string;
+  subtype: string;
+  images: string[];
+}
+
+export interface RelatedAsset {
+  assetId: string;
+  key: string;
+  name: string;
+  kind: AssetKind;
+  subtype: string;
+  relationType: string;
+  direction: "outgoing" | "incoming";
+}
+
 export interface ProjectSummary {
   id: string;
   name: string;
@@ -13,13 +36,16 @@ export interface ProjectSummary {
 
 export interface AssetRevision {
   id: string;
+  sequence: number;
   label: string;
   image: string;
+  format: "json" | "markdown" | "media";
+  content: unknown;
   createdAt: string;
   author: string;
   resolution: string;
   fileSize: string;
-  status: "candidate" | "approved" | "rejected";
+  status: "candidate" | "approved" | "rejected" | "superseded";
 }
 
 export interface QACheck {
@@ -35,19 +61,28 @@ export interface GameAsset {
   approvedRevisionId?: string;
   reviewReady?: boolean;
   reviewBlockReason?: string;
+  detailsLoaded: boolean;
   key: string;
   name: string;
   kind: AssetKind;
   category: string;
   subtype: string;
+  subtypeLabel: string;
   tags: string[];
   reviewStatus: ReviewStatus;
+  productionStage: string;
+  timeAccuracy: "known" | "unknown";
+  preview: AssetPreview;
   qaPassed: number;
   qaTotal: number;
   updatedAt: string;
   updatedLabel: string;
   updatedBy: string;
   thumbnails: string[];
+  linkedMedia: LinkedMedia[];
+  relatedAssets: RelatedAsset[];
+  revisionFormat: "json" | "markdown" | "media";
+  revisionContent: unknown;
   revisions: AssetRevision[];
   prompt: string;
   negativePrompt: string;
@@ -73,7 +108,6 @@ export interface WorkbenchPayload {
   project: ProjectSummary;
   assets: GameAsset[];
   job: JobSummary;
-  source: "api" | "demo";
 }
 
 export interface ProviderProfile {

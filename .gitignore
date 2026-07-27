@@ -3,6 +3,7 @@ node_modules/
 .pnpm-store/
 dist/
 coverage/
+node_cache
 
 __pycache__/
 *.py[cod]
@@ -16,8 +17,4 @@ __pycache__/
 *.log
 *.sqlite
 *.sqlite3
-
-output/game-assets/
-**/output/game-assets/
-**/.game-assets-local/
 

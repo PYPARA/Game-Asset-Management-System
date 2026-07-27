@@ -4,7 +4,6 @@ requires-python = ">=3.13"
 
 [manifest]
 members = [
-    "emperor-adapter",
     "game-assets-api",
 ]
 
@@ -92,20 +91,6 @@ wheels = [
 ]
 
 [[package]]
-name = "emperor-adapter"
-version = "0.1.0"
-source = { editable = "packages/emperor_adapter" }
-
-[package.optional-dependencies]
-test = [
-    { name = "pytest" },
-]
-
-[package.metadata]
-requires-dist = [{ name = "pytest", marker = "extra == 'test'", specifier = ">=8.3" }]
-provides-extras = ["test"]
-
-[[package]]
 name = "fastapi"
 version = "0.139.2"
 source = { registry = "https://pypi.org/simple" }
@@ -127,7 +112,6 @@ version = "0.1.0"
 source = { editable = "apps/api" }
 dependencies = [
     { name = "alembic" },
-    { name = "emperor-adapter" },
     { name = "fastapi" },
     { name = "httpx" },
     { name = "jsonschema" },
@@ -147,7 +131,6 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "alembic", specifier = ">=1.14,<2" },
-    { name = "emperor-adapter", editable = "packages/emperor_adapter" },
     { name = "fastapi", specifier = ">=0.116,<1" },
     { name = "httpx", specifier = ">=0.28,<1" },
     { name = "jsonschema", specifier = ">=4.23,<5" },

@@ -14,8 +14,6 @@ from .database import Database
 from .domain import (
     AssetCreate,
     AssetRead,
-    EmperorImportRequest,
-    EmperorPreviewRequest,
     GenerationAttemptRead,
     GenerationJobRead,
     GenerationPlanCreate,
@@ -24,6 +22,7 @@ from .domain import (
     Message,
     ProjectCreate,
     ProjectRead,
+    ProjectUpdate,
     ProviderCapabilities,
     ProviderCreate,
     ProviderKind,
@@ -41,6 +40,7 @@ from .domain import (
     RevisionCreate,
     RevisionRead,
     ScanReport,
+    SystemInfo,
 )
 from .models import (
     Asset,
@@ -73,12 +73,14 @@ from .services import (
     create_release,
     create_review,
     create_revision,
+    discover_projects,
     register_project,
     require,
     run_qa,
     scan_project,
+    update_project,
 )
-from .storage import ProjectStore, StorageError, safe_join
+from .storage import ProjectStore, StorageError
 
 
 router = APIRouter(prefix="/api")
@@ -114,59 +116,53 @@ def provider_http_error(exc: ProviderError) -> HTTPException:
     return HTTPException(mapping.get(exc.category.value, 502), detail={"category": exc.category.value, "message": str(exc)})
 
 
-def emperor_adapter():
-    try:
-        from emperor_adapter import AdapterError, dry_run, import_to
-    except ImportError as exc:
-        raise HTTPException(503, "Emperor adapter is not installed") from exc
-    return AdapterError, dry_run, import_to
-
-
 @router.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@router.post("/importers/emperor/preview")
-def emperor_preview(payload: EmperorPreviewRequest) -> dict[str, Any]:
-    AdapterError, dry_run, _import_to = emperor_adapter()
-    try:
-        return {"executed": False, "preview": dry_run(payload.source_root)}
-    except (AdapterError, OSError, ValueError) as exc:
-        raise HTTPException(422, str(exc)) from exc
-
-
-@router.post("/importers/emperor/import")
-def emperor_import(payload: EmperorImportRequest) -> dict[str, Any]:
-    AdapterError, dry_run, import_to = emperor_adapter()
-    try:
-        if not payload.apply:
-            return {"executed": False, "preview": dry_run(payload.source_root)}
-        if not payload.destination_path:
-            raise HTTPException(422, "destination_path is required when apply=true")
-        return {
-            "executed": True,
-            "report": import_to(payload.source_root, payload.destination_path),
-        }
-    except HTTPException:
-        raise
-    except (AdapterError, OSError, ValueError) as exc:
-        raise HTTPException(422, str(exc)) from exc
-
-
 @router.get("/projects", response_model=list[ProjectRead])
-def list_projects(session: Session = Depends(db)) -> list[Project]:
-    return list(session.scalars(select(Project).order_by(Project.created_at.desc())).all())
+def list_projects(request: Request, session: Session = Depends(db)) -> list[Project]:
+    projects, _errors = discover_projects(session, request.app.state.settings.projects_root)
+    return projects
+
+
+@router.get("/projects/discovery")
+def project_discovery(request: Request, session: Session = Depends(db)) -> dict[str, Any]:
+    projects, errors = discover_projects(
+        session, request.app.state.settings.projects_root, scan=False
+    )
+    return {
+        "projects_root": str(request.app.state.settings.projects_root.resolve()),
+        "projects": [ProjectRead.model_validate(project).model_dump(mode="json") for project in projects],
+        "errors": errors,
+    }
 
 
 @router.post("/projects", response_model=ProjectRead, status_code=status.HTTP_201_CREATED)
-def add_project(payload: ProjectCreate, session: Session = Depends(db)) -> Project:
-    return register_project(session, payload)
+def add_project(payload: ProjectCreate, request: Request, session: Session = Depends(db)) -> Project:
+    return register_project(session, payload, request.app.state.settings.projects_root)
+
+
+@router.get("/system", response_model=SystemInfo)
+def system_info(request: Request) -> SystemInfo:
+    settings = request.app.state.settings
+    return SystemInfo(
+        projects_root=str(settings.projects_root.resolve()),
+        state_dir=str(settings.state_dir.resolve()),
+    )
 
 
 @router.get("/projects/{project_id}", response_model=ProjectRead)
 def get_project(project_id: str, session: Session = Depends(db)) -> Project:
     return require(session, Project, project_id, "project")
+
+
+@router.patch("/projects/{project_id}", response_model=ProjectRead)
+def edit_project(
+    project_id: str, payload: ProjectUpdate, session: Session = Depends(db)
+) -> Project:
+    return update_project(session, require(session, Project, project_id, "project"), payload)
 
 
 @router.post("/projects/{project_id}/scan", response_model=ScanReport)
@@ -256,7 +252,9 @@ def rendition_content(rendition_id: str, session: Session = Depends(db)) -> File
     project = require(session, Project, asset.project_id, "project")
     store = ProjectStore(project.root_path)
     try:
-        content_path = safe_join(store.root, rendition.normalized_path or rendition.source_path)
+        content_path = store.resolve_rendition_path(
+            rendition.normalized_path or rendition.source_path
+        )
     except StorageError as exc:
         raise HTTPException(409, "rendition path is outside the registered project") from exc
     if not content_path.is_file():

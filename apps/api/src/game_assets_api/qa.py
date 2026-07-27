@@ -91,10 +91,10 @@ def normalize_image(
     return {
         "width": image.width,
         "height": image.height,
-        "byteSize": destination.stat().st_size,
+        "byte_size": destination.stat().st_size,
         "sha256": sha256_file(destination),
-        "mediaType": "image/webp",
-        "colorKeyRemoved": keyed,
+        "media_type": "image/webp",
+        "color_key_removed": keyed,
     }
 
 

@@ -13,7 +13,7 @@ from .api import router
 from .database import Database
 from .providers import CredentialVault
 from .runner import JobRunner
-from .services import ServiceError
+from .services import ServiceError, discover_projects
 from .settings import Settings
 
 
@@ -26,6 +26,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         database.create_schema()
+        with database.sessions() as session:
+            discover_projects(session, settings.projects_root, scan=True)
         await runner.start()
         try:
             yield

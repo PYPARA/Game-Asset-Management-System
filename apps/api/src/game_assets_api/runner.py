@@ -30,7 +30,7 @@ from .providers import CredentialVault, ProviderError, ProviderResult, build_pro
 from .qa import normalize_image
 from .services import ServiceError, asset_descriptor, create_revision, run_qa
 from .settings import Settings
-from .storage import ProjectStore, atomic_write_bytes, relative_to_root, safe_join
+from .storage import ProjectStore, atomic_write_bytes, relative_to_root, safe_join, stable_id
 
 
 class JobRunner:
@@ -314,13 +314,13 @@ class JobRunner:
             if project is None or profile is None or asset is None:
                 raise ServiceError(422, "job references missing records")
             provider_snapshot = {
-                "profileId": profile.id,
+                "profile_id": profile.id,
                 "kind": profile.kind,
-                "baseUrl": profile.base_url,
-                "textModel": profile.text_model,
-                "imageModel": profile.image_model,
+                "base_url": profile.base_url,
+                "text_model": profile.text_model,
+                "image_model": profile.image_model,
                 "quality": profile.quality,
-                "requestId": result.request_id or "unknown",
+                "request_id": result.request_id,
             }
             if job.task_kind == TaskKind.TEXT.value:
                 revision = create_revision(
@@ -350,6 +350,16 @@ class JobRunner:
                 transparent=bool(job.request_json.get("transparent")),
             )
             normalized_relative = relative_to_root(store.root, normalized)
+            rendition_data = {
+                "media_type": info["media_type"],
+                "source_path": relative_to_root(store.root, source),
+                "normalized_path": normalized_relative,
+                "target_path": job.request_json.get("target_path"),
+                "sha256": info["sha256"],
+                "width": info["width"],
+                "height": info["height"],
+                "byte_size": info["byte_size"],
+            }
             revision = create_revision(
                 session,
                 RevisionCreate(
@@ -359,25 +369,19 @@ class JobRunner:
                         "prompt": job.request_json["prompt"],
                         "width": info["width"],
                         "height": info["height"],
-                        "colorKeyRemoved": info["colorKeyRemoved"],
+                        "color_key_removed": info["color_key_removed"],
+                        "rendition": rendition_data,
                     },
                     provider_snapshot=provider_snapshot,
-                    candidate_path=normalized_relative,
                 ),
             )
             rendition = Rendition(
-                id=new_id(),
+                id=stable_id("rendition", revision.id, info["sha256"]),
                 revision_id=revision.id,
-                media_type=info["mediaType"],
-                source_path=relative_to_root(store.root, source),
-                normalized_path=normalized_relative,
-                target_path=job.request_json.get("target_path"),
-                sha256=info["sha256"],
-                width=info["width"],
-                height=info["height"],
-                byte_size=info["byteSize"],
+                **rendition_data,
             )
             session.add(rendition)
+            session.flush()
             session.commit()
             run_qa(
                 session,

@@ -7,10 +7,23 @@ from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+DEFAULT_PROJECTS_ROOT = (
+    Path.home()
+    / "Library"
+    / "Mobile Documents"
+    / "com~apple~CloudDocs"
+    / "Game-Projects"
+)
+DEFAULT_STATE_DIR = (
+    Path.home() / "Library" / "Application Support" / "Game-Asset-Management-System"
+)
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="GAME_ASSETS_", extra="ignore")
 
-    data_dir: Path = Field(default_factory=lambda: Path(__file__).parents[2] / ".data")
+    projects_root: Path = Field(default_factory=lambda: DEFAULT_PROJECTS_ROOT)
+    state_dir: Path = Field(default_factory=lambda: DEFAULT_STATE_DIR)
     frontend_dist: Path | None = Field(
         default_factory=lambda: Path(__file__).resolve().parents[3] / "web" / "dist"
     )
@@ -43,7 +56,8 @@ class Settings(BaseSettings):
     def resolved_database_url(self) -> str:
         if self.database_url:
             return self.database_url
-        return f"sqlite:///{(self.data_dir / 'index.sqlite3').as_posix()}"
+        return f"sqlite:///{(self.state_dir / 'index.sqlite3').as_posix()}"
 
     def prepare(self) -> None:
-        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.projects_root.mkdir(parents=True, exist_ok=True)
+        self.state_dir.mkdir(parents=True, exist_ok=True)

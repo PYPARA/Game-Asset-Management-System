@@ -7,6 +7,7 @@ import { deleteCredential, hasCredential, saveCredential } from "../lib/credenti
 
 const apiMocks = vi.hoisted(() => ({
   ensureProviderProfile: vi.fn(),
+  fetchSystemInfo: vi.fn(),
   lockProvider: vi.fn(),
   testProvider: vi.fn(),
   unlockProvider: vi.fn(),
@@ -45,6 +46,13 @@ function DrawerHarness() {
 
 describe("供应商设置抽屉", () => {
   beforeEach(() => {
+    apiMocks.fetchSystemInfo.mockReset();
+    apiMocks.fetchSystemInfo.mockResolvedValue({
+      projects_root: "/projects",
+      state_dir: "/projects/local-state",
+      project_workspace: "<project>/workspace",
+      credential_store: "browser IndexedDB",
+    });
     apiMocks.ensureProviderProfile.mockReset();
     apiMocks.ensureProviderProfile.mockImplementation(async (profile) => ({
       id: profile.id,
