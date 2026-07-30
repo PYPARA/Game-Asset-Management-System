@@ -20,6 +20,8 @@ def wait_for_job(client: TestClient, job_id: str, timeout: float = 5.0) -> dict:
     while time.monotonic() < deadline:
         job = client.get(f"/api/jobs/{job_id}").json()
         if job["status"] in {
+            "candidate_ready",
+            "awaiting_user",
             "succeeded",
             "qa_failed",
             "failed",
@@ -62,7 +64,7 @@ def generate_and_approve_image(
     ).json()
     job_id = client.post(f"/api/generation-plans/{plan['id']}/confirm").json()[0]["id"]
     job = wait_for_job(client, job_id)
-    assert job["status"] == "succeeded", job
+    assert job["status"] == "candidate_ready", job
     approval = client.post(
         "/api/reviews",
         json={"revision_id": job["result_revision_id"], "verdict": "approve"},
@@ -102,7 +104,7 @@ def test_structured_text_job_creates_schema_valid_candidate(client: TestClient, 
     assert plan_response.status_code == 201, plan_response.text
     jobs = client.post(f"/api/generation-plans/{plan_response.json()['id']}/confirm").json()
     job = wait_for_job(client, jobs[0]["id"])
-    assert job["status"] == "succeeded", job
+    assert job["status"] == "candidate_ready", job
     revision = client.get(f"/api/revisions/{job['result_revision_id']}").json()
     assert revision["content"] == {"name": "generated-name", "rarity": "legendary"}
     assert revision["provider_snapshot"]["request_id"] == "fake-text-request"
@@ -142,7 +144,7 @@ def test_image_approval_promotes_durable_artifacts_and_rebuilds_without_workspac
     ).json()
     jobs = client.post(f"/api/generation-plans/{plan['id']}/confirm").json()
     job = wait_for_job(client, jobs[0]["id"])
-    assert job["status"] == "succeeded", job
+    assert job["status"] == "candidate_ready", job
     revision_id = job["result_revision_id"]
     renditions = client.get(f"/api/revisions/{revision_id}/renditions").json()
     assert len(renditions) == 1
@@ -278,10 +280,11 @@ def test_hard_qa_failure_is_not_reported_as_job_success(
 
     job = wait_for_job(client, job_id)
 
-    assert job["status"] == "qa_failed"
+    assert job["status"] == "awaiting_user"
+    assert job["stage"] == "hard_qa"
     assert job["result_revision_id"]
     assert job["error_category"] == "validation"
-    assert client.get(f"/api/assets/{asset['id']}").json()["generation_status"] == "qa_failed"
+    assert client.get(f"/api/assets/{asset['id']}").json()["generation_status"] == "awaiting_user"
     attempts = client.get(f"/api/jobs/{job_id}/attempts").json()
     assert attempts[0]["status"] == "succeeded"
 

@@ -24,6 +24,7 @@ dev = [
 
 [project.scripts]
 game-assets-api = "game_assets_api.cli:main"
+gams = "game_assets_api.cli:main"
 
 [build-system]
 requires = ["hatchling"]

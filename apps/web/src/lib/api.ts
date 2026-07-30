@@ -1,10 +1,17 @@
 import type {
   AssetRevision,
   GameAsset,
+  GenerationJobRun,
+  GenerationPlanInput,
+  GenerationPlanRun,
+  GenerationProviderProfile,
   JobSummary,
   ProjectSummary,
   QACheck,
+  RemediationRun,
   ReviewStatus,
+  RunEventItem,
+  RunInspection,
   WorkbenchPayload,
 } from "../types";
 import type { ProviderProfile } from "../types";
@@ -222,6 +229,7 @@ function normalizeAsset(value: unknown): GameAsset {
     detailsLoaded: false,
     reviewBlockReason: "正在加载真实候选修订与 QA 证据。",
     key,
+    schemaRef: typeof value.schema_ref === "string" ? value.schema_ref : undefined,
     name: String(value.title ?? key),
     kind,
     category,
@@ -257,14 +265,33 @@ function normalizeJob(value: unknown): JobSummary {
     return emptyJob;
   }
   const rawStatus = String(value.status ?? "paused");
-  const status = ["queued", "running", "completed", "paused", "credentials_locked", "qa_failed"].includes(rawStatus)
+  const activeStatuses = new Set([
+    "running",
+    "output_received",
+    "hard_qa",
+    "semantic_qa",
+    "remediating",
+  ]);
+  const status = [
+    "queued",
+    "completed",
+    "paused",
+    "awaiting_user",
+    "credentials_locked",
+    "qa_failed",
+  ].includes(rawStatus)
     ? rawStatus
-    : rawStatus === "succeeded"
+    : ["succeeded", "candidate_ready"].includes(rawStatus)
       ? "completed"
+      : activeStatuses.has(rawStatus)
+        ? "running"
       : "paused";
-  const progress = Number(value.progress ?? 0);
+  const rawProgress = Number(value.progress ?? 0);
+  const progress = rawProgress <= 1 ? Math.round(rawProgress * 100) : Math.round(rawProgress);
   return {
     id: String(value.id ?? "job"),
+    planId: typeof value.plan_id === "string" ? value.plan_id : undefined,
+    taskId: typeof value.task_id === "string" ? value.task_id : undefined,
     name: String(value.name ?? value.task_id ?? "生成任务"),
     progress,
     completed: Number(value.completed ?? (status === "completed" ? 1 : 0)),
@@ -761,6 +788,143 @@ export async function updateProject(projectId: string, name: string) {
     },
   );
   return normalizeProject(project);
+}
+
+export async function fetchGenerationProviders(): Promise<GenerationProviderProfile[]> {
+  const profiles = await request<Array<Record<string, unknown>>>("/providers");
+  return profiles.map((profile) => ({
+    id: String(profile.id ?? ""),
+    name: String(profile.name ?? "未命名供应商"),
+    kind: String(profile.kind ?? ""),
+    text_model: String(profile.text_model ?? ""),
+    image_model: String(profile.image_model ?? ""),
+    concurrency: Number(profile.concurrency ?? 1),
+    pricing: isRecord(profile.pricing)
+      ? Object.fromEntries(
+          Object.entries(profile.pricing).flatMap(([key, value]) => {
+            const parsed = Number(value);
+            return Number.isFinite(parsed) ? [[key, parsed]] : [];
+          }),
+        )
+      : null,
+    is_unlocked: profile.is_unlocked === true,
+  }));
+}
+
+export async function createAndConfirmGenerationPlan(
+  payload: GenerationPlanInput,
+): Promise<{ plan: GenerationPlanRun; jobs: GenerationJobRun[] }> {
+  const plan = await request<GenerationPlanRun>("/generation-plans", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  const jobs = await request<GenerationJobRun[]>(
+    `/generation-plans/${encodeURIComponent(plan.id)}/confirm`,
+    { method: "POST" },
+  );
+  return { plan, jobs };
+}
+
+export async function fetchRunInspection(planId: string): Promise<RunInspection> {
+  return request<RunInspection>(
+    `/generation-plans/${encodeURIComponent(planId)}/inspect`,
+    { timeoutMs: 15_000 },
+  );
+}
+
+export async function updateGenerationBudget(
+  planId: string,
+  extraCallBudget: number,
+): Promise<GenerationPlanRun> {
+  return request<GenerationPlanRun>(
+    `/generation-plans/${encodeURIComponent(planId)}/budget`,
+    {
+      method: "PATCH",
+      body: JSON.stringify({ extra_call_budget: extraCallBudget }),
+    },
+  );
+}
+
+export async function resumeGenerationPlan(planId: string): Promise<GenerationJobRun[]> {
+  return request<GenerationJobRun[]>(
+    `/generation-plans/${encodeURIComponent(planId)}/resume`,
+    { method: "POST" },
+  );
+}
+
+export async function createRunRemediation(
+  jobId: string,
+  payload: {
+    action: "retry" | "tool_repair" | "regenerate" | "image_edit" | "await_user";
+    strategy: string;
+    reason: string;
+    parameters?: Record<string, unknown>;
+    finding_ids?: string[];
+    expected_additional_calls?: number;
+  },
+): Promise<RemediationRun> {
+  return request<RemediationRun>(`/jobs/${encodeURIComponent(jobId)}/remediations`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function runEvidenceUrl(evidenceId: string): string {
+  return `${API_ROOT}/run-evidence/${encodeURIComponent(evidenceId)}/content`;
+}
+
+export function subscribeToRunEvents(
+  planId: string,
+  onEvent: (event: RunEventItem) => void,
+  onConnectionChange?: (connected: boolean) => void,
+) {
+  if (typeof EventSource === "undefined") return () => undefined;
+  const source = new EventSource(
+    `${API_ROOT}/runs/events?plan_id=${encodeURIComponent(planId)}`,
+  );
+  source.onopen = () => onConnectionChange?.(true);
+  source.onmessage = (event) => {
+    try {
+      onEvent(JSON.parse(event.data) as RunEventItem);
+    } catch {
+      // The stream also emits typed events and keepalives.
+    }
+  };
+  const handleTypedEvent = (event: MessageEvent<string>) => {
+    try {
+      onEvent(JSON.parse(event.data) as RunEventItem);
+    } catch {
+      // Ignore a malformed event without closing the durable stream.
+    }
+  };
+  const eventTypes = [
+    "plan.confirmed",
+    "run.queued",
+    "run.lease_acquired",
+    "run.inputs_resolved",
+    "run.stage_changed",
+    "run.awaiting_user",
+    "run.recovered",
+    "run.resumed",
+    "finding.created",
+    "action.accepted",
+    "budget.changed",
+    "provider.call_started",
+    "provider.call_failed",
+    "provider.credentials_locked",
+    "artifact.created",
+    "worker.started",
+  ];
+  for (const eventType of eventTypes) {
+    source.addEventListener(eventType, handleTypedEvent as EventListener);
+  }
+  source.onerror = () => onConnectionChange?.(false);
+  return () => {
+    for (const eventType of eventTypes) {
+      source.removeEventListener(eventType, handleTypedEvent as EventListener);
+    }
+    source.close();
+  };
 }
 
 export function subscribeToJobEvents(

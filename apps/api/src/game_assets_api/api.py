@@ -20,7 +20,9 @@ from .domain import (
     GenerationPlanCreate,
     GenerationPlanRead,
     GenerationStatus,
+    FindingRead,
     Message,
+    PlanBudgetUpdate,
     ProjectCreate,
     ProjectRead,
     ProjectUpdate,
@@ -31,6 +33,10 @@ from .domain import (
     ProviderUnlock,
     QARunCreate,
     QARunRead,
+    RemediationCreate,
+    RemediationKind,
+    RemediationRead,
+    RemediationStatus,
     RelationCreate,
     RelationRead,
     ReleaseCreate,
@@ -40,6 +46,9 @@ from .domain import (
     ReviewRead,
     RevisionCreate,
     RevisionRead,
+    RunEventRead,
+    RunEvidenceRead,
+    RunInspectRead,
     ScanReport,
     SystemInfo,
 )
@@ -51,12 +60,16 @@ from .models import (
     GenerationAttempt,
     GenerationJob,
     GenerationPlan,
+    ProductionFinding,
     Project,
     ProviderProfile,
     QARun,
+    RemediationAction,
     Release,
     Rendition,
     ReviewDecision,
+    RunEvent,
+    RunEvidence,
     new_id,
     utcnow,
 )
@@ -65,6 +78,15 @@ from .providers import (
     ProviderError,
     build_provider,
     validate_base_url,
+)
+from .production import (
+    attempt_output_is_valid,
+    create_remediation,
+    inspect_run,
+    record_run_event,
+    refresh_plan_status,
+    resume_recoverable_jobs,
+    update_extra_call_budget,
 )
 from .services import (
     ServiceError,
@@ -82,7 +104,7 @@ from .services import (
     scan_project,
     update_project,
 )
-from .storage import ProjectStore, StorageError
+from .storage import ProjectStore, StorageError, sha256_file
 
 
 router = APIRouter(prefix="/api")
@@ -438,6 +460,42 @@ def get_plan(plan_id: str, session: Session = Depends(db)) -> GenerationPlan:
     return require(session, GenerationPlan, plan_id, "generation plan")
 
 
+@router.get("/generation-plans/{plan_id}/inspect", response_model=RunInspectRead)
+def inspect_plan(plan_id: str, session: Session = Depends(db)) -> dict[str, Any]:
+    plan = require(session, GenerationPlan, plan_id, "generation plan")
+    return inspect_run(session, plan)
+
+
+@router.patch("/generation-plans/{plan_id}/budget", response_model=GenerationPlanRead)
+def change_plan_budget(
+    plan_id: str,
+    payload: PlanBudgetUpdate,
+    session: Session = Depends(db),
+) -> GenerationPlan:
+    plan = require(session, GenerationPlan, plan_id, "generation plan")
+    return update_extra_call_budget(
+        session,
+        plan=plan,
+        extra_call_budget=payload.extra_call_budget,
+    )
+
+
+@router.post("/generation-plans/{plan_id}/resume", response_model=list[GenerationJobRead])
+def resume_plan(
+    plan_id: str,
+    session: Session = Depends(db),
+    credentials: CredentialVault = Depends(vault),
+) -> list[GenerationJob]:
+    plan = require(session, GenerationPlan, plan_id, "generation plan")
+    profile = require(session, ProviderProfile, plan.provider_profile_id, "provider profile")
+    return resume_recoverable_jobs(
+        session,
+        plan=plan,
+        credentials_available=profile.kind == ProviderKind.FAKE.value
+        or credentials.is_unlocked(profile.id),
+    )
+
+
 @router.post("/generation-plans/{plan_id}/confirm", response_model=list[GenerationJobRead])
 def approve_plan(
     plan_id: str,
@@ -488,6 +546,63 @@ async def job_events(
     )
 
 
+@router.get("/run-events", response_model=list[RunEventRead])
+def list_run_events(
+    project_id: str | None = None,
+    plan_id: str | None = None,
+    after: int = Query(default=0, ge=0),
+    limit: int = Query(default=500, ge=1, le=2_000),
+    session: Session = Depends(db),
+) -> list[RunEvent]:
+    statement = select(RunEvent).where(RunEvent.sequence > after)
+    if project_id:
+        statement = statement.where(RunEvent.project_id == project_id)
+    if plan_id:
+        statement = statement.where(RunEvent.plan_id == plan_id)
+    return list(session.scalars(statement.order_by(RunEvent.sequence).limit(limit)).all())
+
+
+@router.get("/runs/events")
+async def run_events(
+    request: Request,
+    project_id: str | None = None,
+    plan_id: str | None = None,
+    after: int = Query(default=0, ge=0),
+) -> StreamingResponse:
+    header_cursor = request.headers.get("last-event-id")
+    try:
+        initial_cursor = max(after, int(header_cursor)) if header_cursor else after
+    except ValueError:
+        initial_cursor = after
+
+    async def events() -> AsyncIterator[str]:
+        cursor = initial_cursor
+        last_keepalive = time.monotonic()
+        while not await request.is_disconnected():
+            database: Database = request.app.state.database
+            with database.sessions() as session:
+                statement = select(RunEvent).where(RunEvent.sequence > cursor)
+                if project_id:
+                    statement = statement.where(RunEvent.project_id == project_id)
+                if plan_id:
+                    statement = statement.where(RunEvent.plan_id == plan_id)
+                rows = session.scalars(statement.order_by(RunEvent.sequence).limit(500)).all()
+                for row in rows:
+                    cursor = row.sequence
+                    data = RunEventRead.model_validate(row).model_dump_json()
+                    yield f"id: {row.sequence}\nevent: {row.event_type}\ndata: {data}\n\n"
+            if time.monotonic() - last_keepalive >= 15:
+                yield ": keepalive\n\n"
+                last_keepalive = time.monotonic()
+            await asyncio.sleep(0.25)
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @router.get("/jobs", response_model=list[GenerationJobRead])
 def list_jobs(
     project_id: str | None = None,
@@ -522,6 +637,99 @@ def job_attempts(job_id: str, session: Session = Depends(db)) -> list[Generation
     )
 
 
+@router.get("/findings", response_model=list[FindingRead])
+def list_findings(
+    plan_id: str | None = None,
+    job_id: str | None = None,
+    blocking: bool | None = None,
+    session: Session = Depends(db),
+) -> list[ProductionFinding]:
+    statement = select(ProductionFinding)
+    if plan_id:
+        statement = statement.where(ProductionFinding.plan_id == plan_id)
+    if job_id:
+        statement = statement.where(ProductionFinding.job_id == job_id)
+    if blocking is not None:
+        statement = statement.where(ProductionFinding.blocking.is_(blocking))
+    return list(
+        session.scalars(
+            statement.order_by(ProductionFinding.created_at, ProductionFinding.id)
+        ).all()
+    )
+
+
+@router.get("/run-evidence", response_model=list[RunEvidenceRead])
+def list_run_evidence(
+    plan_id: str | None = None,
+    job_id: str | None = None,
+    session: Session = Depends(db),
+) -> list[RunEvidence]:
+    statement = select(RunEvidence)
+    if plan_id:
+        statement = statement.where(RunEvidence.plan_id == plan_id)
+    if job_id:
+        statement = statement.where(RunEvidence.job_id == job_id)
+    return list(session.scalars(statement.order_by(RunEvidence.created_at, RunEvidence.id)).all())
+
+
+@router.get("/run-evidence/{evidence_id}/content", response_class=FileResponse)
+def run_evidence_content(
+    evidence_id: str,
+    session: Session = Depends(db),
+) -> FileResponse:
+    evidence = require(session, RunEvidence, evidence_id, "run evidence")
+    if not evidence.path or not evidence.media_type:
+        raise HTTPException(404, "evidence has no media content")
+    plan = require(session, GenerationPlan, evidence.plan_id, "generation plan")
+    project = require(session, Project, plan.project_id, "project")
+    try:
+        content_path = ProjectStore(project.root_path).resolve_rendition_path(evidence.path)
+    except StorageError as exc:
+        raise HTTPException(409, "evidence path is outside the registered project") from exc
+    if not content_path.is_file():
+        raise HTTPException(404, "evidence content is missing")
+    if evidence.sha256 and sha256_file(content_path) != evidence.sha256:
+        raise HTTPException(409, "evidence content hash does not match the persisted record")
+    return FileResponse(
+        content_path,
+        media_type=evidence.media_type,
+        filename=None,
+        headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"},
+    )
+
+
+@router.get("/remediations", response_model=list[RemediationRead])
+def list_remediations(
+    plan_id: str | None = None,
+    job_id: str | None = None,
+    session: Session = Depends(db),
+) -> list[RemediationAction]:
+    statement = select(RemediationAction)
+    if plan_id:
+        statement = statement.where(RemediationAction.plan_id == plan_id)
+    if job_id:
+        statement = statement.where(RemediationAction.job_id == job_id)
+    return list(
+        session.scalars(
+            statement.order_by(RemediationAction.created_at, RemediationAction.id)
+        ).all()
+    )
+
+
+@router.post(
+    "/jobs/{job_id}/remediations",
+    response_model=RemediationRead,
+    status_code=status.HTTP_201_CREATED,
+)
+def add_remediation(
+    job_id: str,
+    payload: RemediationCreate,
+    session: Session = Depends(db),
+) -> RemediationAction:
+    job = require(session, GenerationJob, job_id, "generation job")
+    return create_remediation(session, job=job, payload=payload)
+
+
 @router.post("/jobs/{job_id}/cancel", response_model=GenerationJobRead)
 def cancel_job(job_id: str, session: Session = Depends(db)) -> GenerationJob:
     job = require(session, GenerationJob, job_id, "generation job")
@@ -545,19 +753,48 @@ def resume_job(
     credentials: CredentialVault = Depends(vault),
 ) -> GenerationJob:
     job = require(session, GenerationJob, job_id, "generation job")
+    previous_status = job.status
     if job.status not in {
-        GenerationStatus.QA_FAILED.value,
-        GenerationStatus.FAILED.value,
-        GenerationStatus.CANCELLED.value,
+        GenerationStatus.AWAITING_USER.value,
         GenerationStatus.CREDENTIALS_LOCKED.value,
     }:
-        raise ServiceError(
-            409, "only QA-failed, failed, cancelled, or credentials-locked jobs can resume"
-        )
+        raise ServiceError(409, "use an explicit remediation action to repeat completed calls")
     profile = require(session, ProviderProfile, job.provider_profile_id, "provider profile")
+    has_recoverable_output = False
+    has_recoverable_action = False
+    if job.status == GenerationStatus.AWAITING_USER.value:
+        latest = session.scalar(
+            select(GenerationAttempt)
+            .where(GenerationAttempt.job_id == job.id)
+            .order_by(GenerationAttempt.number.desc())
+            .limit(1)
+        )
+        has_recoverable_output = attempt_output_is_valid(session, job, latest)
+        pending_action = (
+            session.get(RemediationAction, job.pending_action_id)
+            if job.pending_action_id
+            else None
+        )
+        has_recoverable_action = bool(
+            pending_action
+            and pending_action.action == RemediationKind.TOOL_REPAIR.value
+            and pending_action.status
+            in {
+                RemediationStatus.ACCEPTED.value,
+                RemediationStatus.RUNNING.value,
+            }
+        )
+        if not has_recoverable_action and not has_recoverable_output:
+            raise ServiceError(
+                409,
+                "provider delivery is not safely resumable; choose retry, repair, regenerate, or await user",
+            )
     job.status = (
         GenerationStatus.QUEUED.value
-        if profile.kind == ProviderKind.FAKE.value or credentials.is_unlocked(profile.id)
+        if profile.kind == ProviderKind.FAKE.value
+        or credentials.is_unlocked(profile.id)
+        or has_recoverable_output
+        or has_recoverable_action
         else GenerationStatus.CREDENTIALS_LOCKED.value
     )
     job.cancel_requested = False
@@ -565,6 +802,24 @@ def resume_job(
     job.error_category = None
     job.error_message = None
     job.updated_at = utcnow()
+    if job.status != previous_status:
+        record_run_event(
+            session,
+            plan_id=job.plan_id,
+            project_id=job.project_id,
+            job_id=job.id,
+            asset_id=str(job.request_json.get("asset_id")),
+            event_type="run.resumed",
+            stage=job.stage,
+            data={
+                "previous_status": previous_status,
+                "recoverable_output": has_recoverable_output,
+                "recoverable_action": has_recoverable_action,
+            },
+        )
+        plan = session.get(GenerationPlan, job.plan_id)
+        if plan:
+            refresh_plan_status(session, plan)
     session.commit()
     return job
 

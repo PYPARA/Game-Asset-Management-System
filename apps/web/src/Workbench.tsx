@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   type ColumnDef,
@@ -54,6 +54,17 @@ import {
 } from "./lib/api";
 import { assetSubtypeLabel } from "./lib/labels";
 import type { GameAsset, JobSummary, ProjectSummary, ReviewStatus } from "./types";
+
+const GenerationPlanDrawer = lazy(() =>
+  import("./components/GenerationPlanDrawer").then((module) => ({
+    default: module.GenerationPlanDrawer,
+  })),
+);
+const RunInspectorDrawer = lazy(() =>
+  import("./components/RunInspectorDrawer").then((module) => ({
+    default: module.RunInspectorDrawer,
+  })),
+);
 
 const libraryItems = [
   { id: "content", label: "叙事内容", icon: Article },
@@ -152,6 +163,10 @@ export function Workbench() {
   const [reviewBusy, setReviewBusy] = useState(false);
   const [visibleLimit, setVisibleLimit] = useState(60);
   const [editingAssetId, setEditingAssetId] = useState<string | null>(null);
+  const [planDrawerOpen, setPlanDrawerOpen] = useState(false);
+  const [planSeedAssetIds, setPlanSeedAssetIds] = useState<string[]>([]);
+  const [runInspectorPlanId, setRunInspectorPlanId] = useState<string | null>(null);
+  const [runFocusAssetIds, setRunFocusAssetIds] = useState<string[]>([]);
 
   const openProjectDialog = (project: ProjectSummary | null = null) => {
     setProjectToEdit(project);
@@ -380,7 +395,12 @@ export function Workbench() {
       return;
     }
     if (decision === "regenerate") {
-      setToast("返工任务尚未接入生成计划；本次没有写入或入队。");
+      if (!job.planId) {
+        setToast("当前没有可检查的生产运行，请先建立生成计划。");
+        return;
+      }
+      setRunFocusAssetIds(ids);
+      setRunInspectorPlanId(job.planId);
       return;
     }
 
@@ -452,6 +472,11 @@ export function Workbench() {
     if (!target) return;
     setActiveCategory(target.category);
     setSelectedAssetId(target.id);
+  };
+
+  const openPlanDrawer = (assetIds: string[]) => {
+    setPlanSeedAssetIds(assetIds);
+    setPlanDrawerOpen(true);
   };
 
   return (
@@ -560,15 +585,15 @@ export function Workbench() {
         <main className="batch-panel">
           <header className="batch-heading">
             <div>
-              <span className="section-kicker">图像生成批次</span>
-              <h1>批量审查 <span>· 已完成</span> <CheckCircle size={21} weight="fill" /></h1>
+              <span className="section-kicker">资产生产批次</span>
+              <h1>批量审查 <span>· {job.status === "awaiting_user" ? "等待人工" : job.status === "running" || job.status === "queued" ? "生产中" : "已同步"}</span> <CheckCircle size={21} weight="fill" /></h1>
             </div>
             <button
               className="button secondary generate-button"
               type="button"
-              disabled
-              title="生成计划编辑器将在下一实施里程碑接入"
-            ><Plus size={17} /> 新建生成计划（待接入）</button>
+              disabled={!data.project.id || isError}
+              onClick={() => openPlanDrawer(selectedIds)}
+            ><Plus size={17} /> 新建生成计划</button>
           </header>
 
           <div className="toolbar">
@@ -701,7 +726,7 @@ export function Workbench() {
             <div />
             <button className="button primary" type="button" disabled={!selectionReviewable || reviewBusy} onClick={() => reviewAssets("approve")}>批量批准版本</button>
             <button className="button secondary" type="button" disabled={!selectionReviewable || reviewBusy} onClick={() => reviewAssets("reject")}>驳回</button>
-            <button className="button secondary" type="button" disabled title="返工任务将在生成计划编辑器接入后启用">需要重做（待接入）</button>
+            <button className="button secondary" type="button" disabled={selectedIds.length === 0 || !job.planId || reviewBusy} onClick={() => reviewAssets("regenerate")}>需要重做</button>
             <button className="icon-button" type="button" aria-label="更多审核操作"><DotsThree size={19} /></button>
           </footer>
         </main>
@@ -727,14 +752,44 @@ export function Workbench() {
         <div className="task-label"><strong>近期任务</strong><span /></div>
         <div className="task-copy">
           <strong>{isError ? "后台任务服务不可用" : job.name}</strong>
-          <span>{isError ? "等待重新连接" : job.status === "completed" ? "已完成" : job.status === "credentials_locked" ? "等待凭据" : job.status === "qa_failed" ? "硬 QA 未通过" : job.status === "paused" ? "已暂停" : "处理中"}</span>
+          <span>{isError ? "等待重新连接" : job.status === "completed" ? "已完成" : job.status === "awaiting_user" ? "等待人工决定" : job.status === "credentials_locked" ? "等待凭据" : job.status === "qa_failed" ? "硬 QA 未通过" : job.status === "paused" ? "已暂停" : "处理中"}</span>
         </div>
-        <span className={`job-status ${job.status}`}>{isError ? "错误" : job.status === "completed" ? "已完成" : job.status === "qa_failed" ? "QA 未通过" : job.status === "paused" ? "已暂停" : `${job.progress}%`}</span>
+        <span className={`job-status ${job.status}`}>{isError ? "错误" : job.status === "completed" ? "已完成" : job.status === "awaiting_user" ? "待人工" : job.status === "qa_failed" ? "QA 未通过" : job.status === "paused" ? "已暂停" : `${job.progress}%`}</span>
         <div className="job-previews">{job.previewImages.map((image, index) => <img key={`${image}-${index}`} src={image} alt="" />)}</div>
         <div className="job-metrics"><span>{isError ? "任务数据不可用" : `共生成 ${job.total} 项`}</span><strong>{isError ? "—" : `通过 QA ${job.passed} 项`}</strong></div>
         <div className="job-output"><small>输出位置</small><span title={job.outputPath}>{isError ? "—" : job.outputPath}</span></div>
-        <button className="button secondary" type="button" disabled title="本地文件夹桥接尚未接入"><FolderOpen size={17} /> 打开文件夹</button>
+        <button className="button secondary" type="button" disabled={!job.planId || isError} onClick={() => { if (job.planId) { setRunFocusAssetIds([]); setRunInspectorPlanId(job.planId); } }}><ListBullets size={17} /> 检查运行</button>
       </footer>
+
+      {planDrawerOpen ? (
+        <Suspense fallback={<div className="drawer-backdrop production-loading" role="status">正在载入计划编辑器…</div>}>
+          <GenerationPlanDrawer
+            open
+            project={data.project}
+            assets={assets}
+            initialAssetIds={planSeedAssetIds}
+            onClose={() => setPlanDrawerOpen(false)}
+            onConfirmed={(planId) => {
+              setPlanDrawerOpen(false);
+              setRunFocusAssetIds(planSeedAssetIds);
+              setRunInspectorPlanId(planId);
+              setToast("生成计划已确认并进入持久队列。");
+              void refetch();
+            }}
+          />
+        </Suspense>
+      ) : null}
+      {runInspectorPlanId ? (
+        <Suspense fallback={<div className="drawer-backdrop production-loading" role="status">正在载入运行检查器…</div>}>
+          <RunInspectorDrawer
+            open
+            planId={runInspectorPlanId}
+            focusAssetIds={runFocusAssetIds}
+            onClose={() => setRunInspectorPlanId(null)}
+            onChanged={() => void refetch()}
+          />
+        </Suspense>
+      ) : null}
 
       <SettingsDrawer open={settingsOpen} onClose={() => setSettingsOpen(false)} />
       <ProjectDialog

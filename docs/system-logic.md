@@ -1,6 +1,6 @@
 # 系统主逻辑
 
-本文首先说明 Game Asset Management System（下文简称 GAMS）截至 2026-07-27 的当前正式运行模型。标记为“目标”的章节记录已确认但尚未实现的 v1 生产与交付契约，不得把目标状态解读为当前能力。本文不包含一次性迁移过程。
+本文首先说明 Game Asset Management System（下文简称 GAMS）截至 2026-07-30 的当前正式运行模型。标记为“目标”的章节记录 M3/M4 尚未实现的生产监督与交付契约，不得把目标状态解读为当前能力。本文不包含一次性迁移过程。
 
 ## 一句话模型
 
@@ -30,6 +30,7 @@ Project 内所有磁盘字段使用 `snake_case`。稳定 Key 表示业务身份
 - 从 Project 扫描得到的资产、修订、rendition、QA 和关系索引；
 - 从 Project 扫描得到的 Artifact、审核决定和 Release 索引；
 - 生成计划、任务、尝试次数和运行进度；
+- Job lease、heartbeat、Finding、Evidence、RemediationAction、调用预算和持久运行事件；
 - 本机服务运行所需的关联状态。
 
 SQLite 不是备份，也不是项目事实源。删除 `local-state` 后，正式资产和审核状态可以从 Project 文件重新索引；未完成的运行任务不会被当作正式成果恢复。
@@ -106,20 +107,21 @@ SQLite rendition ID 由修订和内容哈希确定性派生。前端统一通过
 
 ## 当前生成任务
 
-生成计划先校验任务 ID、依赖图、目标资产和输出 Schema。确认计划后，任务进入 SQLite 队列：
+Web 计划编辑器先校验任务 ID、依赖图、目标资产、输出 Schema、尺寸、参考任务和预算。用户查看基础调用量、预计成本、额外调用额度、单资产付费轮次、网络重试和并发后显式确认，任务才进入 SQLite 队列：
 
-1. Job Runner 按依赖顺序选取可执行任务；
-2. 调用已解锁供应商，记录每次尝试和可重试错误；
-3. 文本结果按 Schema 校验，图片结果写入 `workspace/candidates` 并归一化；
-4. 生成结果创建正式候选修订；
-5. 图片运行硬 QA，报告同时写入 Project 历史与 workspace 工作区；
-6. 服务重启时，运行中的任务回到 queued 或 credentials_locked，而不是伪装为完成。
+1. Controller 取 provider 并发与计划并发的较小值，以原子 claim 和 lease 取得所有依赖已就绪的 Job；heartbeat 在长调用期间续租。
+2. DAG 下游请求注入上游任务的 Job/修订 ID、内容哈希和结构化产物；图像编辑从明确的上游或当前候选解析参考图。
+3. 每个实际 Runner 调用创建持久 Attempt、稳定请求哈希和幂等 Key，并更新计划实际调用量与已知成本。网络、鉴权、额度、内容策略和未知错误分类处理。
+4. Provider 输出先以哈希落入 `workspace/candidates`，Job 进入 `output_received`；文本按 Schema 校验，图片归一化并创建候选修订与 rendition。
+5. 图片执行硬 QA，生成稳定 code 的 Finding、当前候选、三种联系表，以及可用时的并排、50% 叠加和差异证据。
+6. 硬 QA fail 进入 `awaiting_user`，不会成为候选就绪。人工运行检查器可选择注册 Worker、同请求重试、重新生成、图像编辑或继续等待；Controller 再校验状态、输入哈希、预算与策略。
+7. 服务重启或 lease 过期时，只自动恢复尚未 dispatch 的任务、已知可重试失败、哈希匹配的 `output_received`/`staged` 输出或确定性 Worker。dispatch 后交付未知的调用进入 `awaiting_user`，不重复调用。
 
-当前 Job 的 `succeeded` 表示供应商输出已处理、硬 QA 没有 fail 且已产生候选，不代表人工批准或发布。硬 QA fail 会保留候选证据并进入 `qa_failed`，供应商 Attempt 仍可单独记录为 `succeeded`，从而不再混淆“收到输出”和“通过 QA”。完整的多阶段 Controller 状态机仍属于 M2。
+`GenerationAttempt.status = succeeded` 只表示供应商或 Worker 已产生可记录输出；Job 的 `candidate_ready` 表示确定性自动检查通过并可供人工审核，不代表已经人工批准、Release 或 Delivery。
 
-## 目标生产状态机（未实现）
+## 当前生产状态机
 
-目标生产状态严格区分：
+生产状态严格区分：
 
 `output_received → hard_qa → semantic_qa → candidate_ready → approved → released → delivered`
 
@@ -129,20 +131,20 @@ stateDiagram-v2
     output_received --> hard_qa
     hard_qa --> semantic_qa: 无阻塞硬 Finding
     hard_qa --> remediating: 可修复问题
-    semantic_qa --> candidate_ready: 无阻塞语义 Finding
-    semantic_qa --> remediating: 需工具修复/重新生成
+    semantic_qa --> candidate_ready: M2 确定性证据已完备
+    semantic_qa --> remediating: 人工或未来 Agent 选择返工
     remediating --> output_received: 产生新 Artifact
     remediating --> awaiting_user: 越权、重复或超预算
     candidate_ready --> approved: 人工批准
-    approved --> released: Release v2 全量预检通过
-    released --> delivered: checkout 应用与验证通过
+    approved --> released: 当前 Release v1 全量预检通过
+    released --> delivered: M3 checkout 应用与验证通过
 ```
 
-Provider 返回只会进入 `output_received`。硬 QA、语义 QA 或预算不满足时，任务进入 remediation、`awaiting_user` 或失败；不能直接进入 `candidate_ready`。自动修复由 GAMS Controller 校验固定 `RemediationAction` 后执行，Codex 只负责诊断和提出动作。
+Provider 返回只会进入 `output_received`。硬 QA 或预算不满足时，任务进入 remediation、`awaiting_user` 或失败；不能直接进入 `candidate_ready`。M2 的 `semantic_qa` 是生成结构化证据并等待可审查边界，不宣称已完成 Codex 语义诊断；自动语义 Finding 与策略选择属于 M4。当前人工动作和未来 Codex 动作都必须由 GAMS Controller 校验后执行。
 
-目标计划确认必须冻结基础调用量、预计成本、网络重试和额外返工预算。同请求网络重试最多 2 次；额外调用建议值为 `max(2, ceil(基础调用量 × 20%))`，用户可以下调；单资产额外付费返工最多 2 轮。达到任一硬上限即进入 `awaiting_user`。
+计划确认冻结基础调用量、预计成本、网络重试和额外返工预算。同请求网络重试默认最多 2 次；额外调用建议值为 `max(2, ceil(基础调用量 × 20%))`，用户可以下调；单资产额外付费返工默认最多 2 轮。达到任一硬上限即进入 `awaiting_user`。
 
-每个最多 6 项的依赖批次会生成联系表、参考/候选并排图、50% 叠加图、差异图、硬 QA 和结构化视觉 Finding。完整诊断与权限规则见 [Codex 监督式智能生产](agentic-production.md)。
+每个最多 6 项的依赖批次会生成联系表；有参考输入时同时生成参考/候选并排图、50% 叠加图和差异图，没有参考时持久记录不适用原因。完整诊断与权限规则见 [Codex 监督式智能生产](agentic-production.md)。
 
 ## QA 与审核
 

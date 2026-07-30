@@ -3,7 +3,7 @@ from __future__ import annotations
 import ipaddress
 from pathlib import Path
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -39,7 +39,29 @@ class Settings(BaseSettings):
         "http://localhost:8787",
     ]
     job_poll_interval: float = 0.15
+    job_lease_seconds: float = 30.0
+    job_heartbeat_interval: float = 5.0
     log_level: str = "info"
+
+    @field_validator("job_lease_seconds")
+    @classmethod
+    def valid_lease(cls, value: float) -> float:
+        if value < 1.0:
+            raise ValueError("job lease must be at least one second")
+        return value
+
+    @field_validator("job_heartbeat_interval")
+    @classmethod
+    def valid_heartbeat(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("job heartbeat interval must be positive")
+        return value
+
+    @model_validator(mode="after")
+    def heartbeat_precedes_lease_expiry(self) -> "Settings":
+        if self.job_heartbeat_interval >= self.job_lease_seconds:
+            raise ValueError("job heartbeat interval must be shorter than the job lease")
+        return self
 
     @field_validator("host")
     @classmethod

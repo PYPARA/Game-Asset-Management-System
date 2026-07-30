@@ -146,7 +146,13 @@ class ProviderResult:
 class GenerationProvider(Protocol):
     requires_credentials: bool
 
-    async def structured_text(self, *, prompt: str, schema: dict[str, Any]) -> ProviderResult: ...
+    async def structured_text(
+        self,
+        *,
+        prompt: str,
+        schema: dict[str, Any],
+        idempotency_key: str | None = None,
+    ) -> ProviderResult: ...
 
     async def image(
         self,
@@ -155,6 +161,7 @@ class GenerationProvider(Protocol):
         width: int | None,
         height: int | None,
         reference: bytes | None = None,
+        idempotency_key: str | None = None,
     ) -> ProviderResult: ...
 
     async def test_connection(self) -> list[str]: ...
@@ -191,7 +198,13 @@ class FakeProvider:
     def __init__(self, profile: ProviderProfile):
         self.profile = profile
 
-    async def structured_text(self, *, prompt: str, schema: dict[str, Any]) -> ProviderResult:
+    async def structured_text(
+        self,
+        *,
+        prompt: str,
+        schema: dict[str, Any],
+        idempotency_key: str | None = None,
+    ) -> ProviderResult:
         await asyncio.sleep(0)
         value = _fake_value(schema)
         if isinstance(value, dict) and "prompt" in schema.get("properties", {}):
@@ -206,6 +219,7 @@ class FakeProvider:
         width: int | None,
         height: int | None,
         reference: bytes | None = None,
+        idempotency_key: str | None = None,
     ) -> ProviderResult:
         await asyncio.sleep(0)
         size = (width or 256, height or 256)
@@ -236,9 +250,18 @@ class OpenAICompatibleProvider:
         )
         self._headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
-    async def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        idempotency_key: str | None = None,
+        **kwargs: Any,
+    ) -> httpx.Response:
         guard_resolved_host(self.base_url, allow_private_network=self.profile.allow_private_network)
-        headers = kwargs.pop("headers", self._headers)
+        headers = dict(kwargs.pop("headers", self._headers))
+        if idempotency_key:
+            headers["Idempotency-Key"] = idempotency_key
         try:
             async with httpx.AsyncClient(timeout=90.0, follow_redirects=False) as client:
                 response = await client.request(
@@ -273,10 +296,17 @@ class OpenAICompatibleProvider:
         except (ValueError, KeyError, IndexError, TypeError) as exc:
             raise ProviderError("provider returned an empty or invalid text response", ErrorCategory.EMPTY) from exc
 
-    async def _chat(self, messages: list[dict[str, str]], response_format: dict[str, Any]) -> ProviderResult:
+    async def _chat(
+        self,
+        messages: list[dict[str, str]],
+        response_format: dict[str, Any],
+        *,
+        idempotency_key: str | None = None,
+    ) -> ProviderResult:
         response = await self._request(
             "POST",
             "chat/completions",
+            idempotency_key=idempotency_key,
             json={
                 "model": self.profile.text_model,
                 "messages": messages,
@@ -289,7 +319,13 @@ class OpenAICompatibleProvider:
         except json.JSONDecodeError as exc:
             raise ProviderError("provider text was not valid JSON", ErrorCategory.INVALID_RESPONSE) from exc
 
-    async def structured_text(self, *, prompt: str, schema: dict[str, Any]) -> ProviderResult:
+    async def structured_text(
+        self,
+        *,
+        prompt: str,
+        schema: dict[str, Any],
+        idempotency_key: str | None = None,
+    ) -> ProviderResult:
         messages = [
             {"role": "system", "content": "Return only JSON that satisfies the supplied schema."},
             {"role": "user", "content": prompt},
@@ -301,11 +337,16 @@ class OpenAICompatibleProvider:
                     "type": "json_schema",
                     "json_schema": {"name": "asset_candidate", "strict": True, "schema": schema},
                 },
+                idempotency_key=f"{idempotency_key}:schema" if idempotency_key else None,
             )
         except ProviderError as exc:
             if exc.status_code not in {400, 404, 422}:
                 raise
-            result = await self._chat(messages, {"type": "json_object"})
+            result = await self._chat(
+                messages,
+                {"type": "json_object"},
+                idempotency_key=f"{idempotency_key}:fallback" if idempotency_key else None,
+            )
 
         try:
             jsonschema.validate(result.value, schema)
@@ -319,7 +360,11 @@ class OpenAICompatibleProvider:
                     + json.dumps(schema, ensure_ascii=False),
                 },
             ]
-            repaired = await self._chat(repair_messages, {"type": "json_object"})
+            repaired = await self._chat(
+                repair_messages,
+                {"type": "json_object"},
+                idempotency_key=f"{idempotency_key}:repair" if idempotency_key else None,
+            )
             try:
                 jsonschema.validate(repaired.value, schema)
             except jsonschema.ValidationError as exc:
@@ -336,6 +381,7 @@ class OpenAICompatibleProvider:
         width: int | None,
         height: int | None,
         reference: bytes | None = None,
+        idempotency_key: str | None = None,
     ) -> ProviderResult:
         if reference is not None:
             guard_resolved_host(self.base_url, allow_private_network=self.profile.allow_private_network)
@@ -343,7 +389,10 @@ class OpenAICompatibleProvider:
                 async with httpx.AsyncClient(timeout=180.0, follow_redirects=False) as client:
                     response = await client.post(
                         f"{self.base_url}/images/edits",
-                        headers={"Authorization": self._headers["Authorization"]},
+                        headers={
+                            "Authorization": self._headers["Authorization"],
+                            **({"Idempotency-Key": idempotency_key} if idempotency_key else {}),
+                        },
                         data={
                             "model": self.profile.image_model,
                             "prompt": prompt,
@@ -366,6 +415,7 @@ class OpenAICompatibleProvider:
             response = await self._request(
                 "POST",
                 "images/generations",
+                idempotency_key=idempotency_key,
                 json={
                     "model": self.profile.image_model,
                     "prompt": prompt,

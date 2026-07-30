@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, within } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Workbench } from "../Workbench";
@@ -13,7 +13,7 @@ function json(payload: unknown, status = 200) {
   );
 }
 
-function mockAssetApi() {
+function mockAssetApi(jobs: unknown[] = []) {
   const assets = [
     { id: "asset-shen", key: "portrait.shen-yan.neutral", title: "沈渊（文官）· 中立姿态" },
     { id: "asset-han", key: "portrait.han-lie.resolute", title: "韩烈（大将军）· 坚毅" },
@@ -40,7 +40,8 @@ function mockAssetApi() {
           })),
         );
       }
-      if (url.startsWith("/api/jobs?")) return json([]);
+      if (url.startsWith("/api/jobs?")) return json(jobs);
+      if (url === "/api/providers") return json([]);
       if (url.startsWith("/api/relations?")) return json([]);
       if (url.startsWith("/api/revisions?asset_id=")) {
         const assetId = new URL(url, "http://local").searchParams.get("asset_id");
@@ -168,5 +169,30 @@ describe("制作台", () => {
     expect(screen.getByRole("dialog", { name: "连接与凭据" })).toBeInTheDocument();
     expect(screen.getByText("本地持久凭据的边界")).toBeInTheDocument();
     expect(screen.getByText(/无法抵御同源脚本注入/)).toBeInTheDocument();
+  });
+
+  it("启用计划编辑器和批量需要重做入口", async () => {
+    mockAssetApi([
+      {
+        id: "job-1",
+        plan_id: "plan-1",
+        task_id: "draw-hero",
+        status: "candidate_ready",
+        progress: 1,
+        result_revision_id: "revision-asset-shen",
+      },
+    ]);
+    const user = userEvent.setup();
+    renderWorkbench();
+
+    const createPlan = await screen.findByRole("button", { name: "新建生成计划" });
+    await waitFor(() => expect(createPlan).toBeEnabled());
+    await user.click(createPlan);
+    expect(await screen.findByRole("dialog", { name: "编排生成计划" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "关闭生成计划" }));
+
+    await user.click(screen.getByRole("checkbox", { name: "选择 沈渊（文官）· 中立姿态" }));
+    expect(screen.getByRole("button", { name: "需要重做" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "检查运行" })).toBeEnabled();
   });
 });

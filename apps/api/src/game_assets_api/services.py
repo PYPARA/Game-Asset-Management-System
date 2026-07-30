@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import shutil
 import threading
 from datetime import datetime
@@ -28,6 +29,7 @@ from .domain import (
     ReviewCreate,
     ReviewVerdict,
     RevisionCreate,
+    RunStage,
     ScanReport,
     TaskKind,
 )
@@ -976,8 +978,23 @@ def validate_plan(session: Session, payload: GenerationPlanCreate) -> list[dict[
             raise ServiceError(422, f"task {task.id} has unknown dependencies: {sorted(missing)}")
         if task.id in task.depends_on:
             raise ServiceError(422, f"task {task.id} cannot depend on itself")
+        if task.reference_task_id:
+            if task.reference_task_id not in task_ids:
+                raise ServiceError(
+                    422,
+                    f"task {task.id} references unknown task {task.reference_task_id}",
+                )
+            if task.reference_task_id not in task.depends_on:
+                raise ServiceError(
+                    422,
+                    f"task {task.id} must depend on its reference task",
+                )
         if task.kind == TaskKind.TEXT and task.output_schema is None and not asset.schema_ref:
             raise ServiceError(422, f"text task {task.id} requires an inline or asset JSON schema")
+        if task.kind == TaskKind.IMAGE_EDIT and not (
+            task.reference_path or task.reference_task_id or task.depends_on
+        ):
+            raise ServiceError(422, f"image edit task {task.id} requires a reference input")
     visiting: set[str] = set()
     visited: set[str] = set()
 
@@ -1005,21 +1022,39 @@ def create_plan(session: Session, payload: GenerationPlanCreate) -> GenerationPl
         total = 0.0
         known = True
         for task in payload.tasks:
-            price = profile.pricing.get("image_call" if task.kind != TaskKind.TEXT else "text_call")
+            if task.kind == TaskKind.TEXT:
+                price_key = "text_call"
+            elif task.kind == TaskKind.IMAGE_EDIT and "image_edit_call" in profile.pricing:
+                price_key = "image_edit_call"
+            else:
+                price_key = "image_call"
+            price = profile.pricing.get(price_key)
             if price is None:
                 known = False
                 break
             total += float(price)
         if known:
             estimated_cost = total
+    suggested_extra_calls = max(2, math.ceil(len(tasks) * 0.2))
+    extra_call_budget = (
+        suggested_extra_calls
+        if payload.extra_call_budget is None
+        else payload.extra_call_budget
+    )
     plan = GenerationPlan(
         id=new_id(),
         project_id=payload.project_id,
         provider_profile_id=payload.provider_profile_id,
+        name=payload.name.strip(),
         status="draft",
         tasks_json=tasks,
         estimated_calls=len(tasks),
         estimated_cost=estimated_cost,
+        suggested_extra_calls=suggested_extra_calls,
+        extra_call_budget=extra_call_budget,
+        max_paid_remediation_rounds=payload.max_paid_remediation_rounds,
+        max_transport_retries=payload.max_transport_retries,
+        max_concurrency=payload.max_concurrency,
     )
     session.add(plan)
     session.commit()
@@ -1046,14 +1081,48 @@ def confirm_plan(session: Session, plan: GenerationPlan, *, credentials_availabl
             task_kind=str(task["kind"]),
             request_json=task,
             status=initial_status,
+            stage=RunStage.QUEUED.value,
         )
         jobs.append(job)
         session.add(job)
         asset = session.get(Asset, str(task["asset_id"]))
         if asset:
             asset.generation_status = GenerationStatus.PLANNED.value
-    plan.status = "confirmed"
+    plan.status = (
+        "confirmed"
+        if initial_status == GenerationStatus.QUEUED.value
+        else GenerationStatus.CREDENTIALS_LOCKED.value
+    )
     plan.confirmed_at = utcnow()
+    from .production import record_run_event
+
+    confirmation = record_run_event(
+        session,
+        plan_id=plan.id,
+        project_id=plan.project_id,
+        event_type="plan.confirmed",
+        data={
+            "base_calls": plan.estimated_calls,
+            "estimated_base_cost": plan.estimated_cost,
+            "suggested_extra_calls": plan.suggested_extra_calls,
+            "extra_call_budget": plan.extra_call_budget,
+            "max_paid_remediation_rounds": plan.max_paid_remediation_rounds,
+            "max_transport_retries": plan.max_transport_retries,
+            "max_concurrency": plan.max_concurrency,
+        },
+    )
+    for job in jobs:
+        record_run_event(
+            session,
+            plan_id=plan.id,
+            project_id=plan.project_id,
+            job_id=job.id,
+            asset_id=str(job.request_json.get("asset_id")),
+            event_type="run.queued",
+            stage=job.stage,
+            causation_id=confirmation.id,
+            data={"task_id": job.task_id, "status": job.status},
+        )
     session.commit()
     return jobs
 

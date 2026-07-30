@@ -168,10 +168,19 @@ class GenerationPlan(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
     provider_profile_id: Mapped[str] = mapped_column(ForeignKey("provider_profiles.id"), index=True)
+    name: Mapped[str] = mapped_column(String(200), default="未命名生成计划")
     status: Mapped[str] = mapped_column(String(40), default="draft")
     tasks_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON)
     estimated_calls: Mapped[int] = mapped_column(Integer)
     estimated_cost: Mapped[float | None] = mapped_column(Float)
+    suggested_extra_calls: Mapped[int] = mapped_column(Integer, default=2)
+    extra_call_budget: Mapped[int] = mapped_column(Integer, default=2)
+    extra_calls_used: Mapped[int] = mapped_column(Integer, default=0)
+    actual_calls: Mapped[int] = mapped_column(Integer, default=0)
+    actual_cost: Mapped[float] = mapped_column(Float, default=0.0)
+    max_paid_remediation_rounds: Mapped[int] = mapped_column(Integer, default=2)
+    max_transport_retries: Mapped[int] = mapped_column(Integer, default=2)
+    max_concurrency: Mapped[int] = mapped_column(Integer, default=6)
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -188,12 +197,22 @@ class GenerationJob(Base):
     task_kind: Mapped[str] = mapped_column(String(40))
     request_json: Mapped[dict[str, Any]] = mapped_column(JSON)
     status: Mapped[str] = mapped_column(String(40), default=GenerationStatus.QUEUED.value, index=True)
+    stage: Mapped[str] = mapped_column(String(40), default="queued", index=True)
     progress: Mapped[float] = mapped_column(Float, default=0.0)
     result_revision_id: Mapped[str | None] = mapped_column(ForeignKey("asset_revisions.id"))
     error_category: Mapped[str | None] = mapped_column(String(40))
     error_message: Mapped[str | None] = mapped_column(Text)
     cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False)
     attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    paid_remediation_rounds: Mapped[int] = mapped_column(Integer, default=0)
+    lease_owner: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
+    lease_token: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_request_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    pending_action_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, index=True)
 
@@ -205,11 +224,127 @@ class GenerationAttempt(Base):
     job_id: Mapped[str] = mapped_column(ForeignKey("generation_jobs.id", ondelete="CASCADE"), index=True)
     number: Mapped[int] = mapped_column(Integer)
     status: Mapped[str] = mapped_column(String(40))
+    phase: Mapped[str] = mapped_column(String(40), default="created", index=True)
+    purpose: Mapped[str] = mapped_column(String(40), default="base")
+    idempotency_key: Mapped[str | None] = mapped_column(String(160), nullable=True, index=True)
+    request_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    request_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     request_id: Mapped[str | None] = mapped_column(String(240))
     error_category: Mapped[str | None] = mapped_column(String(40))
     error_message: Mapped[str | None] = mapped_column(Text)
+    output_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    output_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    result_revision_id: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    billable: Mapped[bool] = mapped_column(Boolean, default=True)
+    estimated_cost: Mapped[float | None] = mapped_column(Float, nullable=True)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class RunEvent(Base):
+    __tablename__ = "run_events"
+
+    sequence: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[str] = mapped_column(String(48), unique=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    plan_id: Mapped[str] = mapped_column(
+        ForeignKey("generation_plans.id", ondelete="CASCADE"), index=True
+    )
+    job_id: Mapped[str | None] = mapped_column(
+        ForeignKey("generation_jobs.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    asset_id: Mapped[str | None] = mapped_column(
+        ForeignKey("assets.id", ondelete="SET NULL"), nullable=True
+    )
+    attempt_id: Mapped[str | None] = mapped_column(
+        ForeignKey("generation_attempts.id", ondelete="SET NULL"), nullable=True
+    )
+    event_type: Mapped[str] = mapped_column(String(80), index=True)
+    stage: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    data_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    causation_id: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ProductionFinding(Base):
+    __tablename__ = "production_findings"
+
+    id: Mapped[str] = mapped_column(String(48), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    plan_id: Mapped[str] = mapped_column(
+        ForeignKey("generation_plans.id", ondelete="CASCADE"), index=True
+    )
+    job_id: Mapped[str] = mapped_column(
+        ForeignKey("generation_jobs.id", ondelete="CASCADE"), index=True
+    )
+    revision_id: Mapped[str | None] = mapped_column(
+        ForeignKey("asset_revisions.id", ondelete="SET NULL"), nullable=True
+    )
+    code: Mapped[str] = mapped_column(String(160), index=True)
+    severity: Mapped[str] = mapped_column(String(20))
+    blocking: Mapped[bool] = mapped_column(Boolean, default=True)
+    evidence_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    confidence: Mapped[float] = mapped_column(Float, default=1.0)
+    suggested_action: Mapped[str] = mapped_column(String(40))
+    occurrence: Mapped[int] = mapped_column(Integer, default=1)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class RunEvidence(Base):
+    __tablename__ = "run_evidence"
+
+    id: Mapped[str] = mapped_column(String(48), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    plan_id: Mapped[str] = mapped_column(
+        ForeignKey("generation_plans.id", ondelete="CASCADE"), index=True
+    )
+    job_id: Mapped[str | None] = mapped_column(
+        ForeignKey("generation_jobs.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    revision_id: Mapped[str | None] = mapped_column(
+        ForeignKey("asset_revisions.id", ondelete="SET NULL"), nullable=True
+    )
+    kind: Mapped[str] = mapped_column(String(80), index=True)
+    label: Mapped[str] = mapped_column(String(200))
+    path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    media_type: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    byte_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class RemediationAction(Base):
+    __tablename__ = "remediation_actions"
+
+    id: Mapped[str] = mapped_column(String(48), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    plan_id: Mapped[str] = mapped_column(
+        ForeignKey("generation_plans.id", ondelete="CASCADE"), index=True
+    )
+    job_id: Mapped[str] = mapped_column(
+        ForeignKey("generation_jobs.id", ondelete="CASCADE"), index=True
+    )
+    action: Mapped[str] = mapped_column(String(40))
+    strategy: Mapped[str] = mapped_column(String(120))
+    status: Mapped[str] = mapped_column(String(40), index=True)
+    reason: Mapped[str] = mapped_column(Text)
+    parameters_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    finding_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    input_hash: Mapped[str] = mapped_column(String(64))
+    expected_additional_calls: Mapped[int] = mapped_column(Integer, default=0)
+    actual_additional_calls: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class QARun(Base):

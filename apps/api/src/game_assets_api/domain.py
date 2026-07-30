@@ -33,6 +33,12 @@ class GenerationStatus(StrEnum):
     RUNNING = "running"
     SUCCEEDED = "succeeded"
     QA_FAILED = "qa_failed"
+    OUTPUT_RECEIVED = "output_received"
+    HARD_QA = "hard_qa"
+    SEMANTIC_QA = "semantic_qa"
+    CANDIDATE_READY = "candidate_ready"
+    REMEDIATING = "remediating"
+    AWAITING_USER = "awaiting_user"
     FAILED = "failed"
     CANCELLED = "cancelled"
     CREDENTIALS_LOCKED = "credentials_locked"
@@ -96,6 +102,37 @@ class ErrorCategory(StrEnum):
     CONTENT_POLICY = "content_policy"
     CANCELLED = "cancelled"
     UNKNOWN = "unknown"
+
+
+class RunStage(StrEnum):
+    QUEUED = "queued"
+    OUTPUT_RECEIVED = "output_received"
+    HARD_QA = "hard_qa"
+    SEMANTIC_QA = "semantic_qa"
+    CANDIDATE_READY = "candidate_ready"
+
+
+class RemediationKind(StrEnum):
+    RETRY = "retry"
+    TOOL_REPAIR = "tool_repair"
+    REGENERATE = "regenerate"
+    IMAGE_EDIT = "image_edit"
+    AWAIT_USER = "await_user"
+
+
+class RemediationStatus(StrEnum):
+    PROPOSED = "proposed"
+    ACCEPTED = "accepted"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    REJECTED = "rejected"
+    FAILED = "failed"
+
+
+class FindingSeverity(StrEnum):
+    INFO = "info"
+    WARNING = "warning"
+    ERROR = "error"
 
 
 class ORMModel(BaseModel):
@@ -301,25 +338,42 @@ class GenerationTask(BaseModel):
     depends_on: list[str] = []
     width: int | None = Field(default=None, ge=1, le=8192)
     height: int | None = Field(default=None, ge=1, le=8192)
+    max_bytes: int | None = Field(default=None, ge=1, le=2_000_000_000)
     transparent: bool = False
     reference_path: str | None = None
+    reference_task_id: str | None = None
     target_path: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class GenerationPlanCreate(BaseModel):
     project_id: str
     provider_profile_id: str
+    name: str = Field(default="未命名生成计划", min_length=1, max_length=200)
     tasks: list[GenerationTask] = Field(min_length=1)
+    extra_call_budget: int | None = Field(default=None, ge=0, le=10_000)
+    max_paid_remediation_rounds: int = Field(default=2, ge=0, le=20)
+    max_transport_retries: int = Field(default=2, ge=0, le=8)
+    max_concurrency: int = Field(default=6, ge=1, le=32)
 
 
 class GenerationPlanRead(ORMModel):
     id: str
     project_id: str
     provider_profile_id: str
+    name: str
     status: str
     tasks: list[dict[str, Any]] = Field(validation_alias="tasks_json")
     estimated_calls: int
     estimated_cost: float | None
+    suggested_extra_calls: int
+    extra_call_budget: int
+    extra_calls_used: int
+    actual_calls: int
+    actual_cost: float
+    max_paid_remediation_rounds: int
+    max_transport_retries: int
+    max_concurrency: int
     confirmed_at: datetime | None
     created_at: datetime
 
@@ -331,13 +385,23 @@ class GenerationJobRead(ORMModel):
     provider_profile_id: str
     task_id: str
     task_kind: str
+    request: dict[str, Any] = Field(default_factory=dict, validation_alias="request_json")
     status: str
+    stage: str
     progress: float
     result_revision_id: str | None
     error_category: str | None
     error_message: str | None
     cancel_requested: bool
     attempt_count: int
+    paid_remediation_rounds: int
+    lease_owner: str | None
+    lease_expires_at: datetime | None
+    heartbeat_at: datetime | None
+    resolved_request: dict[str, Any] = Field(
+        default_factory=dict, validation_alias="resolved_request_json"
+    )
+    pending_action_id: str | None
     created_at: datetime
     updated_at: datetime
 
@@ -347,11 +411,111 @@ class GenerationAttemptRead(ORMModel):
     job_id: str
     number: int
     status: str
+    phase: str
+    purpose: str
+    idempotency_key: str | None
+    request_hash: str | None
     request_id: str | None
     error_category: str | None
     error_message: str | None
+    output_path: str | None
+    output_hash: str | None
+    result_revision_id: str | None
+    billable: bool
+    estimated_cost: float | None
     started_at: datetime
     completed_at: datetime | None
+
+
+class PlanBudgetUpdate(BaseModel):
+    extra_call_budget: int = Field(ge=0, le=10_000)
+
+
+class RunEventRead(ORMModel):
+    id: str
+    sequence: int
+    project_id: str
+    plan_id: str
+    job_id: str | None
+    asset_id: str | None
+    attempt_id: str | None
+    event_type: str
+    stage: str | None
+    data: dict[str, Any] = Field(default_factory=dict, validation_alias="data_json")
+    causation_id: str | None
+    created_at: datetime
+
+
+class FindingRead(ORMModel):
+    id: str
+    project_id: str
+    plan_id: str
+    job_id: str
+    revision_id: str | None
+    code: str
+    severity: str
+    blocking: bool
+    evidence: list[dict[str, Any]] = Field(
+        default_factory=list, validation_alias="evidence_json"
+    )
+    confidence: float
+    suggested_action: str
+    occurrence: int
+    resolved_at: datetime | None
+    created_at: datetime
+
+
+class RunEvidenceRead(ORMModel):
+    id: str
+    project_id: str
+    plan_id: str
+    job_id: str | None
+    revision_id: str | None
+    kind: str
+    label: str
+    path: str | None
+    media_type: str | None
+    sha256: str | None
+    byte_size: int | None
+    metadata: dict[str, Any] = Field(default_factory=dict, validation_alias="metadata_json")
+    created_at: datetime
+
+
+class RemediationCreate(BaseModel):
+    action: RemediationKind
+    strategy: str = Field(min_length=1, max_length=120)
+    reason: str = Field(min_length=1, max_length=2_000)
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    finding_ids: list[str] = Field(default_factory=list)
+    expected_additional_calls: int = Field(default=0, ge=0, le=10)
+
+
+class RemediationRead(ORMModel):
+    id: str
+    project_id: str
+    plan_id: str
+    job_id: str
+    action: str
+    strategy: str
+    status: str
+    reason: str
+    parameters: dict[str, Any] = Field(default_factory=dict, validation_alias="parameters_json")
+    finding_ids: list[str] = Field(default_factory=list, validation_alias="finding_ids_json")
+    input_hash: str
+    expected_additional_calls: int
+    actual_additional_calls: int
+    created_at: datetime
+    completed_at: datetime | None
+
+
+class RunInspectRead(BaseModel):
+    plan: GenerationPlanRead
+    jobs: list[GenerationJobRead]
+    attempts: list[GenerationAttemptRead]
+    findings: list[FindingRead]
+    evidence: list[RunEvidenceRead]
+    actions: list[RemediationRead]
+    events: list[RunEventRead]
 
 
 class QARunCreate(BaseModel):
