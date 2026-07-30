@@ -14,6 +14,7 @@ import {
 import {
   createAndConfirmGenerationPlan,
   fetchGenerationProviders,
+  fetchProviderDefaults,
 } from "../lib/api";
 import { useModalFocus } from "../hooks/useModalFocus";
 import type {
@@ -22,6 +23,8 @@ import type {
   GenerationProviderProfile,
   GenerationTaskInput,
   GenerationTaskKind,
+  ProviderDefaults,
+  ProviderModelModality,
   ProjectSummary,
 } from "../types";
 
@@ -30,6 +33,8 @@ interface TaskDraft {
   taskId: string;
   assetId: string;
   kind: GenerationTaskKind;
+  providerId: string;
+  model: string;
   prompt: string;
   width: number;
   height: number;
@@ -58,13 +63,64 @@ function safeTaskId(asset: GameAsset, index: number): string {
   return `produce-${stem}-${index + 1}`;
 }
 
-function defaultTask(asset: GameAsset, index: number): TaskDraft {
+interface TaskRoute {
+  providerId: string;
+  model: string;
+}
+
+interface RouteNotice {
+  tone: "error" | "warning";
+  message: string;
+}
+
+interface CostEstimate {
+  total: number | null;
+  knownSubtotal: number;
+  unknownTasks: number;
+  byProvider: Array<{
+    providerId: string;
+    providerName: string;
+    taskCount: number;
+    total: number | null;
+  }>;
+}
+
+function taskModality(kind: GenerationTaskKind): ProviderModelModality {
+  return kind === "text" ? "text" : "image";
+}
+
+function globalRoute(
+  kind: GenerationTaskKind,
+  defaults: ProviderDefaults | undefined,
+  providers: GenerationProviderProfile[],
+): TaskRoute {
+  const route = defaults?.[taskModality(kind)];
+  const provider = providers.find((item) => item.id === route?.provider_profile_id && item.is_active);
+  return provider && route ? { providerId: provider.id, model: route.model } : { providerId: "", model: "" };
+}
+
+function providerRoute(
+  kind: GenerationTaskKind,
+  providerId: string,
+  providers: GenerationProviderProfile[],
+): TaskRoute {
+  const provider = providers.find((item) => item.id === providerId && item.is_active);
+  if (!provider) return { providerId: "", model: "" };
+  return {
+    providerId: provider.id,
+    model: taskModality(kind) === "text" ? provider.text_model : provider.image_model,
+  };
+}
+
+function defaultTask(asset: GameAsset, index: number, route: TaskRoute = { providerId: "", model: "" }): TaskDraft {
   const image = asset.kind === "media" || asset.kind === "production";
   return {
     localId: `${asset.id}-${index}-${Date.now()}`,
     taskId: safeTaskId(asset, index),
     assetId: asset.id,
     kind: image ? "image" : "text",
+    providerId: route.providerId,
+    model: route.model,
     prompt: image ? `生成 ${asset.name}，遵循当前 Project 的制作规范。` : `生成 ${asset.name} 的结构化内容。`,
     width: 1024,
     height: 1024,
@@ -120,6 +176,8 @@ function toTaskInput(task: TaskDraft, assets: Map<string, GameAsset>): Generatio
     kind: task.kind,
     asset_id: task.assetId,
     prompt: task.prompt.trim(),
+    provider_profile_id: task.providerId,
+    model: task.model.trim(),
     depends_on: task.dependsOn,
   };
   if (task.kind === "text") {
@@ -153,23 +211,71 @@ function toTaskInput(task: TaskDraft, assets: Map<string, GameAsset>): Generatio
   return input;
 }
 
-function estimateCost(
-  tasks: TaskDraft[],
-  provider: GenerationProviderProfile | undefined,
-): number | null {
-  if (!provider?.pricing) return null;
-  let total = 0;
-  for (const task of tasks) {
-    const key = task.kind === "text"
-      ? "text_call"
-      : task.kind === "image_edit" && provider.pricing.image_edit_call !== undefined
-        ? "image_edit_call"
-        : "image_call";
-    const price = provider.pricing[key];
-    if (price === undefined) return null;
-    total += price;
+function routeNotice(task: TaskDraft, providers: GenerationProviderProfile[]): RouteNotice | null {
+  if (!task.providerId) return { tone: "error", message: "尚未选择供应商。" };
+  const provider = providers.find((item) => item.id === task.providerId);
+  if (!provider) return { tone: "error", message: "供应商配置不存在。" };
+  if (!provider.is_active) return { tone: "error", message: "该供应商已归档，不能分配给新计划。" };
+  const modelId = task.model.trim();
+  if (!modelId) return { tone: "error", message: "尚未选择或输入模型 ID。" };
+  const modality = taskModality(task.kind);
+  const model = provider.models.find((item) => item.id === modelId);
+  if (model && model.classification !== "unknown" && !model.modalities.includes(modality)) {
+    return {
+      tone: "error",
+      message: `${modelId} 已分类为不支持${modality === "text" ? "文字" : "图片"}任务。`,
+    };
   }
-  return total;
+  if (!model || model.classification === "unknown") {
+    return { tone: "warning", message: "手填或未分类模型；确认前请核对供应商能力。" };
+  }
+  if (!model.available) {
+    return { tone: "warning", message: "该模型未出现在最近一次供应商模型列表中。" };
+  }
+  return null;
+}
+
+function taskPrice(task: TaskDraft, provider: GenerationProviderProfile | undefined): number | null {
+  if (!provider?.pricing) return null;
+  const key = task.kind === "text"
+    ? "text_call"
+    : task.kind === "image_edit" && provider.pricing.image_edit_call !== undefined
+      ? "image_edit_call"
+      : "image_call";
+  const price = provider.pricing[key];
+  return price === undefined ? null : price;
+}
+
+function estimateCost(tasks: TaskDraft[], providers: GenerationProviderProfile[]): CostEstimate {
+  const groups = new Map<string, CostEstimate["byProvider"][number]>();
+  let knownSubtotal = 0;
+  let unknownTasks = 0;
+  for (const task of tasks) {
+    const provider = providers.find((item) => item.id === task.providerId);
+    const providerId = provider?.id ?? (task.providerId || "unassigned");
+    const group = groups.get(providerId) ?? {
+      providerId,
+      providerName: provider?.name ?? "未分配供应商",
+      taskCount: 0,
+      total: 0,
+    };
+    group.taskCount += 1;
+    const price = taskPrice(task, provider);
+    if (price === null) {
+      unknownTasks += 1;
+      group.total = null;
+    } else {
+      knownSubtotal += price;
+      if (group.total !== null) group.total += price;
+    }
+    groups.set(providerId, group);
+  }
+  return {
+    total: unknownTasks > 0 ? null : knownSubtotal,
+    knownSubtotal,
+    unknownTasks,
+    byProvider: [...groups.values()],
+  };
 }
 
 function taskKindLabel(kind: GenerationTaskKind): string {
@@ -188,9 +294,9 @@ export function GenerationPlanDrawer({
 }: GenerationPlanDrawerProps) {
   const dialogRef = useRef<HTMLElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
+  const routingSeededRef = useRef(false);
   const [step, setStep] = useState<"edit" | "review">("edit");
   const [name, setName] = useState("新资产生产计划");
-  const [providerId, setProviderId] = useState("");
   const [tasks, setTasks] = useState<TaskDraft[]>([]);
   const [assetToAdd, setAssetToAdd] = useState("");
   const [extraBudget, setExtraBudget] = useState(2);
@@ -206,19 +312,25 @@ export function GenerationPlanDrawer({
     queryFn: fetchGenerationProviders,
     enabled: open,
   });
+  const defaultsQuery = useQuery({
+    queryKey: ["provider-defaults"],
+    queryFn: fetchProviderDefaults,
+    enabled: open,
+  });
   const providers = providersQuery.data ?? [];
-  const provider = providers.find((item) => item.id === providerId);
+  const activeProviders = providers.filter((item) => item.is_active);
   const suggestedExtraCalls = Math.max(2, Math.ceil(tasks.length * 0.2));
-  const estimatedCost = estimateCost(tasks, provider);
+  const estimatedCost = estimateCost(tasks, providers);
 
   useModalFocus({ open, dialogRef, initialFocusRef: closeRef, onClose });
 
   useEffect(() => {
     if (!open) return;
+    routingSeededRef.current = false;
     const selected = initialAssetIds
       .map((assetId) => assetsById.get(assetId))
       .filter((asset): asset is GameAsset => Boolean(asset));
-    setTasks(selected.map(defaultTask));
+    setTasks(selected.map((asset, index) => defaultTask(asset, index)));
     setAssetToAdd(assets[0]?.id ?? "");
     setStep("edit");
     setName("新资产生产计划");
@@ -232,15 +344,29 @@ export function GenerationPlanDrawer({
   }, [open]);
 
   useEffect(() => {
-    if (!open || providers.length === 0) return;
-    if (providers.some((item) => item.id === providerId)) return;
-    setProviderId(providers[0].id);
-    setMaxConcurrency(Math.min(3, providers[0].concurrency));
-  }, [open, providerId, providers]);
+    if (!open || routingSeededRef.current || providersQuery.isLoading || defaultsQuery.isLoading) return;
+    routingSeededRef.current = true;
+    setTasks((current) => current.map((task) => {
+      if (task.providerId || task.model) return task;
+      return { ...task, ...globalRoute(task.kind, defaultsQuery.data, providers) };
+    }));
+  }, [defaultsQuery.data, defaultsQuery.isLoading, open, providers, providersQuery.isLoading]);
 
   const updateTask = (localId: string, patch: Partial<TaskDraft>) => {
     setTasks((current) => current.map((task) => task.localId === localId ? { ...task, ...patch } : task));
     setMessage("");
+  };
+
+  const changeTaskKind = (localId: string, kind: GenerationTaskKind) => {
+    updateTask(localId, {
+      kind,
+      referenceTaskId: "",
+      ...globalRoute(kind, defaultsQuery.data, providers),
+    });
+  };
+
+  const changeTaskProvider = (localId: string, kind: GenerationTaskKind, providerId: string) => {
+    updateTask(localId, providerRoute(kind, providerId, providers));
   };
 
   const renameTask = (localId: string, nextTaskId: string) => {
@@ -261,7 +387,10 @@ export function GenerationPlanDrawer({
   const addTask = () => {
     const asset = assetsById.get(assetToAdd);
     if (!asset) return;
-    setTasks((current) => [...current, defaultTask(asset, current.length)]);
+    setTasks((current) => {
+      const task = defaultTask(asset, current.length);
+      return [...current, { ...task, ...globalRoute(task.kind, defaultsQuery.data, providers) }];
+    });
     setExtraBudget((current) => Math.max(current, Math.max(2, Math.ceil((tasks.length + 1) * 0.2))));
   };
 
@@ -277,7 +406,6 @@ export function GenerationPlanDrawer({
 
   const buildPayload = (): GenerationPlanInput => {
     if (!project.id) throw new Error("请先创建或载入 Project。");
-    if (!providerId) throw new Error("请先在供应商设置中建立生成配置。");
     if (tasks.length === 0) throw new Error("计划至少需要一个任务。");
     if (!Number.isInteger(extraBudget) || extraBudget < 0 || extraBudget > 10_000) {
       throw new Error("额外调用预算必须是 0–10000 的整数。");
@@ -295,6 +423,8 @@ export function GenerationPlanDrawer({
     if (new Set(taskIds).size !== taskIds.length) throw new Error("任务 ID 必须唯一。");
     const known = new Set(taskIds);
     for (const task of tasks) {
+      const notice = routeNotice(task, providers);
+      if (notice?.tone === "error") throw new Error(`任务 ${task.taskId || "（未命名）"}：${notice.message}`);
       if (task.dependsOn.some((dependency) => !known.has(dependency))) {
         throw new Error(`任务 ${task.taskId} 引用了已删除的上游任务。`);
       }
@@ -302,13 +432,12 @@ export function GenerationPlanDrawer({
     assertAcyclic(tasks);
     return {
       project_id: project.id,
-      provider_profile_id: providerId,
       name: name.trim() || "未命名生成计划",
       tasks: tasks.map((task) => toTaskInput(task, assetsById)),
       extra_call_budget: extraBudget,
       max_paid_remediation_rounds: maxPaidRounds,
       max_transport_retries: transportRetries,
-      max_concurrency: Math.min(maxConcurrency, provider?.concurrency ?? maxConcurrency),
+      max_concurrency: maxConcurrency,
     };
   };
 
@@ -371,32 +500,37 @@ export function GenerationPlanDrawer({
                 <span>计划名称</span>
                 <input value={name} onChange={(event) => setName(event.target.value)} />
               </label>
-              <label className="production-field">
-                <span>供应商配置</span>
-                <select value={providerId} onChange={(event) => setProviderId(event.target.value)}>
-                  {providers.length === 0 ? <option value="">尚无供应商配置</option> : null}
-                  {providers.map((item) => (
-                    <option key={item.id} value={item.id}>
-                      {item.name}{item.kind !== "fake" && !item.is_unlocked ? " · 凭据未解锁" : ""}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              {providersQuery.isError ? (
-                <p className="production-inline-error">供应商列表读取失败，请检查本地服务。</p>
+              <div className="plan-default-routes" aria-label="全局默认路由快照源">
+                <div className="plan-default-routes-heading"><span>新任务路由</span><small>建立任务时继承</small></div>
+                {(["text", "image"] as ProviderModelModality[]).map((modality) => {
+                  const route = defaultsQuery.data?.[modality];
+                  const routeProvider = activeProviders.find((item) => item.id === route?.provider_profile_id);
+                  return (
+                    <div key={modality} className={`plan-default-route ${modality}`}>
+                      <b>{modality === "text" ? "T" : "I"}</b>
+                      <span><strong>{routeProvider?.name ?? "未配置"}</strong><small>{route?.model || "前往供应商设置补齐"}</small></span>
+                    </div>
+                  );
+                })}
+              </div>
+              {providersQuery.isError || defaultsQuery.isError ? (
+                <p className="production-inline-error">供应商或默认路由读取失败，请检查本地服务。</p>
+              ) : activeProviders.length === 0 ? (
+                <p className="production-inline-error">尚无活动供应商；请先在供应商设置中新增并配置默认路由。</p>
               ) : null}
               <div className="constraint-ledger">
                 <h3><Calculator size={16} /> 调用账本</h3>
                 <label><span>额外调用预算</span><input type="number" min={0} value={extraBudget} onChange={(event) => setExtraBudget(Number(event.target.value))} /></label>
                 <small>系统建议 {suggestedExtraCalls} 次；付费返工入队前预留。</small>
-                <label><span>计划并发</span><input type="number" min={1} max={provider?.concurrency ?? 32} value={maxConcurrency} onChange={(event) => setMaxConcurrency(Number(event.target.value))} /></label>
-                <small>供应商上限 {provider?.concurrency ?? "—"}；实际取两者较小值。</small>
+                <label><span>计划总并发</span><input type="number" min={1} max={32} value={maxConcurrency} onChange={(event) => setMaxConcurrency(Number(event.target.value))} /></label>
+                <small>控制整个计划；每个供应商还会分别应用自己的并发上限。</small>
                 <label><span>单资产付费轮次</span><input type="number" min={0} max={20} value={maxPaidRounds} onChange={(event) => setMaxPaidRounds(Number(event.target.value))} /></label>
                 <label><span>同请求网络重试</span><input type="number" min={0} max={8} value={transportRetries} onChange={(event) => setTransportRetries(Number(event.target.value))} /></label>
               </div>
               <div className="plan-cost-readout">
                 <span>基础调用</span><strong>{tasks.length}</strong>
-                <span>预计基础成本</span><strong>{estimatedCost === null ? "未提供价格" : estimatedCost.toFixed(2)}</strong>
+                <span>预计基础成本</span><strong>{estimatedCost.total === null ? "含未知价格" : estimatedCost.total.toFixed(2)}</strong>
+                {estimatedCost.unknownTasks > 0 ? <><span>已知价格小计</span><strong>{estimatedCost.knownSubtotal.toFixed(2)}</strong></> : null}
               </div>
             </section>
 
@@ -424,6 +558,12 @@ export function GenerationPlanDrawer({
                   {tasks.map((task, index) => {
                     const asset = assetsById.get(task.assetId);
                     const otherTasks = tasks.filter((candidate) => candidate.localId !== task.localId);
+                    const taskProvider = providers.find((item) => item.id === task.providerId);
+                    const modality = taskModality(task.kind);
+                    const modelOptions = (taskProvider?.models ?? []).filter((model) =>
+                      model.classification === "unknown" || model.modalities.includes(modality),
+                    );
+                    const notice = routeNotice(task, providers);
                     return (
                       <li key={task.localId} className="task-dag-card">
                         <div className="task-causal-index"><span>{String(index + 1).padStart(2, "0")}</span></div>
@@ -435,7 +575,12 @@ export function GenerationPlanDrawer({
                           <div className="production-form-grid three">
                             <label className="production-field"><span>任务 ID</span><input value={task.taskId} onChange={(event) => renameTask(task.localId, event.target.value)} /></label>
                             <label className="production-field"><span>目标资产</span><select value={task.assetId} onChange={(event) => updateTask(task.localId, { assetId: event.target.value })}>{assets.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
-                            <label className="production-field"><span>任务类型</span><select value={task.kind} onChange={(event) => updateTask(task.localId, { kind: event.target.value as GenerationTaskKind, referenceTaskId: "" })}><option value="text">结构化文本</option><option value="image">图像生成</option><option value="image_edit">参考图编辑</option></select></label>
+                            <label className="production-field"><span>任务类型</span><select value={task.kind} onChange={(event) => changeTaskKind(task.localId, event.target.value as GenerationTaskKind)}><option value="text">结构化文本</option><option value="image">图像生成</option><option value="image_edit">参考图编辑</option></select></label>
+                          </div>
+                          <div className="task-route-grid">
+                            <label className="production-field"><span>任务供应商</span><select value={task.providerId} aria-invalid={notice?.tone === "error"} onChange={(event) => changeTaskProvider(task.localId, task.kind, event.target.value)}><option value="">未选择</option>{taskProvider && !taskProvider.is_active ? <option value={taskProvider.id}>{taskProvider.name} · 已归档</option> : null}{activeProviders.map((item) => <option key={item.id} value={item.id}>{item.name}{item.kind !== "fake" && !item.is_unlocked ? " · 凭据锁定" : ""}</option>)}</select></label>
+                            <label className="production-field"><span>{modality === "text" ? "文字模型" : "图片模型"}</span><input list={`task-models-${index}`} value={task.model} aria-invalid={notice?.tone === "error"} onChange={(event) => updateTask(task.localId, { model: event.target.value })} placeholder="搜索或直接输入模型 ID" spellCheck={false} /><datalist id={`task-models-${index}`}>{modelOptions.map((model) => <option key={model.id} value={model.id} label={model.available ? model.classification : `${model.classification} · 已下线`} />)}</datalist></label>
+                            <div className={`task-route-state ${notice?.tone ?? "ready"}`}><span>{taskProvider?.is_unlocked || taskProvider?.kind === "fake" ? "READY" : "LOCKED"}</span><strong>{notice?.message ?? "路由与任务类型兼容"}</strong></div>
                           </div>
                           <label className="production-field"><span>Prompt</span><textarea rows={3} value={task.prompt} onChange={(event) => updateTask(task.localId, { prompt: event.target.value })} /></label>
                           {task.kind === "text" ? (
@@ -479,15 +624,23 @@ export function GenerationPlanDrawer({
             </section>
             <section className="frozen-ledger">
               <div><span>基础调用</span><strong>{tasks.length}</strong><small>计划冻结</small></div>
-              <div><span>预计基础成本</span><strong>{estimatedCost === null ? "未知" : estimatedCost.toFixed(2)}</strong><small>{provider?.name ?? "无供应商"}</small></div>
+              <div><span>预计基础成本</span><strong>{estimatedCost.total === null ? "未知" : estimatedCost.total.toFixed(2)}</strong><small>{estimatedCost.unknownTasks > 0 ? `${estimatedCost.unknownTasks} 项价格未知 · 已知 ${estimatedCost.knownSubtotal.toFixed(2)}` : `${estimatedCost.byProvider.length} 个供应商汇总`}</small></div>
               <div><span>额外调用额度</span><strong>{extraBudget}</strong><small>建议 {suggestedExtraCalls}</small></div>
-              <div><span>并发上限</span><strong>{Math.min(maxConcurrency, provider?.concurrency ?? maxConcurrency)}</strong><small>计划 / 供应商双重限制</small></div>
+              <div><span>计划总并发</span><strong>{maxConcurrency}</strong><small>供应商并发分别限制</small></div>
               <div><span>单资产付费轮次</span><strong>{maxPaidRounds}</strong><small>达到即等待人工</small></div>
               <div><span>同请求网络重试</span><strong>{transportRetries}</strong><small>每次 Attempt 留痕</small></div>
             </section>
+            <section className="review-route-ledger">
+              <h3>供应商成本路由</h3>
+              <div>{estimatedCost.byProvider.map((item) => <article key={item.providerId}><span><strong>{item.providerName}</strong><small>{item.taskCount} 个任务</small></span><b>{item.total === null ? "价格未知" : item.total.toFixed(2)}</b></article>)}</div>
+            </section>
             <section className="review-dag">
               <h3>冻结任务与真实依赖</h3>
-              <ol>{tasks.map((task, index) => <li key={task.localId}><span>{String(index + 1).padStart(2, "0")}</span><div><strong>{task.taskId}</strong><small>{taskKindLabel(task.kind)} · {assetsById.get(task.assetId)?.name}</small></div><p>{task.dependsOn.length ? `注入：${task.dependsOn.join("、")}` : "根任务"}</p></li>)}</ol>
+              <ol>{tasks.map((task, index) => {
+                const taskProvider = providers.find((item) => item.id === task.providerId);
+                const notice = routeNotice(task, providers);
+                return <li key={task.localId}><span>{String(index + 1).padStart(2, "0")}</span><div><strong>{task.taskId}</strong><small>{taskKindLabel(task.kind)} · {assetsById.get(task.assetId)?.name}</small><em className={notice?.tone}>{taskProvider?.name ?? "未分配供应商"} / {task.model || "未选择模型"}{notice?.tone === "warning" ? " · 需人工核对" : ""}</em></div><p>{task.dependsOn.length ? `注入：${task.dependsOn.join("、")}` : "根任务"}</p></li>;
+              })}</ol>
             </section>
             <label className="explicit-confirmation"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /><span><strong>我确认本次基础调用与额外预算</strong><small>供应商返回只进入输出阶段；硬 QA、证据和人工审核仍会独立执行。</small></span></label>
           </div>

@@ -12,7 +12,17 @@ FastAPI 后端只监听本机回环地址。Project 根目录文件是权威数�
 - SQLite 中的 Artifact、审核和 Release 都能由 Project 文件重新扫描建立索引。
 - Workspace 保存被忽略的候选、驳回、QA 报告与缓存。
 - M2 生成计划冻结 DAG、预算与并发；Runner 使用 lease/heartbeat、持久 Attempt 和事件流恢复执行，并为人工返工生成 Finding 与视觉证据。
+- M2.1 支持多个 OpenAI 兼容供应商、全局文字/图片默认路由和任务级供应商/模型覆盖；确认后的 Job 保存冻结供应商快照且不自动回退。
 - 系统不支持其他项目布局或外部媒体路径协议。
+
+## 供应商与模型路由
+
+- `GET/POST/PATCH /api/providers` 管理供应商配置；`POST /api/providers/{id}/archive|restore` 软停用或恢复配置。
+- `GET/PUT /api/provider-defaults` 管理新任务使用的全局文字、图片默认路由。
+- `GET /api/providers/{id}/models` 读取缓存；`POST .../models/refresh` 拉取供应商模型列表；`PATCH .../models` 保存人工模态分类。
+- 模型刷新失败不会覆盖旧缓存。归档供应商保留历史 Job 和快照，但不能分配给新计划。
+- `GenerationTask` 的 `provider_profile_id` 与 `model` 是新计划的实际路由；计划顶层 `provider_profile_id` 仅作为旧客户端兼容回退。
+- API Key 不进入请求响应、SQLite、Project、事件或 Job 快照；后端仅在当前进程内按供应商 ID 持有已解锁明文。
 
 ## 常用命令
 

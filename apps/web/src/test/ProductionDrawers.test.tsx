@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -62,6 +62,80 @@ const sidekickAsset: GameAsset = {
   name: "同伴中立立绘",
 };
 
+const contentAsset: GameAsset = {
+  ...mediaAsset,
+  id: "asset-lore",
+  key: "item.route-lore",
+  name: "路线设定",
+  kind: "content",
+  category: "content",
+  subtype: "item",
+  subtypeLabel: "物品设定",
+  schemaRef: "schemas/item.schema.json",
+  preview: { kind: "content", label: "结构化内容", meta: "JSON", summary: "路线设定摘要" },
+  revisionFormat: "json",
+};
+
+const routingProviders = [
+  {
+    id: "provider-text",
+    name: "文字供应商",
+    kind: "fake",
+    base_url: "https://text.invalid/v1",
+    text_model: "text-default",
+    image_model: "text-provider-image",
+    quality: "high",
+    concurrency: 2,
+    max_retries: 2,
+    allow_private_network: false,
+    pricing: { text_call: 0.25, image_call: 0.6 },
+    is_active: true,
+    is_unlocked: true,
+    models_refreshed_at: "2026-07-30T08:00:00Z",
+    models: [
+      { id: "text-default", modalities: ["text"], classification: "provider", available: true },
+      { id: "text-provider-image", modalities: ["image"], classification: "provider", available: true },
+    ],
+  },
+  {
+    id: "provider-image",
+    name: "图片供应商",
+    kind: "fake",
+    base_url: "https://image.invalid/v1",
+    text_model: "image-provider-text",
+    image_model: "image-default",
+    quality: "high",
+    concurrency: 3,
+    max_retries: 1,
+    allow_private_network: false,
+    pricing: { image_call: 0.8 },
+    is_active: true,
+    is_unlocked: true,
+    models_refreshed_at: "2026-07-30T08:00:00Z",
+    models: [
+      { id: "image-default", modalities: ["image"], classification: "provider", available: true },
+      { id: "image-provider-text", modalities: ["text"], classification: "manual", available: true },
+    ],
+  },
+];
+
+function mockRoutingApi() {
+  const fetchMock = vi.fn((input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url === "/api/providers") return json(routingProviders);
+    if (url === "/api/provider-defaults") {
+      return json({
+        text: { provider_profile_id: "provider-text", model: "text-default" },
+        image: { provider_profile_id: "provider-image", model: "image-default" },
+        updated_at: "2026-07-30T08:00:00Z",
+      });
+    }
+    throw new Error(`unexpected request: ${url}`);
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  return fetchMock;
+}
+
 const inspection: RunInspection = {
   plan: {
     id: "plan-1",
@@ -110,6 +184,11 @@ const inspection: RunInspection = {
       lease_expires_at: null,
       heartbeat_at: null,
       resolved_request: {},
+      provider_snapshot: {
+        id: "provider-1",
+        name: "测试供应商",
+        model: "gpt-image-1",
+      },
       pending_action_id: null,
       created_at: "2026-07-30T10:00:00Z",
       updated_at: "2026-07-30T10:01:00Z",
@@ -202,11 +281,17 @@ describe("M2 生产抽屉", () => {
           },
         ]);
       }
+      if (url === "/api/provider-defaults") {
+        return json({
+          text: { provider_profile_id: "provider-1", model: "fake-text" },
+          image: { provider_profile_id: "provider-1", model: "fake-image" },
+          updated_at: null,
+        });
+      }
       if (url === "/api/generation-plans" && init?.method === "POST") {
         const body = JSON.parse(String(init.body));
         expect(body).toMatchObject({
           project_id: "project-1",
-          provider_profile_id: "provider-1",
           extra_call_budget: 2,
           max_paid_remediation_rounds: 2,
           max_transport_retries: 2,
@@ -214,6 +299,8 @@ describe("M2 生产抽屉", () => {
             {
               kind: "image",
               asset_id: "asset-portrait",
+              provider_profile_id: "provider-1",
+              model: "fake-image",
               width: 1024,
               height: 1024,
               transparent: true,
@@ -244,7 +331,7 @@ describe("M2 生产抽屉", () => {
     );
 
     const dialog = screen.getByRole("dialog", { name: "编排生成计划" });
-    expect(await within(dialog).findByText("确定性测试供应商")).toBeInTheDocument();
+    expect((await within(dialog).findAllByText("确定性测试供应商")).length).toBeGreaterThan(0);
     expect(within(dialog).getAllByText("主角中立立绘").length).toBeGreaterThan(0);
     await user.click(within(dialog).getByRole("button", { name: "校验并查看预算" }));
 
@@ -279,6 +366,13 @@ describe("M2 生产抽屉", () => {
           is_unlocked: true,
         }]);
       }
+      if (url === "/api/provider-defaults") {
+        return json({
+          text: { provider_profile_id: "provider-1", model: "fake-text" },
+          image: { provider_profile_id: "provider-1", model: "fake-image" },
+          updated_at: null,
+        });
+      }
       if (url === "/api/generation-plans" && init?.method === "POST") {
         submitted = JSON.parse(String(init.body));
         return json({ id: "plan-renamed" }, 201);
@@ -302,7 +396,7 @@ describe("M2 生产抽屉", () => {
     );
 
     const dialog = screen.getByRole("dialog", { name: "编排生成计划" });
-    await within(dialog).findByText("确定性测试供应商");
+    expect((await within(dialog).findAllByText("确定性测试供应商")).length).toBeGreaterThan(0);
     const originalRootId = "produce-portrait-hero-neutral-1";
     await user.click(within(dialog).getByRole("checkbox", { name: originalRootId }));
     const taskIds = within(dialog).getAllByLabelText("任务 ID");
@@ -322,11 +416,148 @@ describe("M2 生产抽屉", () => {
     });
   });
 
+  it("按任务类型继承全局路由，并在切换供应商或类型时使用对应默认模型", async () => {
+    const user = userEvent.setup();
+    mockRoutingApi();
+    render(
+      <QueryClientProvider client={queryClient()}>
+        <GenerationPlanDrawer
+          open
+          project={{ id: "project-1", name: "测试 Project", path: "/tmp/project", assetCount: 1, thumbnail: "" }}
+          assets={[mediaAsset]}
+          initialAssetIds={[mediaAsset.id]}
+          onClose={() => undefined}
+          onConfirmed={() => undefined}
+        />
+      </QueryClientProvider>,
+    );
+
+    const providerSelect = await screen.findByLabelText("任务供应商");
+    const kindSelect = screen.getByLabelText("任务类型");
+    await waitFor(() => expect(providerSelect).toHaveValue("provider-image"));
+    expect(screen.getByLabelText("图片模型")).toHaveValue("image-default");
+
+    await user.selectOptions(providerSelect, "provider-text");
+    expect(screen.getByLabelText("图片模型")).toHaveValue("text-provider-image");
+
+    await user.selectOptions(kindSelect, "text");
+    expect(providerSelect).toHaveValue("provider-text");
+    expect(screen.getByLabelText("文字模型")).toHaveValue("text-default");
+
+    await user.selectOptions(kindSelect, "image_edit");
+    expect(providerSelect).toHaveValue("provider-image");
+    expect(screen.getByLabelText("图片模型")).toHaveValue("image-default");
+  });
+
+  it("默认路由变化不会改写已经建立的草稿任务", async () => {
+    const client = queryClient();
+    mockRoutingApi();
+    render(
+      <QueryClientProvider client={client}>
+        <GenerationPlanDrawer
+          open
+          project={{ id: "project-1", name: "测试 Project", path: "/tmp/project", assetCount: 1, thumbnail: "" }}
+          assets={[mediaAsset]}
+          initialAssetIds={[mediaAsset.id]}
+          onClose={() => undefined}
+          onConfirmed={() => undefined}
+        />
+      </QueryClientProvider>,
+    );
+
+    const providerSelect = await screen.findByLabelText("任务供应商");
+    await waitFor(() => expect(providerSelect).toHaveValue("provider-image"));
+    expect(screen.getByLabelText("图片模型")).toHaveValue("image-default");
+
+    act(() => {
+      client.setQueryData(["provider-defaults"], {
+        text: { provider_profile_id: "provider-text", model: "text-default" },
+        image: { provider_profile_id: "provider-text", model: "text-provider-image" },
+        updated_at: "2026-07-30T09:00:00Z",
+      });
+    });
+    const snapshot = screen.getByLabelText("全局默认路由快照源");
+    await waitFor(() => expect(within(snapshot).getByText("text-provider-image")).toBeInTheDocument());
+    expect(providerSelect).toHaveValue("provider-image");
+    expect(screen.getByLabelText("图片模型")).toHaveValue("image-default");
+  });
+
+  it("混合任务分别继承文字与图片路由，并按供应商汇总预算", async () => {
+    const user = userEvent.setup();
+    mockRoutingApi();
+    render(
+      <QueryClientProvider client={queryClient()}>
+        <GenerationPlanDrawer
+          open
+          project={{ id: "project-1", name: "测试 Project", path: "/tmp/project", assetCount: 2, thumbnail: "" }}
+          assets={[contentAsset, mediaAsset]}
+          initialAssetIds={[contentAsset.id, mediaAsset.id]}
+          onClose={() => undefined}
+          onConfirmed={() => undefined}
+        />
+      </QueryClientProvider>,
+    );
+
+    const providerSelects = await screen.findAllByLabelText("任务供应商");
+    await waitFor(() => {
+      expect(providerSelects[0]).toHaveValue("provider-text");
+      expect(providerSelects[1]).toHaveValue("provider-image");
+    });
+    expect(screen.getByLabelText("文字模型")).toHaveValue("text-default");
+    expect(screen.getByLabelText("图片模型")).toHaveValue("image-default");
+
+    await user.click(screen.getByRole("button", { name: "校验并查看预算" }));
+    const routeLedger = screen.getByText("供应商成本路由").closest("section");
+    expect(routeLedger).not.toBeNull();
+    expect(within(routeLedger as HTMLElement).getByText("文字供应商")).toBeInTheDocument();
+    expect(within(routeLedger as HTMLElement).getByText("图片供应商")).toBeInTheDocument();
+    expect(within(routeLedger as HTMLElement).getByText("0.25")).toBeInTheDocument();
+    expect(within(routeLedger as HTMLElement).getByText("0.80")).toBeInTheDocument();
+  });
+
+  it("允许手填或未分类模型并警告，但阻止已明确分类为不兼容的模型", async () => {
+    const user = userEvent.setup();
+    mockRoutingApi();
+    render(
+      <QueryClientProvider client={queryClient()}>
+        <GenerationPlanDrawer
+          open
+          project={{ id: "project-1", name: "测试 Project", path: "/tmp/project", assetCount: 1, thumbnail: "" }}
+          assets={[mediaAsset]}
+          initialAssetIds={[mediaAsset.id]}
+          onClose={() => undefined}
+          onConfirmed={() => undefined}
+        />
+      </QueryClientProvider>,
+    );
+
+    const modelInput = await screen.findByLabelText("图片模型");
+    await waitFor(() => expect(modelInput).toHaveValue("image-default"));
+    await user.clear(modelInput);
+    await user.type(modelInput, "manual-image-custom");
+    expect(screen.getByText("手填或未分类模型；确认前请核对供应商能力。")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "校验并查看预算" }));
+    expect(screen.getByText(/图片供应商 \/ manual-image-custom · 需人工核对/)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "返回修改" }));
+
+    const incompatibleModel = screen.getByLabelText("图片模型");
+    await user.clear(incompatibleModel);
+    await user.type(incompatibleModel, "image-provider-text");
+    expect(screen.getByText("image-provider-text 已分类为不支持图片任务。")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "校验并查看预算" }));
+    expect(screen.getByRole("alert")).toHaveTextContent("image-provider-text 已分类为不支持图片任务");
+    expect(screen.getByRole("dialog", { name: "编排生成计划" })).toBeInTheDocument();
+  });
+
   it("把键盘焦点限制在抽屉内并在关闭后还给入口", async () => {
     const user = userEvent.setup();
     const client = queryClient();
     vi.stubGlobal("fetch", vi.fn((input: RequestInfo | URL) => {
       if (String(input) === "/api/providers") return json([]);
+      if (String(input) === "/api/provider-defaults") {
+        return json({ text: null, image: null, updated_at: null });
+      }
       throw new Error(`unexpected request: ${String(input)}`);
     }));
 

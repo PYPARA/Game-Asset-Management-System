@@ -158,8 +158,30 @@ class ProviderProfile(Base):
     max_retries: Mapped[int] = mapped_column(Integer, default=2)
     allow_private_network: Mapped[bool] = mapped_column(Boolean, default=False)
     pricing: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    models_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    models_refreshed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class ProviderRoutingDefaults(Base):
+    __tablename__ = "provider_routing_defaults"
+
+    id: Mapped[str] = mapped_column(String(20), primary_key=True, default="global")
+    text_provider_profile_id: Mapped[str | None] = mapped_column(
+        ForeignKey("provider_profiles.id", ondelete="SET NULL"), nullable=True
+    )
+    text_model: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    image_provider_profile_id: Mapped[str | None] = mapped_column(
+        ForeignKey("provider_profiles.id", ondelete="SET NULL"), nullable=True
+    )
+    image_model: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
 
 
 class GenerationPlan(Base):
@@ -212,6 +234,7 @@ class GenerationJob(Base):
     )
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     resolved_request_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    provider_snapshot_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     pending_action_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, index=True)

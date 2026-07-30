@@ -7,6 +7,8 @@ import type {
   GenerationProviderProfile,
   JobSummary,
   ProjectSummary,
+  ProviderDefaults,
+  ProviderModelRecord,
   QACheck,
   RemediationRun,
   ReviewStatus,
@@ -703,6 +705,72 @@ interface ProviderApiRecord {
   concurrency: number;
   max_retries: number;
   allow_private_network: boolean;
+  pricing?: Record<string, unknown> | null;
+  is_active?: boolean;
+  models?: ProviderModelRecord[];
+  models_refreshed_at?: string | null;
+  is_unlocked?: boolean;
+}
+
+interface ProviderModelsResponse {
+  provider_profile_id: string;
+  models: ProviderModelRecord[];
+  refreshed_at: string | null;
+}
+
+function providerPayload(profile: ProviderProfile) {
+  return {
+    name: profile.name,
+    kind: "openai_compatible",
+    base_url: profile.baseUrl,
+    text_model: profile.textModel,
+    image_model: profile.imageModel,
+    quality: profile.quality,
+    concurrency: profile.concurrency,
+    max_retries: profile.retries,
+    allow_private_network: profile.allowPrivateNetwork,
+  };
+}
+
+function normalizeGenerationProvider(profile: Record<string, unknown>): GenerationProviderProfile {
+  const quality = String(profile.quality ?? "high");
+  return {
+    id: String(profile.id ?? ""),
+    name: String(profile.name ?? "未命名供应商"),
+    kind: String(profile.kind ?? ""),
+    base_url: String(profile.base_url ?? ""),
+    text_model: String(profile.text_model ?? ""),
+    image_model: String(profile.image_model ?? ""),
+    quality: quality === "low" || quality === "medium" ? quality : "high",
+    concurrency: Number(profile.concurrency ?? 1),
+    max_retries: Number(profile.max_retries ?? 0),
+    allow_private_network: profile.allow_private_network === true,
+    pricing: isRecord(profile.pricing)
+      ? Object.fromEntries(
+          Object.entries(profile.pricing).flatMap(([key, value]) => {
+            const parsed = Number(value);
+            return Number.isFinite(parsed) ? [[key, parsed]] : [];
+          }),
+        )
+      : null,
+    is_active: profile.is_active !== false,
+    models: Array.isArray(profile.models)
+      ? profile.models.flatMap((model) => isRecord(model) && model.id
+        ? [{
+            id: String(model.id),
+            modalities: Array.isArray(model.modalities)
+              ? model.modalities.filter((value): value is "text" | "image" => value === "text" || value === "image")
+              : [],
+            classification: model.classification === "provider" || model.classification === "heuristic" || model.classification === "manual"
+              ? model.classification
+              : "unknown",
+            available: model.available !== false,
+          }]
+        : [])
+      : [],
+    models_refreshed_at: typeof profile.models_refreshed_at === "string" ? profile.models_refreshed_at : null,
+    is_unlocked: profile.is_unlocked === true,
+  };
 }
 
 export async function ensureProviderProfile(profile: ProviderProfile): Promise<ProviderApiRecord> {
@@ -722,17 +790,74 @@ export async function ensureProviderProfile(profile: ProviderProfile): Promise<P
 
   return request<ProviderApiRecord>("/providers", {
     method: "POST",
-    body: JSON.stringify({
-      name: profile.name,
-      kind: "openai_compatible",
-      base_url: profile.baseUrl,
-      text_model: profile.textModel,
-      image_model: profile.imageModel,
-      quality: profile.quality,
-      concurrency: profile.concurrency,
-      max_retries: profile.retries,
-      allow_private_network: profile.allowPrivateNetwork,
-    }),
+    body: JSON.stringify(providerPayload(profile)),
+  });
+}
+
+export async function createProviderProfile(profile: ProviderProfile): Promise<GenerationProviderProfile> {
+  const created = await request<Record<string, unknown>>("/providers", {
+    method: "POST",
+    body: JSON.stringify(providerPayload(profile)),
+  });
+  return normalizeGenerationProvider(created);
+}
+
+export async function updateProviderProfile(
+  profileId: string,
+  profile: ProviderProfile,
+): Promise<GenerationProviderProfile> {
+  const updated = await request<Record<string, unknown>>(
+    `/providers/${encodeURIComponent(profileId)}`,
+    { method: "PATCH", body: JSON.stringify(providerPayload(profile)) },
+  );
+  return normalizeGenerationProvider(updated);
+}
+
+export async function archiveProvider(profileId: string): Promise<GenerationProviderProfile> {
+  const result = await request<Record<string, unknown>>(
+    `/providers/${encodeURIComponent(profileId)}/archive`,
+    { method: "POST" },
+  );
+  return normalizeGenerationProvider(result);
+}
+
+export async function restoreProvider(profileId: string): Promise<GenerationProviderProfile> {
+  const result = await request<Record<string, unknown>>(
+    `/providers/${encodeURIComponent(profileId)}/restore`,
+    { method: "POST" },
+  );
+  return normalizeGenerationProvider(result);
+}
+
+export async function fetchProviderDefaults(): Promise<ProviderDefaults> {
+  return request<ProviderDefaults>("/provider-defaults");
+}
+
+export async function updateProviderDefaults(defaults: ProviderDefaults): Promise<ProviderDefaults> {
+  return request<ProviderDefaults>("/provider-defaults", {
+    method: "PUT",
+    body: JSON.stringify({ text: defaults.text, image: defaults.image }),
+  });
+}
+
+export async function fetchProviderModels(profileId: string): Promise<ProviderModelsResponse> {
+  return request<ProviderModelsResponse>(`/providers/${encodeURIComponent(profileId)}/models`);
+}
+
+export async function refreshProviderModels(profileId: string): Promise<ProviderModelsResponse> {
+  return request<ProviderModelsResponse>(
+    `/providers/${encodeURIComponent(profileId)}/models/refresh`,
+    { method: "POST", timeoutMs: 120_000 },
+  );
+}
+
+export async function updateProviderModelOverrides(
+  profileId: string,
+  models: Array<Pick<ProviderModelRecord, "id" | "modalities">>,
+): Promise<ProviderModelsResponse> {
+  return request<ProviderModelsResponse>(`/providers/${encodeURIComponent(profileId)}/models`, {
+    method: "PATCH",
+    body: JSON.stringify({ models }),
   });
 }
 
@@ -792,23 +917,7 @@ export async function updateProject(projectId: string, name: string) {
 
 export async function fetchGenerationProviders(): Promise<GenerationProviderProfile[]> {
   const profiles = await request<Array<Record<string, unknown>>>("/providers");
-  return profiles.map((profile) => ({
-    id: String(profile.id ?? ""),
-    name: String(profile.name ?? "未命名供应商"),
-    kind: String(profile.kind ?? ""),
-    text_model: String(profile.text_model ?? ""),
-    image_model: String(profile.image_model ?? ""),
-    concurrency: Number(profile.concurrency ?? 1),
-    pricing: isRecord(profile.pricing)
-      ? Object.fromEntries(
-          Object.entries(profile.pricing).flatMap(([key, value]) => {
-            const parsed = Number(value);
-            return Number.isFinite(parsed) ? [[key, parsed]] : [];
-          }),
-        )
-      : null,
-    is_unlocked: profile.is_unlocked === true,
-  }));
+  return profiles.map(normalizeGenerationProvider);
 }
 
 export async function createAndConfirmGenerationPlan(

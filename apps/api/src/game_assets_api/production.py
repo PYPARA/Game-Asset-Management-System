@@ -475,7 +475,7 @@ def resume_recoverable_jobs(
     session: Session,
     *,
     plan: GenerationPlan,
-    credentials_available: bool,
+    available_provider_ids: set[str],
 ) -> list[GenerationJob]:
     jobs = list(
         session.scalars(
@@ -506,7 +506,10 @@ def resume_recoverable_jobs(
                 RemediationStatus.RUNNING.value,
             }
         )
-        if job.status == GenerationStatus.CREDENTIALS_LOCKED.value and credentials_available:
+        if (
+            job.status == GenerationStatus.CREDENTIALS_LOCKED.value
+            and job.provider_profile_id in available_provider_ids
+        ):
             job.status = GenerationStatus.QUEUED.value
         elif job.status == GenerationStatus.AWAITING_USER.value and (
             recoverable_output or recoverable_action

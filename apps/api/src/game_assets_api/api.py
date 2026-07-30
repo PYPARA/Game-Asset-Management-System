@@ -28,9 +28,15 @@ from .domain import (
     ProjectUpdate,
     ProviderCapabilities,
     ProviderCreate,
+    ProviderDefaultRoute,
+    ProviderDefaultsRead,
+    ProviderDefaultsUpdate,
     ProviderKind,
+    ProviderModelsRead,
+    ProviderModelsUpdate,
     ProviderRead,
     ProviderUnlock,
+    ProviderUpdate,
     QARunCreate,
     QARunRead,
     RemediationCreate,
@@ -63,6 +69,7 @@ from .models import (
     ProductionFinding,
     Project,
     ProviderProfile,
+    ProviderRoutingDefaults,
     QARun,
     RemediationAction,
     Release,
@@ -78,6 +85,13 @@ from .providers import (
     ProviderError,
     build_provider,
     validate_base_url,
+)
+from .provider_catalog import (
+    apply_model_overrides,
+    ensure_profile_default_models,
+    ensure_routing_defaults,
+    merge_discovered_models,
+    model_is_compatible,
 )
 from .production import (
     attempt_output_is_valid,
@@ -123,6 +137,46 @@ def provider_view(profile: ProviderProfile, credentials: CredentialVault) -> Pro
     view = ProviderRead.model_validate(profile)
     return view.model_copy(
         update={"is_unlocked": profile.kind == ProviderKind.FAKE.value or credentials.is_unlocked(profile.id)}
+    )
+
+
+def available_provider_ids(
+    session: Session, credentials: CredentialVault
+) -> set[str]:
+    return {
+        profile.id
+        for profile in session.scalars(select(ProviderProfile)).all()
+        if profile.kind == ProviderKind.FAKE.value or credentials.is_unlocked(profile.id)
+    }
+
+
+def provider_models_view(profile: ProviderProfile) -> ProviderModelsRead:
+    return ProviderModelsRead(
+        provider_profile_id=profile.id,
+        models=profile.models_json or [],
+        refreshed_at=profile.models_refreshed_at,
+    )
+
+
+def provider_defaults_view(defaults: ProviderRoutingDefaults) -> ProviderDefaultsRead:
+    return ProviderDefaultsRead(
+        text=(
+            ProviderDefaultRoute(
+                provider_profile_id=defaults.text_provider_profile_id,
+                model=defaults.text_model,
+            )
+            if defaults.text_provider_profile_id and defaults.text_model
+            else None
+        ),
+        image=(
+            ProviderDefaultRoute(
+                provider_profile_id=defaults.image_provider_profile_id,
+                model=defaults.image_model,
+            )
+            if defaults.image_provider_profile_id and defaults.image_model
+            else None
+        ),
+        updated_at=defaults.updated_at,
     )
 
 
@@ -328,9 +382,13 @@ def add_relation(payload: RelationCreate, session: Session = Depends(db)) -> Ass
 
 @router.get("/providers", response_model=list[ProviderRead])
 def list_providers(
+    include_archived: bool = True,
     session: Session = Depends(db), credentials: CredentialVault = Depends(vault)
 ) -> list[ProviderRead]:
-    profiles = session.scalars(select(ProviderProfile).order_by(ProviderProfile.created_at)).all()
+    statement = select(ProviderProfile).order_by(ProviderProfile.created_at, ProviderProfile.id)
+    if not include_archived:
+        statement = statement.where(ProviderProfile.is_active.is_(True))
+    profiles = session.scalars(statement).all()
     return [provider_view(profile, credentials) for profile in profiles]
 
 
@@ -360,10 +418,118 @@ def add_provider(
         max_retries=payload.max_retries,
         allow_private_network=payload.allow_private_network,
         pricing=payload.pricing,
+        is_active=True,
+        models_json=[],
     )
+    ensure_profile_default_models(profile)
     session.add(profile)
+    session.flush()
+    ensure_routing_defaults(session)
     session.commit()
     return provider_view(profile, credentials)
+
+
+@router.patch("/providers/{provider_id}", response_model=ProviderRead)
+def edit_provider(
+    provider_id: str,
+    payload: ProviderUpdate,
+    session: Session = Depends(db),
+    credentials: CredentialVault = Depends(vault),
+) -> ProviderRead:
+    profile = require(session, ProviderProfile, provider_id, "provider profile")
+    changes = payload.model_dump(exclude_unset=True)
+    if "base_url" in changes or "allow_private_network" in changes:
+        base_url = str(changes.get("base_url", profile.base_url))
+        allow_private_network = bool(
+            changes.get("allow_private_network", profile.allow_private_network)
+        )
+        if profile.kind == ProviderKind.OPENAI_COMPATIBLE.value:
+            try:
+                changes["base_url"] = validate_base_url(
+                    base_url, allow_private_network=allow_private_network
+                )
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from exc
+    for field, value in changes.items():
+        setattr(profile, field, value)
+    ensure_profile_default_models(profile)
+    profile.updated_at = utcnow()
+    session.commit()
+    return provider_view(profile, credentials)
+
+
+@router.post("/providers/{provider_id}/archive", response_model=ProviderRead)
+def archive_provider(
+    provider_id: str,
+    session: Session = Depends(db),
+    credentials: CredentialVault = Depends(vault),
+) -> ProviderRead:
+    profile = require(session, ProviderProfile, provider_id, "provider profile")
+    profile.is_active = False
+    profile.updated_at = utcnow()
+    defaults = ensure_routing_defaults(session)
+    if defaults.text_provider_profile_id == profile.id:
+        defaults.text_provider_profile_id = None
+        defaults.text_model = None
+    if defaults.image_provider_profile_id == profile.id:
+        defaults.image_provider_profile_id = None
+        defaults.image_model = None
+    defaults.updated_at = utcnow()
+    session.commit()
+    return provider_view(profile, credentials)
+
+
+@router.post("/providers/{provider_id}/restore", response_model=ProviderRead)
+def restore_provider(
+    provider_id: str,
+    session: Session = Depends(db),
+    credentials: CredentialVault = Depends(vault),
+) -> ProviderRead:
+    profile = require(session, ProviderProfile, provider_id, "provider profile")
+    profile.is_active = True
+    profile.updated_at = utcnow()
+    session.commit()
+    return provider_view(profile, credentials)
+
+
+@router.get("/provider-defaults", response_model=ProviderDefaultsRead)
+def get_provider_defaults(session: Session = Depends(db)) -> ProviderDefaultsRead:
+    defaults = ensure_routing_defaults(session)
+    session.commit()
+    return provider_defaults_view(defaults)
+
+
+@router.put("/provider-defaults", response_model=ProviderDefaultsRead)
+def set_provider_defaults(
+    payload: ProviderDefaultsUpdate,
+    session: Session = Depends(db),
+) -> ProviderDefaultsRead:
+    defaults = ensure_routing_defaults(session)
+    for modality in ("text", "image"):
+        route = getattr(payload, modality)
+        if route is None:
+            setattr(defaults, f"{modality}_provider_profile_id", None)
+            setattr(defaults, f"{modality}_model", None)
+            continue
+        profile = require(
+            session,
+            ProviderProfile,
+            route.provider_profile_id,
+            f"default {modality} provider",
+        )
+        if not profile.is_active:
+            raise HTTPException(422, f"default {modality} provider is archived")
+        model = route.model.strip()
+        if not model_is_compatible(profile, model, modality):
+            raise HTTPException(
+                422,
+                f"default {modality} model {model} is not classified for {modality}",
+            )
+        setattr(defaults, f"{modality}_provider_profile_id", profile.id)
+        setattr(defaults, f"{modality}_model", model)
+    defaults.updated_at = utcnow()
+    session.commit()
+    return provider_defaults_view(defaults)
 
 
 @router.get("/providers/{provider_id}", response_model=ProviderRead)
@@ -373,6 +539,57 @@ def get_provider(
     credentials: CredentialVault = Depends(vault),
 ) -> ProviderRead:
     return provider_view(require(session, ProviderProfile, provider_id, "provider profile"), credentials)
+
+
+@router.get("/providers/{provider_id}/models", response_model=ProviderModelsRead)
+def get_provider_models(
+    provider_id: str, session: Session = Depends(db)
+) -> ProviderModelsRead:
+    return provider_models_view(require(session, ProviderProfile, provider_id, "provider profile"))
+
+
+@router.patch("/providers/{provider_id}/models", response_model=ProviderModelsRead)
+def update_provider_models(
+    provider_id: str,
+    payload: ProviderModelsUpdate,
+    session: Session = Depends(db),
+) -> ProviderModelsRead:
+    profile = require(session, ProviderProfile, provider_id, "provider profile")
+    profile.models_json = apply_model_overrides(
+        profile.models_json or [],
+        [item.model_dump(mode="json") for item in payload.models],
+    )
+    ensure_profile_default_models(profile)
+    profile.updated_at = utcnow()
+    session.commit()
+    return provider_models_view(profile)
+
+
+async def refresh_provider_model_catalog(
+    profile: ProviderProfile,
+    session: Session,
+    credentials: CredentialVault,
+) -> ProviderModelsRead:
+    try:
+        discovered = await build_provider(profile, credentials).discover_models()
+    except ProviderError as exc:
+        raise provider_http_error(exc) from exc
+    profile.models_json = merge_discovered_models(profile.models_json or [], discovered)
+    ensure_profile_default_models(profile)
+    profile.models_refreshed_at = utcnow()
+    profile.updated_at = utcnow()
+    session.commit()
+    return provider_models_view(profile)
+
+
+@router.post("/providers/{provider_id}/models/refresh", response_model=ProviderModelsRead)
+async def refresh_provider_models(
+    provider_id: str,
+    session: Session = Depends(db),
+    credentials: CredentialVault = Depends(vault),
+) -> ProviderModelsRead:
+    profile = require(session, ProviderProfile, provider_id, "provider profile")
+    return await refresh_provider_model_catalog(profile, session, credentials)
 
 
 @router.post("/providers/{provider_id}/unlock", response_model=Message)
@@ -395,6 +612,11 @@ def unlock_provider(
         job.error_category = None
         job.error_message = None
         job.updated_at = utcnow()
+    plan_ids = {job.plan_id for job in jobs}
+    for plan_id in plan_ids:
+        plan = session.get(GenerationPlan, plan_id)
+        if plan:
+            refresh_plan_status(session, plan)
     session.commit()
     return Message(detail="provider unlocked for this process")
 
@@ -419,7 +641,11 @@ def provider_capabilities(
         structured_text=True,
         image_generation=True,
         image_edit=True,
-        models=[profile.text_model, profile.image_model],
+        models=[
+            str(model.get("id"))
+            for model in profile.models_json or []
+            if model.get("id") and model.get("available", True)
+        ],
     )
 
 
@@ -430,12 +656,12 @@ async def test_provider(
     credentials: CredentialVault = Depends(vault),
 ) -> ProviderCapabilities:
     profile = require(session, ProviderProfile, provider_id, "provider profile")
-    try:
-        models = await build_provider(profile, credentials).test_connection()
-    except ProviderError as exc:
-        raise provider_http_error(exc) from exc
+    catalog = await refresh_provider_model_catalog(profile, session, credentials)
     return ProviderCapabilities(
-        structured_text=True, image_generation=True, image_edit=True, models=models
+        structured_text=True,
+        image_generation=True,
+        image_edit=True,
+        models=[model.id for model in catalog.models if model.available],
     )
 
 
@@ -487,12 +713,10 @@ def resume_plan(
     credentials: CredentialVault = Depends(vault),
 ) -> list[GenerationJob]:
     plan = require(session, GenerationPlan, plan_id, "generation plan")
-    profile = require(session, ProviderProfile, plan.provider_profile_id, "provider profile")
     return resume_recoverable_jobs(
         session,
         plan=plan,
-        credentials_available=profile.kind == ProviderKind.FAKE.value
-        or credentials.is_unlocked(profile.id),
+        available_provider_ids=available_provider_ids(session, credentials),
     )
 
 
@@ -503,12 +727,10 @@ def approve_plan(
     credentials: CredentialVault = Depends(vault),
 ) -> list[GenerationJob]:
     plan = require(session, GenerationPlan, plan_id, "generation plan")
-    profile = require(session, ProviderProfile, plan.provider_profile_id, "provider profile")
     return confirm_plan(
         session,
         plan,
-        credentials_available=profile.kind == ProviderKind.FAKE.value
-        or credentials.is_unlocked(profile.id),
+        available_provider_ids=available_provider_ids(session, credentials),
     )
 
 

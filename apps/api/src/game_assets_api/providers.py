@@ -143,6 +143,34 @@ class ProviderResult:
     request_id: str | None = None
 
 
+@dataclass(slots=True, frozen=True)
+class ProviderRuntimeConfig:
+    id: str
+    kind: str
+    base_url: str
+    text_model: str
+    image_model: str
+    quality: str
+    allow_private_network: bool
+
+
+def provider_runtime_config(
+    profile: ProviderProfile, snapshot: dict[str, Any] | None = None
+) -> ProviderRuntimeConfig:
+    frozen = snapshot or {}
+    return ProviderRuntimeConfig(
+        id=str(frozen.get("profile_id") or profile.id),
+        kind=str(frozen.get("kind") or profile.kind),
+        base_url=str(frozen.get("base_url") or profile.base_url),
+        text_model=str(frozen.get("text_model") or profile.text_model),
+        image_model=str(frozen.get("image_model") or profile.image_model),
+        quality=str(frozen.get("quality") or profile.quality),
+        allow_private_network=bool(
+            frozen.get("allow_private_network", profile.allow_private_network)
+        ),
+    )
+
+
 class GenerationProvider(Protocol):
     requires_credentials: bool
 
@@ -151,6 +179,7 @@ class GenerationProvider(Protocol):
         *,
         prompt: str,
         schema: dict[str, Any],
+        model: str,
         idempotency_key: str | None = None,
     ) -> ProviderResult: ...
 
@@ -160,9 +189,12 @@ class GenerationProvider(Protocol):
         prompt: str,
         width: int | None,
         height: int | None,
+        model: str,
         reference: bytes | None = None,
         idempotency_key: str | None = None,
     ) -> ProviderResult: ...
+
+    async def discover_models(self) -> list[dict[str, Any]]: ...
 
     async def test_connection(self) -> list[str]: ...
 
@@ -195,7 +227,7 @@ def _fake_value(schema: dict[str, Any], name: str = "value") -> Any:
 class FakeProvider:
     requires_credentials = False
 
-    def __init__(self, profile: ProviderProfile):
+    def __init__(self, profile: ProviderProfile | ProviderRuntimeConfig):
         self.profile = profile
 
     async def structured_text(
@@ -203,6 +235,7 @@ class FakeProvider:
         *,
         prompt: str,
         schema: dict[str, Any],
+        model: str,
         idempotency_key: str | None = None,
     ) -> ProviderResult:
         await asyncio.sleep(0)
@@ -218,6 +251,7 @@ class FakeProvider:
         prompt: str,
         width: int | None,
         height: int | None,
+        model: str,
         reference: bytes | None = None,
         idempotency_key: str | None = None,
     ) -> ProviderResult:
@@ -236,14 +270,20 @@ class FakeProvider:
         image.save(output, "PNG")
         return ProviderResult(value=output.getvalue(), request_id="fake-image-request")
 
+    async def discover_models(self) -> list[dict[str, Any]]:
+        return [
+            {"id": self.profile.text_model, "modalities": ["text"]},
+            {"id": self.profile.image_model, "modalities": ["image"]},
+        ]
+
     async def test_connection(self) -> list[str]:
-        return [self.profile.text_model, self.profile.image_model]
+        return [str(item["id"]) for item in await self.discover_models()]
 
 
 class OpenAICompatibleProvider:
     requires_credentials = True
 
-    def __init__(self, profile: ProviderProfile, api_key: str):
+    def __init__(self, profile: ProviderProfile | ProviderRuntimeConfig, api_key: str):
         self.profile = profile
         self.base_url = validate_base_url(
             profile.base_url, allow_private_network=profile.allow_private_network
@@ -270,10 +310,16 @@ class OpenAICompatibleProvider:
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
             raise ProviderError("provider network request failed", ErrorCategory.NETWORK) from exc
         if response.status_code >= 400:
-            category = classify_http_error(response.status_code, response.text[:1000])
+            response_body = response.text[:1000]
+            category = classify_http_error(response.status_code, response_body)
             request_id = response.headers.get("x-request-id")
+            message = (
+                "provider model is unavailable"
+                if category == ErrorCategory.VALIDATION and "model" in response_body.lower()
+                else f"provider returned HTTP {response.status_code}"
+            )
             raise ProviderError(
-                f"provider returned HTTP {response.status_code}",
+                message,
                 category,
                 status_code=response.status_code,
                 retry_after=_retry_after(response.headers),
@@ -301,6 +347,7 @@ class OpenAICompatibleProvider:
         messages: list[dict[str, str]],
         response_format: dict[str, Any],
         *,
+        model: str,
         idempotency_key: str | None = None,
     ) -> ProviderResult:
         response = await self._request(
@@ -308,7 +355,7 @@ class OpenAICompatibleProvider:
             "chat/completions",
             idempotency_key=idempotency_key,
             json={
-                "model": self.profile.text_model,
+                "model": model,
                 "messages": messages,
                 "response_format": response_format,
             },
@@ -324,6 +371,7 @@ class OpenAICompatibleProvider:
         *,
         prompt: str,
         schema: dict[str, Any],
+        model: str,
         idempotency_key: str | None = None,
     ) -> ProviderResult:
         messages = [
@@ -337,14 +385,19 @@ class OpenAICompatibleProvider:
                     "type": "json_schema",
                     "json_schema": {"name": "asset_candidate", "strict": True, "schema": schema},
                 },
+                model=model,
                 idempotency_key=f"{idempotency_key}:schema" if idempotency_key else None,
             )
         except ProviderError as exc:
-            if exc.status_code not in {400, 404, 422}:
+            if (
+                exc.status_code not in {400, 404, 422}
+                or str(exc) == "provider model is unavailable"
+            ):
                 raise
             result = await self._chat(
                 messages,
                 {"type": "json_object"},
+                model=model,
                 idempotency_key=f"{idempotency_key}:fallback" if idempotency_key else None,
             )
 
@@ -363,6 +416,7 @@ class OpenAICompatibleProvider:
             repaired = await self._chat(
                 repair_messages,
                 {"type": "json_object"},
+                model=model,
                 idempotency_key=f"{idempotency_key}:repair" if idempotency_key else None,
             )
             try:
@@ -380,6 +434,7 @@ class OpenAICompatibleProvider:
         prompt: str,
         width: int | None,
         height: int | None,
+        model: str,
         reference: bytes | None = None,
         idempotency_key: str | None = None,
     ) -> ProviderResult:
@@ -394,7 +449,7 @@ class OpenAICompatibleProvider:
                             **({"Idempotency-Key": idempotency_key} if idempotency_key else {}),
                         },
                         data={
-                            "model": self.profile.image_model,
+                            "model": model,
                             "prompt": prompt,
                             "quality": self.profile.quality,
                             "size": f"{width}x{height}" if width and height else "auto",
@@ -404,9 +459,13 @@ class OpenAICompatibleProvider:
             except (httpx.TimeoutException, httpx.NetworkError) as exc:
                 raise ProviderError("provider network request failed", ErrorCategory.NETWORK) from exc
             if response.status_code >= 400:
+                response_body = response.text[:1000]
+                category = classify_http_error(response.status_code, response_body)
                 raise ProviderError(
-                    f"provider returned HTTP {response.status_code}",
-                    classify_http_error(response.status_code, response.text[:1000]),
+                    "provider model is unavailable"
+                    if category == ErrorCategory.VALIDATION and "model" in response_body.lower()
+                    else f"provider returned HTTP {response.status_code}",
+                    category,
                     status_code=response.status_code,
                     retry_after=_retry_after(response.headers),
                     request_id=response.headers.get("x-request-id"),
@@ -417,7 +476,7 @@ class OpenAICompatibleProvider:
                 "images/generations",
                 idempotency_key=idempotency_key,
                 json={
-                    "model": self.profile.image_model,
+                    "model": model,
                     "prompt": prompt,
                     "quality": self.profile.quality,
                     "size": f"{width}x{height}" if width and height else "auto",
@@ -436,15 +495,23 @@ class OpenAICompatibleProvider:
                 ErrorCategory.INVALID_RESPONSE,
             ) from exc
 
-    async def test_connection(self) -> list[str]:
+    async def discover_models(self) -> list[dict[str, Any]]:
         response = await self._request("GET", "models")
         try:
-            return [str(item["id"]) for item in response.json().get("data", []) if "id" in item]
+            data = response.json().get("data", [])
+            if not isinstance(data, list):
+                raise TypeError("models data is not a list")
+            return [dict(item) for item in data if isinstance(item, dict) and item.get("id")]
         except (ValueError, TypeError) as exc:
             raise ProviderError("provider returned an invalid models response", ErrorCategory.INVALID_RESPONSE) from exc
 
+    async def test_connection(self) -> list[str]:
+        return [str(item["id"]) for item in await self.discover_models()]
 
-def build_provider(profile: ProviderProfile, vault: CredentialVault) -> GenerationProvider:
+
+def build_provider(
+    profile: ProviderProfile | ProviderRuntimeConfig, vault: CredentialVault
+) -> GenerationProvider:
     if profile.kind == ProviderKind.FAKE.value:
         return FakeProvider(profile)
     key = vault.get(profile.id)

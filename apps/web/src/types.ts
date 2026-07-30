@@ -132,6 +132,26 @@ export interface ProviderProfile {
   allowPrivateNetwork: boolean;
 }
 
+export type ProviderModelModality = "text" | "image";
+
+export interface ProviderModelRecord {
+  id: string;
+  modalities: ProviderModelModality[];
+  classification: "provider" | "heuristic" | "manual" | "unknown";
+  available: boolean;
+}
+
+export interface ProviderDefaultRoute {
+  provider_profile_id: string;
+  model: string;
+}
+
+export interface ProviderDefaults {
+  text: ProviderDefaultRoute | null;
+  image: ProviderDefaultRoute | null;
+  updated_at: string | null;
+}
+
 export type GenerationTaskKind = "text" | "image" | "image_edit";
 
 export interface GenerationTaskInput {
@@ -139,6 +159,8 @@ export interface GenerationTaskInput {
   kind: GenerationTaskKind;
   asset_id: string;
   prompt: string;
+  provider_profile_id?: string;
+  model?: string;
   schema?: Record<string, unknown>;
   depends_on: string[];
   width?: number;
@@ -151,7 +173,7 @@ export interface GenerationTaskInput {
 
 export interface GenerationPlanInput {
   project_id: string;
-  provider_profile_id: string;
+  provider_profile_id?: string;
   name: string;
   tasks: GenerationTaskInput[];
   extra_call_budget: number;
@@ -164,10 +186,17 @@ export interface GenerationProviderProfile {
   id: string;
   name: string;
   kind: string;
+  base_url: string;
   text_model: string;
   image_model: string;
+  quality: "low" | "medium" | "high";
   concurrency: number;
+  max_retries: number;
+  allow_private_network: boolean;
   pricing: Record<string, number> | null;
+  is_active: boolean;
+  models: ProviderModelRecord[];
+  models_refreshed_at: string | null;
   is_unlocked: boolean;
 }
 
@@ -212,6 +241,7 @@ export interface GenerationJobRun {
   lease_expires_at: string | null;
   heartbeat_at: string | null;
   resolved_request: Record<string, unknown>;
+  provider_snapshot: Record<string, unknown>;
   pending_action_id: string | null;
   created_at: string;
   updated_at: string;

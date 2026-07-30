@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   type ColumnDef,
@@ -48,10 +48,14 @@ import {
   emptyWorkbenchPayload,
   createAssetRevision,
   fetchAssetDetails,
+  fetchGenerationProviders,
   fetchWorkbench,
+  refreshProviderModels,
   submitReview,
   subscribeToJobEvents,
+  unlockProvider,
 } from "./lib/api";
+import { readCredential } from "./lib/credentials";
 import { assetSubtypeLabel } from "./lib/labels";
 import type { GameAsset, JobSummary, ProjectSummary, ReviewStatus } from "./types";
 
@@ -111,6 +115,26 @@ function matchesSearch(asset: GameAsset, search: string) {
     .includes(value);
 }
 
+function modelCacheIsStale(refreshedAt: string | null): boolean {
+  if (!refreshedAt) return true;
+  const refreshed = Date.parse(refreshedAt);
+  return !Number.isFinite(refreshed) || Date.now() - refreshed > 24 * 60 * 60 * 1000;
+}
+
+async function unlockActiveProviderCredentials(): Promise<void> {
+  const providers = (await fetchGenerationProviders()).filter((provider) => provider.is_active);
+  await Promise.allSettled(providers.map(async (provider) => {
+    if (provider.kind !== "fake") {
+      const apiKey = await readCredential(provider.id);
+      if (!apiKey) return;
+      await unlockProvider(provider.id, apiKey);
+    }
+    if (provider.models.length === 0 || modelCacheIsStale(provider.models_refreshed_at)) {
+      await refreshProviderModels(provider.id);
+    }
+  }));
+}
+
 function AssetPreview({ asset }: { asset: GameAsset }) {
   if (asset.preview.kind === "content") {
     return (
@@ -144,6 +168,7 @@ export function Workbench() {
     queryKey: ["workbench"],
     queryFn: fetchWorkbench,
   });
+  const providerBootstrapStarted = useRef(false);
   const data = isError ? emptyWorkbenchPayload : (queryData ?? emptyWorkbenchPayload);
   const [assets, setAssets] = useState<GameAsset[]>([]);
   const [job, setJob] = useState<JobSummary>(emptyWorkbenchPayload.job);
@@ -167,6 +192,18 @@ export function Workbench() {
   const [planSeedAssetIds, setPlanSeedAssetIds] = useState<string[]>([]);
   const [runInspectorPlanId, setRunInspectorPlanId] = useState<string | null>(null);
   const [runFocusAssetIds, setRunFocusAssetIds] = useState<string[]>([]);
+
+  useEffect(() => {
+    if (isError || isLoading) {
+      if (isError) providerBootstrapStarted.current = false;
+      return;
+    }
+    if (providerBootstrapStarted.current) return;
+    providerBootstrapStarted.current = true;
+    void unlockActiveProviderCredentials().catch(() => {
+      providerBootstrapStarted.current = false;
+    });
+  }, [isError, isLoading]);
 
   const openProjectDialog = (project: ProjectSummary | null = null) => {
     setProjectToEdit(project);

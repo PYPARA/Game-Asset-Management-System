@@ -6,7 +6,7 @@
 
 ## 当前实现边界（2026-07-30）
 
-M2 已实现生成计划显式确认、DAG 真实数据流、provider/plan 双重并发、lease/heartbeat、幂等 Attempt、预算、崩溃恢复、持久事件、Finding、Evidence、白名单 RemediationAction 和确定性媒体 Worker。Web 运行检查器允许人工查看证据并执行 `retry`、`tool_repair`、`regenerate`、`image_edit` 或 `await_user`，因此 Codex 不可用不会阻断确定性生产。
+M2.1 已实现生成计划显式确认、任务级冻结供应商/模型、跨供应商 DAG 真实数据流、计划/供应商独立并发、lease/heartbeat、幂等 Attempt、预算、崩溃恢复、持久事件、Finding、Evidence、白名单 RemediationAction 和确定性媒体 Worker。Web 运行检查器允许人工查看证据并执行 `retry`、`tool_repair`、`regenerate`、`image_edit` 或 `await_user`，因此 Codex 不可用不会阻断确定性生产；模型不可用也不会自动切换路由。
 
 尚未实现的是 M4 的 Codex SDK/App Server 适配、AgentSession、自动语义/视觉诊断、Agent 结构化动作提案和 ChangeSet；M3 的 Manifest v2、外部 checkout Delivery 与 `gams-lock.json` 也不属于 M2。
 

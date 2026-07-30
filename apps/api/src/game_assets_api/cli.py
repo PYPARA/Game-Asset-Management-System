@@ -5,6 +5,7 @@ import json
 from typing import Any
 
 import uvicorn
+from sqlalchemy import select
 
 from .database import Database
 from .domain import ProviderKind, RunInspectRead
@@ -47,7 +48,13 @@ def _print(value: Any, *, as_json: bool) -> None:
         )
         for job in value["jobs"]:
             reason = f" — {job['error_message']}" if job.get("error_message") else ""
-            print(f"{job['task_id']}: {job['status']} / {job['stage']}{reason}")
+            snapshot = job.get("provider_snapshot") or {}
+            provider = snapshot.get("name") or job.get("provider_profile_id") or "unknown-provider"
+            model = snapshot.get("model") or (job.get("request") or {}).get("model") or "unknown-model"
+            print(
+                f"{job['task_id']}: {job['status']} / {job['stage']} "
+                f"[{provider} / {model}]{reason}"
+            )
         return
     print(value)
 
@@ -69,11 +76,18 @@ def _resume(settings: Settings, plan_id: str, *, as_json: bool) -> int:
         plan = session.get(GenerationPlan, plan_id)
         if plan is None:
             raise SystemExit(f"generation plan not found: {plan_id}")
-        profile = session.get(ProviderProfile, plan.provider_profile_id)
+        available_provider_ids = {
+            profile.id
+            for profile in session.scalars(
+                select(ProviderProfile).where(
+                    ProviderProfile.kind == ProviderKind.FAKE.value
+                )
+            ).all()
+        }
         jobs = resume_recoverable_jobs(
             session,
             plan=plan,
-            credentials_available=bool(profile and profile.kind == ProviderKind.FAKE.value),
+            available_provider_ids=available_provider_ids,
         )
         payload = [
             {

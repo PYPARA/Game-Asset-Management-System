@@ -3,6 +3,7 @@ import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Workbench } from "../Workbench";
+import { deleteCredential, saveCredential } from "../lib/credentials";
 
 function json(payload: unknown, status = 200) {
   return Promise.resolve(
@@ -13,14 +14,18 @@ function json(payload: unknown, status = 200) {
   );
 }
 
-function mockAssetApi(jobs: unknown[] = []) {
+interface MockAssetApiOptions {
+  providers?: Array<Record<string, unknown>>;
+  failUnlockIds?: Set<string>;
+}
+
+function mockAssetApi(jobs: unknown[] = [], options: MockAssetApiOptions = {}) {
   const assets = [
     { id: "asset-shen", key: "portrait.shen-yan.neutral", title: "沈渊（文官）· 中立姿态" },
     { id: "asset-han", key: "portrait.han-lie.resolute", title: "韩烈（大将军）· 坚毅" },
   ];
-  vi.stubGlobal(
-    "fetch",
-    vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+  const unlocked = new Set<string>();
+  const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url === "/api/projects") {
         return json([{ id: "project-1", name: "真实项目", root_path: "/tmp/project" }]);
@@ -41,7 +46,30 @@ function mockAssetApi(jobs: unknown[] = []) {
         );
       }
       if (url.startsWith("/api/jobs?")) return json(jobs);
-      if (url === "/api/providers") return json([]);
+      if (url === "/api/providers") {
+        return json((options.providers ?? []).map((provider) => ({
+          ...provider,
+          is_unlocked: unlocked.has(String(provider.id)),
+        })));
+      }
+      if (url === "/api/provider-defaults") return json({ text: null, image: null, updated_at: null });
+      const unlockMatch = /^\/api\/providers\/([^/]+)\/unlock$/.exec(url);
+      if (unlockMatch && init?.method === "POST") {
+        const providerId = decodeURIComponent(unlockMatch[1]);
+        if (options.failUnlockIds?.has(providerId)) {
+          return json({ detail: `unlock failed for ${providerId}` }, 401);
+        }
+        unlocked.add(providerId);
+        return json({ detail: "provider unlocked for this process" });
+      }
+      if (url === "/api/system") {
+        return json({
+          projects_root: "/tmp/projects",
+          state_dir: "/tmp/state",
+          project_workspace: "<project>/workspace",
+          credential_store: "browser IndexedDB",
+        });
+      }
       if (url.startsWith("/api/relations?")) return json([]);
       if (url.startsWith("/api/revisions?asset_id=")) {
         const assetId = new URL(url, "http://local").searchParams.get("asset_id");
@@ -84,8 +112,9 @@ function mockAssetApi(jobs: unknown[] = []) {
       }
       if (url === "/api/reviews" && init?.method === "POST") return json({ id: "review-1" }, 201);
       throw new Error(`unexpected request: ${url}`);
-    }),
-  );
+    });
+  vi.stubGlobal("fetch", fetchMock);
+  return fetchMock;
 }
 
 function renderWorkbench() {
@@ -161,14 +190,89 @@ describe("制作台", () => {
   });
 
   it("打开供应商抽屉并明确凭据安全边界", async () => {
+    mockAssetApi();
     const user = userEvent.setup();
     renderWorkbench();
 
     await user.click(screen.getByRole("button", { name: "供应商设置" }));
 
-    expect(screen.getByRole("dialog", { name: "连接与凭据" })).toBeInTheDocument();
-    expect(screen.getByText("本地持久凭据的边界")).toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "供应商与模型机架" })).toBeInTheDocument();
+    expect(screen.getByText("本机安全边界")).toBeInTheDocument();
     expect(screen.getByText(/无法抵御同源脚本注入/)).toBeInTheDocument();
+  });
+
+  it("启动时逐个解锁活动供应商，并隔离单个凭据失败", async () => {
+    const user = userEvent.setup();
+    const failedProviderId = "provider-unlock-failed";
+    const readyProviderId = "provider-unlock-ready";
+    await Promise.all([
+      saveCredential(failedProviderId, "sk-failed"),
+      saveCredential(readyProviderId, "sk-ready"),
+    ]);
+    const providers = [
+      {
+        id: failedProviderId,
+        name: "锁定供应商",
+        kind: "openai_compatible",
+        base_url: "https://locked.example/v1",
+        text_model: "locked-text",
+        image_model: "locked-image",
+        quality: "high",
+        concurrency: 2,
+        max_retries: 2,
+        allow_private_network: false,
+        is_active: true,
+        models: [{ id: "locked-text", modalities: ["text"], classification: "manual", available: true }],
+        models_refreshed_at: new Date().toISOString(),
+      },
+      {
+        id: readyProviderId,
+        name: "已解锁供应商",
+        kind: "openai_compatible",
+        base_url: "https://ready.example/v1",
+        text_model: "ready-text",
+        image_model: "ready-image",
+        quality: "high",
+        concurrency: 2,
+        max_retries: 2,
+        allow_private_network: false,
+        is_active: true,
+        models: [{ id: "ready-text", modalities: ["text"], classification: "manual", available: true }],
+        models_refreshed_at: new Date().toISOString(),
+      },
+    ];
+    const fetchMock = mockAssetApi([], {
+      providers,
+      failUnlockIds: new Set([failedProviderId]),
+    });
+
+    try {
+      renderWorkbench();
+      await screen.findByText("本地模式");
+      await waitFor(() => {
+        const unlockCalls = fetchMock.mock.calls.filter(([input, init]) =>
+          String(input).endsWith("/unlock") && init?.method === "POST",
+        );
+        expect(unlockCalls).toHaveLength(2);
+      });
+      expect(fetchMock).toHaveBeenCalledWith(
+        `/api/providers/${failedProviderId}/unlock`,
+        expect.objectContaining({ method: "POST", body: JSON.stringify({ api_key: "sk-failed" }) }),
+      );
+      expect(fetchMock).toHaveBeenCalledWith(
+        `/api/providers/${readyProviderId}/unlock`,
+        expect.objectContaining({ method: "POST", body: JSON.stringify({ api_key: "sk-ready" }) }),
+      );
+
+      await user.click(screen.getByRole("button", { name: "供应商设置" }));
+      expect(await screen.findByRole("button", { name: /锁定供应商.*凭据锁定/ })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /已解锁供应商.*已解锁/ })).toBeInTheDocument();
+    } finally {
+      await Promise.all([
+        deleteCredential(failedProviderId),
+        deleteCredential(readyProviderId),
+      ]);
+    }
   });
 
   it("启用计划编辑器和批量需要重做入口", async () => {

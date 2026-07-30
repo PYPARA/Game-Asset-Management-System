@@ -50,6 +50,12 @@ from .models import (
     new_id,
     utcnow,
 )
+from .provider_catalog import (
+    default_route,
+    model_is_compatible,
+    provider_snapshot,
+    required_modality,
+)
 from .qa import inspect_image
 from .storage import (
     ProjectStore,
@@ -963,12 +969,14 @@ def _scan_project(session: Session, project: Project) -> ScanReport:
 
 def validate_plan(session: Session, payload: GenerationPlanCreate) -> list[dict[str, Any]]:
     require(session, Project, payload.project_id, "project")
-    require(session, ProviderProfile, payload.provider_profile_id, "provider profile")
+    if payload.provider_profile_id:
+        require(session, ProviderProfile, payload.provider_profile_id, "provider profile")
     ids = [task.id for task in payload.tasks]
     if len(ids) != len(set(ids)):
         raise ServiceError(422, "generation task ids must be unique")
     task_ids = set(ids)
     tasks = {task.id: task for task in payload.tasks}
+    resolved: list[dict[str, Any]] = []
     for task in payload.tasks:
         asset = require(session, Asset, task.asset_id, "task asset")
         if asset.project_id != payload.project_id:
@@ -995,6 +1003,31 @@ def validate_plan(session: Session, payload: GenerationPlanCreate) -> list[dict[
             task.reference_path or task.reference_task_id or task.depends_on
         ):
             raise ServiceError(422, f"image edit task {task.id} requires a reference input")
+        default_provider_id, default_model = default_route(session, task.kind)
+        provider_id = task.provider_profile_id or payload.provider_profile_id or default_provider_id
+        if not provider_id:
+            raise ServiceError(422, f"task {task.id} requires a provider route")
+        profile = require(session, ProviderProfile, provider_id, "task provider profile")
+        if not profile.is_active:
+            raise ServiceError(422, f"task {task.id} references an archived provider")
+        if task.model:
+            model = task.model.strip()
+        elif task.provider_profile_id or payload.provider_profile_id:
+            model = profile.text_model if task.kind == TaskKind.TEXT else profile.image_model
+        else:
+            model = (default_model or "").strip()
+        if not model:
+            raise ServiceError(422, f"task {task.id} requires a provider model")
+        modality = required_modality(task.kind)
+        if not model_is_compatible(profile, model, modality):
+            raise ServiceError(
+                422,
+                f"task {task.id} model {model} is not classified for {modality}",
+            )
+        task_data = task.model_dump(mode="json", by_alias=True)
+        task_data["provider_profile_id"] = profile.id
+        task_data["model"] = model
+        resolved.append(task_data)
     visiting: set[str] = set()
     visited: set[str] = set()
 
@@ -1011,30 +1044,39 @@ def validate_plan(session: Session, payload: GenerationPlanCreate) -> list[dict[
 
     for task_id in task_ids:
         visit(task_id)
-    return [task.model_dump(mode="json", by_alias=True) for task in payload.tasks]
+    return resolved
+
+
+def _task_price(profile: ProviderProfile, task_kind: str) -> float | None:
+    if not profile.pricing:
+        return None
+    key = "text_call" if task_kind == TaskKind.TEXT.value else "image_call"
+    if task_kind == TaskKind.IMAGE_EDIT.value and "image_edit_call" in profile.pricing:
+        key = "image_edit_call"
+    value = profile.pricing.get(key)
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def create_plan(session: Session, payload: GenerationPlanCreate) -> GenerationPlan:
     tasks = validate_plan(session, payload)
-    profile = require(session, ProviderProfile, payload.provider_profile_id, "provider profile")
-    estimated_cost: float | None = None
-    if profile.pricing:
-        total = 0.0
-        known = True
-        for task in payload.tasks:
-            if task.kind == TaskKind.TEXT:
-                price_key = "text_call"
-            elif task.kind == TaskKind.IMAGE_EDIT and "image_edit_call" in profile.pricing:
-                price_key = "image_edit_call"
-            else:
-                price_key = "image_call"
-            price = profile.pricing.get(price_key)
-            if price is None:
-                known = False
-                break
-            total += float(price)
-        if known:
-            estimated_cost = total
+    total = 0.0
+    known = True
+    for task in tasks:
+        profile = require(
+            session,
+            ProviderProfile,
+            str(task["provider_profile_id"]),
+            "task provider profile",
+        )
+        price = _task_price(profile, str(task["kind"]))
+        if price is None:
+            known = False
+        else:
+            total += price
+    estimated_cost: float | None = total if known else None
     suggested_extra_calls = max(2, math.ceil(len(tasks) * 0.2))
     extra_call_budget = (
         suggested_extra_calls
@@ -1044,7 +1086,7 @@ def create_plan(session: Session, payload: GenerationPlanCreate) -> GenerationPl
     plan = GenerationPlan(
         id=new_id(),
         project_id=payload.project_id,
-        provider_profile_id=payload.provider_profile_id,
+        provider_profile_id=payload.provider_profile_id or str(tasks[0]["provider_profile_id"]),
         name=payload.name.strip(),
         status="draft",
         tasks_json=tasks,
@@ -1061,25 +1103,40 @@ def create_plan(session: Session, payload: GenerationPlanCreate) -> GenerationPl
     return plan
 
 
-def confirm_plan(session: Session, plan: GenerationPlan, *, credentials_available: bool) -> list[GenerationJob]:
+def confirm_plan(
+    session: Session,
+    plan: GenerationPlan,
+    *,
+    available_provider_ids: set[str],
+) -> list[GenerationJob]:
     if plan.status != "draft":
         return session.scalars(select(GenerationJob).where(GenerationJob.plan_id == plan.id)).all()
-    profile = require(session, ProviderProfile, plan.provider_profile_id, "provider profile")
-    initial_status = (
-        GenerationStatus.QUEUED.value
-        if profile.kind == "fake" or credentials_available
-        else GenerationStatus.CREDENTIALS_LOCKED.value
-    )
     jobs = []
     for task in plan.tasks_json:
+        provider_id = str(task.get("provider_profile_id") or plan.provider_profile_id)
+        profile = require(session, ProviderProfile, provider_id, "task provider profile")
+        if not profile.is_active:
+            raise ServiceError(409, f"provider {profile.name} was archived before confirmation")
+        initial_status = (
+            GenerationStatus.QUEUED.value
+            if profile.kind == "fake" or profile.id in available_provider_ids
+            else GenerationStatus.CREDENTIALS_LOCKED.value
+        )
+        model = str(
+            task.get("model")
+            or (profile.text_model if task.get("kind") == TaskKind.TEXT.value else profile.image_model)
+        )
+        task["provider_profile_id"] = profile.id
+        task["model"] = model
         job = GenerationJob(
             id=new_id(),
             plan_id=plan.id,
             project_id=plan.project_id,
-            provider_profile_id=plan.provider_profile_id,
+            provider_profile_id=profile.id,
             task_id=str(task["id"]),
             task_kind=str(task["kind"]),
             request_json=task,
+            provider_snapshot_json=provider_snapshot(profile, model=model),
             status=initial_status,
             stage=RunStage.QUEUED.value,
         )
@@ -1089,9 +1146,9 @@ def confirm_plan(session: Session, plan: GenerationPlan, *, credentials_availabl
         if asset:
             asset.generation_status = GenerationStatus.PLANNED.value
     plan.status = (
-        "confirmed"
-        if initial_status == GenerationStatus.QUEUED.value
-        else GenerationStatus.CREDENTIALS_LOCKED.value
+        GenerationStatus.CREDENTIALS_LOCKED.value
+        if jobs and all(job.status == GenerationStatus.CREDENTIALS_LOCKED.value for job in jobs)
+        else "confirmed"
     )
     plan.confirmed_at = utcnow()
     from .production import record_run_event
@@ -1109,6 +1166,14 @@ def confirm_plan(session: Session, plan: GenerationPlan, *, credentials_availabl
             "max_paid_remediation_rounds": plan.max_paid_remediation_rounds,
             "max_transport_retries": plan.max_transport_retries,
             "max_concurrency": plan.max_concurrency,
+            "routes": [
+                {
+                    "task_id": job.task_id,
+                    "provider_profile_id": job.provider_profile_id,
+                    "model": job.request_json.get("model"),
+                }
+                for job in jobs
+            ],
         },
     )
     for job in jobs:
@@ -1121,7 +1186,12 @@ def confirm_plan(session: Session, plan: GenerationPlan, *, credentials_availabl
             event_type="run.queued",
             stage=job.stage,
             causation_id=confirmation.id,
-            data={"task_id": job.task_id, "status": job.status},
+            data={
+                "task_id": job.task_id,
+                "status": job.status,
+                "provider_profile_id": job.provider_profile_id,
+                "model": job.request_json.get("model"),
+            },
         )
     session.commit()
     return jobs

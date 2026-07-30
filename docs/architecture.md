@@ -21,7 +21,7 @@ workspace/     候选、驳回、QA 报告、缓存和日志
 
 1. Catalog 描述稳定 Key、类型、关系和当前/候选修订指针。
 2. 新修订以规范 JSON 哈希写入 `history/objects/<prefix>/<hash>.json`；媒体 rendition 内嵌在媒体修订中。
-3. 用户在 Web 中冻结生成 DAG、Prompt、尺寸、Schema、参考输入、并发和预算并显式确认。Controller 以 provider/plan 双重并发执行任务，lease、heartbeat、Attempt 和事件写入 SQLite。
+3. 用户在 Web 中为每项任务选择供应商和模型，并冻结生成 DAG、Prompt、尺寸、Schema、参考输入、并发和预算后显式确认。Controller 同时实施计划总并发与各供应商独立并发，lease、heartbeat、Attempt、冻结供应商快照和事件写入 SQLite。
 4. 供应商输出先写入 `workspace/candidates` 并进入 `output_received`；DAG 下游接收上游修订、内容哈希与真实产物。重启只恢复已落盘输出、确定性 Worker 或已知可重试错误，未知交付进入 `awaiting_user`。
 5. 图片归一化后执行硬 QA，生成 Finding、联系表和对比证据。QA fail 进入 `awaiting_user`；人工可选择注册 Worker、重试、重新生成或图像编辑，所有动作校验输入哈希和预算后才入队。
 6. 人工批准媒体时，把原始来源提升到 `production/sources/<hash>`、运行媒体提升到 `approved/objects/<hash>`，写入 Artifact 元数据和只引用耐久对象的 promotion 修订，最后更新 Catalog 指针。
@@ -29,6 +29,14 @@ workspace/     候选、驳回、QA 报告、缓存和日志
 8. Release v1 对全部已批准资产执行 fail-closed 预检，成功后写不可变 Manifest；`target_path` 仅作为后续 Delivery 的逻辑目标，Release 不再从 workspace 发布媒体。
 
 SQLite 是可重建索引。项目扫描会按磁盘权威状态重建资产、修订、Artifact、rendition、QA、审核、关系和 Release；任务队列等本地运行状态继续保存在 SQLite。
+
+## 多供应商与模型路由
+
+供应商配置属于本机运行层，不进入 Project。每个活动配置独立保存 OpenAI 兼容 Base URL、默认文字/图片模型、模型缓存、并发、重试和价格；API Key 例外，只以浏览器 IndexedDB 加密记录和后端进程内明文存在。
+
+全局文字与图片默认路由只在建立新任务时读取。文字任务使用文字路由，图片生成和图片编辑使用图片路由；草稿建立后，默认值变化不会改写已有任务。任务可覆盖供应商和模型，未分类或手填模型会警告，明确不兼容的模型会阻止确认。
+
+计划确认时，每个 Job 保存供应商 ID、显式模型和不含凭据的运行快照，包括 Base URL、质量、并发、重试与价格。Runner 始终使用该快照和模型；后续编辑或归档供应商不会改写已确认 Job。凭据锁定只暂停对应供应商任务，跨供应商下游继续等待上游；模型不可用写入 `provider.model_unavailable` 并等待人工，不执行模型替换、负载均衡或故障转移。
 
 ## 四层架构与实现边界
 
@@ -74,6 +82,8 @@ Web 制作台是 Controller 的客户端，不另建业务事实源。Codex 目�
 - Project 容器默认位于 `~/Library/Mobile Documents/com~apple~CloudDocs/Game-Projects`。
 - SQLite、WAL 和运行状态位于本机 `~/Library/Application Support/Game-Asset-Management-System`，不由 iCloud 或 Git 同步。
 - `project.local.yaml` 保存本机游戏 checkout 绑定并被 Git 忽略。
+- 供应商配置、模型缓存、全局默认路由和冻结 Job 快照位于本机 SQLite；删除数据库会丢失这些本机设置与未完成运行，但不会丢失 Project 正式事实。
+- 浏览器 IndexedDB 按供应商 ID 保存加密 API Key；Web 连接本地后端后逐个解锁活动供应商，单个失败不会阻止其他供应商。
 - `Game-Projects` 是统一父 Git 仓库；Project 不创建嵌套仓库，媒体使用普通 Git。
 - iCloud 不提供跨机器写锁；同一 Project 不能由多台机器同时写入，并应在使用前保持完整下载。
 
@@ -82,5 +92,5 @@ Web 制作台是 Controller 的客户端，不另建业务事实源。Codex 目�
 - 所有相对路径必须通过项目根目录逃逸检查。
 - 修订、审核和 Release 记录不可变。
 - 写入使用 Project 锁和原子替换。
-- API 只绑定回环地址；凭据不写磁盘、数据库或日志。
+- API 只绑定回环地址；API Key 明文不写 Project、SQLite、Job 快照、事件或日志，浏览器磁盘上只保存加密凭据。
 - GAMS 与 Codex 都不执行 `git add`、commit、push 或历史改写。

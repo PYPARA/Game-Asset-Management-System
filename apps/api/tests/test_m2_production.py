@@ -144,6 +144,7 @@ class SlowFakeProvider:
         *,
         prompt: str,
         schema: dict[str, Any],
+        model: str,
         idempotency_key: str | None = None,
     ) -> ProviderResult:
         return await self._tracked(
@@ -151,6 +152,7 @@ class SlowFakeProvider:
             lambda: self._delegate.structured_text(
                 prompt=prompt,
                 schema=schema,
+                model=model,
                 idempotency_key=idempotency_key,
             ),
         )
@@ -161,6 +163,7 @@ class SlowFakeProvider:
         prompt: str,
         width: int | None,
         height: int | None,
+        model: str,
         reference: bytes | None = None,
         idempotency_key: str | None = None,
     ) -> ProviderResult:
@@ -170,6 +173,7 @@ class SlowFakeProvider:
                 prompt=prompt,
                 width=width,
                 height=height,
+                model=model,
                 reference=reference,
                 idempotency_key=idempotency_key,
             ),
@@ -177,6 +181,9 @@ class SlowFakeProvider:
 
     async def test_connection(self) -> list[str]:
         return await self._delegate.test_connection()
+
+    async def discover_models(self) -> list[dict[str, Any]]:
+        return await self._delegate.discover_models()
 
 
 def test_provider_and_plan_concurrency_are_hard_limits(
@@ -998,6 +1005,21 @@ def test_legacy_sqlite_schema_upgrades_without_reset(tmp_path: Path) -> None:
     with sqlite3.connect(database_path) as connection:
         connection.executescript(
             """
+            CREATE TABLE provider_profiles (
+                id VARCHAR(36) PRIMARY KEY,
+                name VARCHAR(160) NOT NULL,
+                kind VARCHAR(40) NOT NULL,
+                base_url TEXT NOT NULL,
+                text_model VARCHAR(160) NOT NULL,
+                image_model VARCHAR(160) NOT NULL,
+                quality VARCHAR(40) NOT NULL,
+                concurrency INTEGER NOT NULL,
+                max_retries INTEGER NOT NULL,
+                allow_private_network BOOLEAN NOT NULL,
+                pricing JSON,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL
+            );
             CREATE TABLE generation_plans (
                 id VARCHAR(36) PRIMARY KEY,
                 project_id VARCHAR(36) NOT NULL,
@@ -1039,6 +1061,11 @@ def test_legacy_sqlite_schema_upgrades_without_reset(tmp_path: Path) -> None:
                 started_at DATETIME NOT NULL,
                 completed_at DATETIME
             );
+            INSERT INTO provider_profiles VALUES (
+                'provider-legacy', 'Legacy provider', 'fake', 'https://fake.invalid/v1',
+                'legacy-text', 'legacy-image', 'high', 2, 1, 0, NULL,
+                '2026-07-01 00:00:00', '2026-07-01 00:00:00'
+            );
             INSERT INTO generation_plans VALUES (
                 'plan-legacy', 'project-legacy', 'provider-legacy', 'draft', '[]', 0,
                 NULL, NULL, '2026-07-01 00:00:00'
@@ -1066,6 +1093,10 @@ def test_legacy_sqlite_schema_upgrades_without_reset(tmp_path: Path) -> None:
         plan_columns = {
             row[1] for row in connection.exec_driver_sql("PRAGMA table_info(generation_plans)")
         }
+        provider_columns = {
+            row[1]
+            for row in connection.exec_driver_sql("PRAGMA table_info(provider_profiles)")
+        }
         job_columns = {
             row[1] for row in connection.exec_driver_sql("PRAGMA table_info(generation_jobs)")
         }
@@ -1087,13 +1118,25 @@ def test_legacy_sqlite_schema_upgrades_without_reset(tmp_path: Path) -> None:
             "SELECT name, extra_call_budget, actual_calls FROM generation_plans "
             "WHERE id = 'plan-legacy'"
         ).one()
+        defaults = connection.exec_driver_sql(
+            "SELECT text_provider_profile_id, text_model, image_provider_profile_id, image_model "
+            "FROM provider_routing_defaults WHERE id = 'global'"
+        ).one()
 
+    assert {"is_active", "models_json", "models_refreshed_at"} <= provider_columns
     assert {"name", "extra_call_budget", "actual_calls", "max_concurrency"} <= plan_columns
-    assert {"stage", "lease_token", "heartbeat_at", "pending_action_id"} <= job_columns
+    assert {
+        "stage",
+        "lease_token",
+        "heartbeat_at",
+        "pending_action_id",
+        "provider_snapshot_json",
+    } <= job_columns
     assert {"phase", "idempotency_key", "output_hash", "billable"} <= attempt_columns
     assert {"run_events", "production_findings", "run_evidence", "remediation_actions"} <= tables
     assert "ix_generation_jobs_lease_expires_at" in indexes
     assert legacy == ("未命名生成计划", 2, 0)
+    assert defaults == ("provider-legacy", "legacy-text", "provider-legacy", "legacy-image")
 
 
 def test_gams_cli_inspects_and_safely_resumes_run(

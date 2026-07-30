@@ -85,6 +85,7 @@ const eventLabels: Record<string, string> = {
   "run.inputs_resolved": "上游输入已解析",
   "provider.call_started": "供应商调用开始",
   "provider.call_failed": "供应商调用失败",
+  "provider.model_unavailable": "模型不可用，等待人工",
   "provider.credentials_locked": "供应商凭据已锁定",
   "artifact.created": "证据或产物已落盘",
   "run.stage_changed": "生产阶段变化",
@@ -131,6 +132,19 @@ function evidenceLabel(item: RunEvidenceItem): string {
 
 function jobAssetId(job: GenerationJobRun): string {
   return typeof job.request?.asset_id === "string" ? job.request.asset_id : "";
+}
+
+function snapshotValue(job: GenerationJobRun, key: string): string {
+  const value = job.provider_snapshot?.[key];
+  return typeof value === "string" && value.trim() ? value : "";
+}
+
+function frozenProviderName(job: GenerationJobRun): string {
+  return snapshotValue(job, "name") || job.provider_profile_id;
+}
+
+function frozenModel(job: GenerationJobRun): string {
+  return snapshotValue(job, "model") || job.request.model || "模型未知";
 }
 
 function suggestedAction(
@@ -360,7 +374,7 @@ export function RunInspectorDrawer({
                   {inspection.jobs.map((job, index) => (
                     <button key={job.id} className={job.id === selectedJobId ? "active" : ""} type="button" onClick={() => setSelectedJobId(job.id)}>
                       <span className="job-causal-number">{String(index + 1).padStart(2, "0")}</span>
-                      <span><strong>{job.task_id}</strong><small>{statusLabels[job.status] ?? job.status} · {stageLabels[job.stage] ?? job.stage}</small></span>
+                      <span><strong>{job.task_id}</strong><small>{statusLabels[job.status] ?? job.status} · {stageLabels[job.stage] ?? job.stage}</small><em>{frozenProviderName(job)} / {frozenModel(job)}</em></span>
                       {job.status === "awaiting_user" ? <WarningCircle size={16} weight="fill" /> : job.status === "candidate_ready" ? <CheckCircle size={16} weight="fill" /> : <ClockCountdown size={16} />}
                     </button>
                   ))}
@@ -377,6 +391,10 @@ export function RunInspectorDrawer({
 
                 {tab === "pipeline" && selectedJob ? (
                   <div className="run-tab-scroll">
+                    <section className="frozen-provider-route">
+                      <span><strong>{frozenProviderName(selectedJob)}</strong><small>冻结供应商 · {selectedJob.provider_profile_id}</small></span>
+                      <b>{frozenModel(selectedJob)}</b>
+                    </section>
                     <section className="stage-sequence">
                       <div className="run-section-heading"><span>阶段状态</span><small>{selectedJob.error_message ?? "当前没有停止原因"}</small></div>
                       <ol>{stages.map((stage, index) => {
@@ -388,7 +406,7 @@ export function RunInspectorDrawer({
                     </section>
                     <section className="attempt-register">
                       <div className="run-section-heading"><span>Attempt 台账</span><small>每次实际供应商请求均独立计数</small></div>
-                      {selectedAttempts.length === 0 ? <p className="run-empty-copy">尚无 Attempt。</p> : <ol>{selectedAttempts.map((attempt) => <li key={attempt.id}><span className={attempt.billable ? "billable" : "worker"}>{attempt.billable ? `调用 ${attempt.number}` : "Worker"}</span><div><strong>{attempt.purpose} · {attempt.phase}</strong><small>{attempt.request_id ?? attempt.idempotency_key ?? "无供应商请求 ID"}</small></div><div><strong>{formatCost(attempt.estimated_cost)}</strong><small>{formatTime(attempt.completed_at ?? attempt.started_at)}</small></div></li>)}</ol>}
+                      {selectedAttempts.length === 0 ? <p className="run-empty-copy">尚无 Attempt。</p> : <ol>{selectedAttempts.map((attempt) => <li key={attempt.id}><span className={attempt.billable ? "billable" : "worker"}>{attempt.billable ? `调用 ${attempt.number}` : "Worker"}</span><div><strong>{attempt.purpose} · {attempt.phase}</strong><em>{frozenProviderName(selectedJob)} / {frozenModel(selectedJob)}</em><small>{attempt.request_id ?? attempt.idempotency_key ?? "无供应商请求 ID"}</small></div><div><strong>{formatCost(attempt.estimated_cost)}</strong><small>{formatTime(attempt.completed_at ?? attempt.started_at)}</small></div></li>)}</ol>}
                     </section>
                     <section className="finding-register">
                       <div className="run-section-heading"><span>Finding</span><small>稳定 code 决定策略切换与停止</small></div>
@@ -407,7 +425,11 @@ export function RunInspectorDrawer({
                 {tab === "events" ? (
                   <div className="run-tab-scroll event-timeline">
                     <div className="run-section-heading"><span>持久事件</span><small>sequence 游标单调递增</small></div>
-                    <ol>{[...inspection.events].reverse().map((event) => <li key={event.id}><span>{event.sequence}</span><div><strong>{eventLabels[event.event_type] ?? event.event_type}</strong><small>{event.stage ? `${stageLabels[event.stage] ?? event.stage} · ` : ""}{formatTime(event.created_at)}</small><p>{Object.keys(event.data).length ? JSON.stringify(event.data) : "无附加数据"}</p></div></li>)}</ol>
+                    <ol>{[...inspection.events].reverse().map((event) => {
+                      const eventJob = inspection.jobs.find((job) => job.id === event.job_id);
+                      const eventModel = typeof event.data.model === "string" ? event.data.model : eventJob ? frozenModel(eventJob) : "";
+                      return <li key={event.id}><span>{event.sequence}</span><div><strong>{eventLabels[event.event_type] ?? event.event_type}</strong><small>{event.stage ? `${stageLabels[event.stage] ?? event.stage} · ` : ""}{formatTime(event.created_at)}</small>{eventJob ? <em>{frozenProviderName(eventJob)}{eventModel ? ` / ${eventModel}` : ""}</em> : null}<p>{Object.keys(event.data).length ? JSON.stringify(event.data) : "无附加数据"}</p></div></li>;
+                    })}</ol>
                   </div>
                 ) : null}
               </section>

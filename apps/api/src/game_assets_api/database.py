@@ -48,6 +48,11 @@ class Database:
         """
 
         columns: dict[str, tuple[tuple[str, str], ...]] = {
+            "provider_profiles": (
+                ("is_active", "BOOLEAN NOT NULL DEFAULT 1"),
+                ("models_json", "JSON NOT NULL DEFAULT '[]'"),
+                ("models_refreshed_at", "DATETIME"),
+            ),
             "generation_plans": (
                 ("name", "VARCHAR(200) NOT NULL DEFAULT '未命名生成计划'"),
                 ("suggested_extra_calls", "INTEGER NOT NULL DEFAULT 2"),
@@ -67,6 +72,7 @@ class Database:
                 ("lease_expires_at", "DATETIME"),
                 ("heartbeat_at", "DATETIME"),
                 ("resolved_request_json", "JSON NOT NULL DEFAULT '{}'"),
+                ("provider_snapshot_json", "JSON NOT NULL DEFAULT '{}'"),
                 ("pending_action_id", "VARCHAR(48)"),
             ),
             "generation_attempts": (
@@ -94,6 +100,7 @@ class Database:
                             f'ALTER TABLE "{table}" ADD COLUMN "{name}" {declaration}'
                         )
             for table, name, column in (
+                ("provider_profiles", "ix_provider_profiles_is_active", "is_active"),
                 ("generation_jobs", "ix_generation_jobs_stage", "stage"),
                 ("generation_jobs", "ix_generation_jobs_lease_owner", "lease_owner"),
                 (
@@ -115,6 +122,25 @@ class Database:
             ):
                 connection.exec_driver_sql(
                     f'CREATE INDEX IF NOT EXISTS "{name}" ON "{table}" ("{column}")'
+                )
+            defaults = connection.exec_driver_sql(
+                "SELECT id FROM provider_routing_defaults WHERE id = 'global'"
+            ).first()
+            if defaults is None:
+                first = connection.exec_driver_sql(
+                    "SELECT id, text_model, image_model FROM provider_profiles "
+                    "WHERE is_active = 1 ORDER BY created_at, id LIMIT 1"
+                ).mappings().first()
+                connection.exec_driver_sql(
+                    "INSERT INTO provider_routing_defaults "
+                    "(id, text_provider_profile_id, text_model, image_provider_profile_id, image_model, updated_at) "
+                    "VALUES ('global', ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                    (
+                        first["id"] if first else None,
+                        first["text_model"] if first else None,
+                        first["id"] if first else None,
+                        first["image_model"] if first else None,
+                    ),
                 )
 
     def session(self) -> Generator[Session, None, None]:

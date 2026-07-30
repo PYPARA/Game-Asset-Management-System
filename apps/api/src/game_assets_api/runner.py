@@ -47,7 +47,13 @@ from .production import (
     record_run_event,
     refresh_plan_status,
 )
-from .providers import CredentialVault, ProviderError, ProviderResult, build_provider
+from .providers import (
+    CredentialVault,
+    ProviderError,
+    ProviderResult,
+    build_provider,
+    provider_runtime_config,
+)
 from .qa import normalize_image
 from .services import ServiceError, asset_descriptor, create_revision, run_qa
 from .settings import Settings
@@ -413,7 +419,6 @@ class JobRunner:
                     GenerationStatus.AWAITING_USER.value,
                     GenerationStatus.FAILED.value,
                     GenerationStatus.CANCELLED.value,
-                    GenerationStatus.CREDENTIALS_LOCKED.value,
                     GenerationStatus.QA_FAILED.value,
                 }
             ),
@@ -485,8 +490,14 @@ class JobRunner:
                     job.error_category = ErrorCategory.VALIDATION.value
                     job.error_message = "job references a missing provider, plan, or asset"
                     continue
-                provider_limit = max(1, profile.concurrency)
-                plan_limit = max(1, min(plan.max_concurrency, provider_limit))
+                try:
+                    provider_limit = max(
+                        1,
+                        int((job.provider_snapshot_json or {}).get("concurrency", profile.concurrency)),
+                    )
+                except (TypeError, ValueError):
+                    provider_limit = max(1, profile.concurrency)
+                plan_limit = max(1, plan.max_concurrency)
                 if provider_counts.get(profile.id, 0) >= provider_limit:
                     continue
                 if plan_counts.get(plan.id, 0) >= plan_limit:
@@ -707,13 +718,18 @@ class JobRunner:
         return (rendition.normalized_path or rendition.source_path) if rendition else None
 
     @staticmethod
-    def _call_price(profile: ProviderProfile, task_kind: str) -> float | None:
-        if not profile.pricing:
+    def _call_price(
+        profile: ProviderProfile,
+        task_kind: str,
+        snapshot: dict[str, Any] | None = None,
+    ) -> float | None:
+        pricing = (snapshot or {}).get("pricing", profile.pricing)
+        if not isinstance(pricing, dict):
             return None
         key = "text_call" if task_kind == TaskKind.TEXT.value else "image_call"
         if task_kind == TaskKind.IMAGE_EDIT.value:
-            key = "image_edit_call" if "image_edit_call" in profile.pricing else "image_call"
-        value = profile.pricing.get(key)
+            key = "image_edit_call" if "image_edit_call" in pricing else "image_call"
+        value = pricing.get(key)
         try:
             return float(value) if value is not None else None
         except (TypeError, ValueError):
@@ -738,7 +754,11 @@ class JobRunner:
             if plan is None or profile is None:
                 raise ProviderError("job plan or provider is missing", ErrorCategory.VALIDATION)
             number = job.attempt_count + 1
-            price = self._call_price(profile, str(request["kind"]))
+            price = self._call_price(
+                profile,
+                str(request["kind"]),
+                job.provider_snapshot_json,
+            )
             attempt = GenerationAttempt(
                 id=new_id(),
                 job_id=job.id,
@@ -773,6 +793,8 @@ class JobRunner:
                     "purpose": purpose,
                     "actual_calls": plan.actual_calls,
                     "estimated_cost": price,
+                    "provider_profile_id": job.provider_profile_id,
+                    "model": request.get("model"),
                 },
             )
             session.commit()
@@ -829,6 +851,15 @@ class JobRunner:
                 session.commit()
                 raise ServiceError(409, "remediation input changed after the action was accepted")
             request = self._resolve_request(session, job, action)
+            if not request.get("model"):
+                request["model"] = str(
+                    job.provider_snapshot_json.get("model")
+                    or (
+                        profile.text_model
+                        if request["kind"] == TaskKind.TEXT.value
+                        else profile.image_model
+                    )
+                )
             schema = request.get("schema")
             if request["kind"] == TaskKind.TEXT.value and schema is None:
                 schema = ProjectStore(project.root_path).read_schema(asset.schema_ref)
@@ -896,10 +927,16 @@ class JobRunner:
             )
             try:
                 with self.sessions() as session:
+                    job_context = session.get(GenerationJob, job_id)
                     profile = session.get(ProviderProfile, profile.id)
-                    if profile is None:
+                    if profile is None or job_context is None:
                         raise ProviderError("provider profile was removed", ErrorCategory.VALIDATION)
-                    provider = build_provider(profile, self.vault)
+                    provider = build_provider(
+                        provider_runtime_config(
+                            profile, job_context.provider_snapshot_json
+                        ),
+                        self.vault,
+                    )
                 result = await self._invoke(
                     provider,
                     job_id=job_id,
@@ -927,6 +964,31 @@ class JobRunner:
                     self._pause_provider_queue(job_id, GenerationStatus.AWAITING_USER.value, exc)
                     return
                 if exc.category == ErrorCategory.CONTENT_POLICY:
+                    self._set_awaiting_user(job_id, str(exc), category=exc.category)
+                    return
+                if (
+                    exc.category == ErrorCategory.VALIDATION
+                    and "model" in str(exc).lower()
+                ):
+                    with self.sessions() as session:
+                        failed_job = session.get(GenerationJob, job_id)
+                        if failed_job:
+                            record_run_event(
+                                session,
+                                plan_id=failed_job.plan_id,
+                                project_id=failed_job.project_id,
+                                job_id=failed_job.id,
+                                asset_id=str(failed_job.request_json.get("asset_id")),
+                                attempt_id=attempt_id,
+                                event_type="provider.model_unavailable",
+                                stage=failed_job.stage,
+                                data={
+                                    "provider_profile_id": failed_job.provider_profile_id,
+                                    "model": request.get("model"),
+                                    "message": str(exc),
+                                },
+                            )
+                            session.commit()
                     self._set_awaiting_user(job_id, str(exc), category=exc.category)
                     return
                 if not exc.retryable or retry_index >= remaining_calls - 1:
@@ -959,6 +1021,7 @@ class JobRunner:
             return await provider.structured_text(
                 prompt=str(request["prompt"]),
                 schema=schema,
+                model=str(request["model"]),
                 idempotency_key=idempotency_key,
             )
         reference = None
@@ -979,6 +1042,7 @@ class JobRunner:
             prompt=str(request["prompt"]),
             width=request.get("width"),
             height=request.get("height"),
+            model=str(request["model"]),
             reference=reference,
             idempotency_key=idempotency_key,
         )
@@ -1159,12 +1223,9 @@ class JobRunner:
                 raise ServiceError(422, "job references missing staging records")
             request = job.resolved_request_json or job.request_json
             provider_snapshot = {
+                **(job.provider_snapshot_json or {}),
                 "profile_id": profile.id,
-                "kind": profile.kind,
-                "base_url": profile.base_url,
-                "text_model": profile.text_model,
-                "image_model": profile.image_model,
-                "quality": profile.quality,
+                "model": request.get("model"),
                 "request_id": result.request_id,
                 "attempt_id": attempt.id,
                 "idempotency_key": attempt.idempotency_key,

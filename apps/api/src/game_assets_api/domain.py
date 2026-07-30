@@ -292,16 +292,66 @@ class ArtifactRead(ORMModel):
 
 
 class ProviderCreate(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=160)
     kind: ProviderKind = ProviderKind.OPENAI_COMPATIBLE
     base_url: str = "https://api.openai.com/v1"
-    text_model: str = "gpt-5.1"
-    image_model: str = "gpt-image-2"
+    text_model: str = Field(default="gpt-5.1", min_length=1, max_length=160)
+    image_model: str = Field(default="gpt-image-2", min_length=1, max_length=160)
     quality: str = "high"
     concurrency: int = Field(default=6, ge=1, le=32)
     max_retries: int = Field(default=2, ge=0, le=8)
     allow_private_network: bool = False
     pricing: dict[str, Any] | None = None
+
+
+class ProviderUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=160)
+    base_url: str | None = None
+    text_model: str | None = Field(default=None, min_length=1, max_length=160)
+    image_model: str | None = Field(default=None, min_length=1, max_length=160)
+    quality: str | None = None
+    concurrency: int | None = Field(default=None, ge=1, le=32)
+    max_retries: int | None = Field(default=None, ge=0, le=8)
+    allow_private_network: bool | None = None
+    pricing: dict[str, Any] | None = None
+
+
+class ProviderModelRead(BaseModel):
+    id: str
+    modalities: list[Literal["text", "image"]] = Field(default_factory=list)
+    classification: Literal["provider", "heuristic", "manual", "unknown"] = "unknown"
+    available: bool = True
+
+
+class ProviderModelsRead(BaseModel):
+    provider_profile_id: str
+    models: list[ProviderModelRead] = Field(default_factory=list)
+    refreshed_at: datetime | None = None
+
+
+class ProviderModelOverride(BaseModel):
+    id: str = Field(min_length=1, max_length=240)
+    modalities: list[Literal["text", "image"]] = Field(default_factory=list)
+
+
+class ProviderModelsUpdate(BaseModel):
+    models: list[ProviderModelOverride] = Field(default_factory=list)
+
+
+class ProviderDefaultRoute(BaseModel):
+    provider_profile_id: str
+    model: str = Field(min_length=1, max_length=160)
+
+
+class ProviderDefaultsUpdate(BaseModel):
+    text: ProviderDefaultRoute | None = None
+    image: ProviderDefaultRoute | None = None
+
+
+class ProviderDefaultsRead(BaseModel):
+    text: ProviderDefaultRoute | None = None
+    image: ProviderDefaultRoute | None = None
+    updated_at: datetime | None = None
 
 
 class ProviderRead(ORMModel):
@@ -316,6 +366,11 @@ class ProviderRead(ORMModel):
     max_retries: int
     allow_private_network: bool
     pricing: dict[str, Any] | None
+    is_active: bool = True
+    models: list[ProviderModelRead] = Field(
+        default_factory=list, validation_alias="models_json"
+    )
+    models_refreshed_at: datetime | None = None
     is_unlocked: bool = False
     created_at: datetime
     updated_at: datetime
@@ -332,6 +387,8 @@ class GenerationTask(BaseModel):
     kind: TaskKind
     asset_id: str
     prompt: str
+    provider_profile_id: str | None = None
+    model: str | None = Field(default=None, min_length=1, max_length=160)
     output_schema: dict[str, Any] | None = Field(
         default=None, validation_alias="schema", serialization_alias="schema"
     )
@@ -348,7 +405,7 @@ class GenerationTask(BaseModel):
 
 class GenerationPlanCreate(BaseModel):
     project_id: str
-    provider_profile_id: str
+    provider_profile_id: str | None = None
     name: str = Field(default="未命名生成计划", min_length=1, max_length=200)
     tasks: list[GenerationTask] = Field(min_length=1)
     extra_call_budget: int | None = Field(default=None, ge=0, le=10_000)
@@ -400,6 +457,9 @@ class GenerationJobRead(ORMModel):
     heartbeat_at: datetime | None
     resolved_request: dict[str, Any] = Field(
         default_factory=dict, validation_alias="resolved_request_json"
+    )
+    provider_snapshot: dict[str, Any] = Field(
+        default_factory=dict, validation_alias="provider_snapshot_json"
     )
     pending_action_id: str | None
     created_at: datetime
