@@ -16,7 +16,10 @@ from .domain import (
     RunStage,
 )
 from .models import (
+    AgentEvent,
+    AgentSession,
     AssetRevision,
+    ChangeSet,
     GenerationAttempt,
     GenerationJob,
     GenerationPlan,
@@ -167,6 +170,36 @@ def inspect_run(session: Session, plan: GenerationPlan, *, event_limit: int = 50
             .order_by(RemediationAction.created_at, RemediationAction.id)
         ).all()
     )
+    agent_sessions = list(
+        session.scalars(
+            select(AgentSession)
+            .where(AgentSession.plan_id == plan.id)
+            .order_by(AgentSession.created_at, AgentSession.id)
+        ).all()
+    )
+    agent_session_ids = [item.id for item in agent_sessions]
+    agent_events = (
+        list(
+            session.scalars(
+                select(AgentEvent)
+                .where(AgentEvent.session_id.in_(agent_session_ids))
+                .order_by(AgentEvent.sequence)
+            ).all()
+        )
+        if agent_session_ids
+        else []
+    )
+    changesets = (
+        list(
+            session.scalars(
+                select(ChangeSet)
+                .where(ChangeSet.session_id.in_(agent_session_ids))
+                .order_by(ChangeSet.created_at, ChangeSet.id)
+            ).all()
+        )
+        if agent_session_ids
+        else []
+    )
     events = list(
         session.scalars(
             select(RunEvent)
@@ -184,6 +217,9 @@ def inspect_run(session: Session, plan: GenerationPlan, *, event_limit: int = 50
         "evidence": evidence,
         "actions": actions,
         "events": events,
+        "agent_sessions": agent_sessions,
+        "agent_events": agent_events,
+        "changesets": changesets,
     }
 
 
@@ -356,6 +392,10 @@ def create_remediation(
             raise ServiceError(422, "tool repair requires an image job")
         if payload.strategy not in REGISTERED_STRATEGIES:
             raise ServiceError(422, f"unknown media worker strategy: {payload.strategy}")
+    if payload.action == RemediationKind.IMAGE_EDIT and job.task_kind not in {"image", "image_edit"}:
+        raise ServiceError(422, "image edit requires an image job")
+    if payload.action == RemediationKind.PROPOSE_CHANGESET:
+        raise ServiceError(422, "propose_changeset is only accepted through the Agent ChangeSet workflow")
     _enforce_strategy_change(session, job=job, payload=payload)
 
     paid = payload.action in {RemediationKind.REGENERATE, RemediationKind.IMAGE_EDIT}

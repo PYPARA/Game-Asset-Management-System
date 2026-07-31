@@ -308,6 +308,33 @@ export interface RemediationRun {
   completed_at: string | null;
 }
 
+export interface AgentSessionRun {
+  id: string;
+  project_id: string;
+  plan_id: string | null;
+  job_id: string | null;
+  asset_id: string | null;
+  thread_id: string | null;
+  adapter: string;
+  adapter_version: string | null;
+  schema_version: number;
+  status: string;
+  context_hash: string;
+  context_path: string | null;
+  context: Record<string, unknown>;
+  sandbox: Record<string, unknown>;
+  allowed_actions: string[];
+  writable_allowlist: string[];
+  budget_limit: number;
+  budget_used: number;
+  diagnostic_reason: string | null;
+  result: Record<string, unknown>;
+  stop_reason: string | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+}
+
 export interface RunEventItem {
   id: string;
   sequence: number;
@@ -328,6 +355,22 @@ export interface RunInspection {
   evidence: RunEvidenceItem[];
   actions: RemediationRun[];
   events: RunEventItem[];
+  agent_sessions?: AgentSessionRun[];
+  agent_events?: Array<{
+    sequence: number;
+    id: string;
+    session_id: string;
+    project_id: string;
+    plan_id: string | null;
+    job_id: string | null;
+    asset_id: string | null;
+    event_type: string;
+    thread_id: string | null;
+    turn_id: string | null;
+    data: Record<string, unknown>;
+    created_at: string;
+  }>;
+  changesets?: Array<Record<string, unknown>>;
 }
 
 export interface ReleaseSummary {

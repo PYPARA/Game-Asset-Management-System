@@ -42,6 +42,12 @@ class Settings(BaseSettings):
     job_lease_seconds: float = 30.0
     job_heartbeat_interval: float = 5.0
     log_level: str = "info"
+    # Optional, isolated Codex/App Server command.  When unset the Agent remains
+    # available for audit and manual fallback but never attempts a best-effort
+    # network or PATH lookup.
+    codex_command: str | None = None
+    codex_timeout_seconds: float = Field(default=45.0, ge=1.0, le=600.0)
+    agent_budget: int = Field(default=1, ge=1, le=20)
 
     @field_validator("job_lease_seconds")
     @classmethod

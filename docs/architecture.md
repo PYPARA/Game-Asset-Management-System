@@ -1,6 +1,6 @@
 # 架构说明
 
-> 阅读约定：未特别标注的内容描述截至 2026-07-30 的当前实现；“目标”内容描述 M3/M4 及之后尚未实现的方向。两者不能混用。
+> 阅读约定：未特别标注的内容描述截至 2026-07-31 的当前实现；“目标”内容描述 M5 及之后尚未实现的方向。两者不能混用。
 
 ## 单一 Project 契约
 
@@ -40,7 +40,7 @@ SQLite 是可重建索引。项目扫描会按磁盘权威状态重建资产、�
 
 ## 四层架构与实现边界
 
-生产系统采用“确定性核心 + 受限智能监督”的分层边界。M2 已实现 Controller 和媒体 Worker；Codex Supervisor 与外部游戏交付仍分别属于 M4 与 M3：
+生产系统采用“确定性核心 + 受限智能监督”的分层边界。M2–M4 已实现 Controller、媒体 Worker、Codex Supervisor；M3 的外部游戏交付也已接通：
 
 ```mermaid
 flowchart LR
@@ -55,10 +55,10 @@ flowchart LR
 
 | 层 | 状态 | 职责与硬边界 |
 |---|---|---|
-| GAMS 确定性核心 | M2 已实现；Delivery 待 M3 | Controller、Project/SQLite 同步、计划、DAG、预算、任务租约、文件事务、硬 QA、审核与 Release；唯一能改变生产状态，任何动作先校验 Schema、状态、输入哈希和预算。 |
+| GAMS 确定性核心 | M2–M3 已实现 | Controller、Project/SQLite 同步、计划、DAG、预算、任务租约、文件事务、硬 QA、审核、Release 与 Delivery；唯一能改变生产状态，任何动作先校验 Schema、状态、输入哈希和预算。 |
 | 媒体工具 Worker | M2 已实现 | 编解码、尺寸、色键/智能抠图适配、边缘清理、联系表、叠加和差异图；不能批准资产或修改 Catalog 指针。 |
-| Codex 监督 Agent | M4 未实现 | 读取证据、语义/视觉诊断、选择受控修复策略、提出 ChangeSet；只能返回结构化动作。 |
-| 游戏仓库 | M3 未实现 | 消费确定性内容模块、资产 Manifest、运行媒体和 `gams-lock.json`；只通过显式导出改变。 |
+| Codex 监督 Agent | M4 已实现 | 通过隔离 stdio 适配器读取脱敏证据，执行结构化语义/视觉诊断、选择受控修复策略或提出 ChangeSet；只能返回结构化动作。 |
+| 游戏仓库 | M3 已实现 | 消费确定性内容模块、资产 Manifest、运行媒体和 `gams-lock.json`；只通过显式导出改变。 |
 
 Web 制作台是 Controller 的客户端，不另建业务事实源。Codex 目标集成使用官方 Python SDK 控制本机 App Server，但 SDK/协议由适配层隔离；其 beta/实验性生命周期不能传播为 Project 契约。
 
@@ -73,7 +73,7 @@ Web 制作台是 Controller 的客户端，不另建业务事实源。Codex 目�
 
 - M4 Agent 只允许提出 Project 白名单内的 Prompt、参数、后处理配置或待批准 ChangeSet；供应商 API Key 不进入 Agent 上下文。
 - GAMS 代码、游戏代码和手写文档变更只生成待批准 ChangeSet。
-- M3 Delivery 必须使用 Manifest v2、checkout staging、受管文件哈希、验证命令和不可变收据。
+- M3 Delivery 使用 Manifest v2、checkout staging、受管文件哈希、验证命令和不可变收据。
 
 目标生产循环详见 [Codex 监督式智能生产](agentic-production.md)，候选提升、Release v2 和游戏 checkout 事务详见 [Release 与游戏项目交付](release-delivery.md)。
 

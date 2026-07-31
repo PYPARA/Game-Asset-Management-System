@@ -8,7 +8,7 @@ import tempfile
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -42,6 +42,9 @@ class ProjectScanResult:
     releases: list[dict[str, Any]]
     deliveries: list[dict[str, Any]]
     errors: list[str]
+    agent_sessions: list[dict[str, Any]] = field(default_factory=list)
+    agent_events: list[dict[str, Any]] = field(default_factory=list)
+    changesets: list[dict[str, Any]] = field(default_factory=list)
 
 
 def canonical_json(value: Any) -> bytes:
@@ -186,6 +189,9 @@ class ProjectStore:
                 "catalog/entities",
                 "catalog/media",
                 "production/prompt-recipes",
+                "production/parameters",
+                "production/postprocess",
+                "production/agent",
                 "production/sources",
                 "approved/assets",
                 "approved/objects",
@@ -193,6 +199,10 @@ class ProjectStore:
                 "history/reviews",
                 "history/qa",
                 "history/deliveries",
+                "history/agent/sessions",
+                "history/agent/events",
+                "history/agent/config",
+                "history/changesets",
                 "releases",
                 "imports",
                 "workspace/candidates",
@@ -200,6 +210,8 @@ class ProjectStore:
                 "workspace/qa",
                 "workspace/tmp",
                 "workspace/logs",
+                "workspace/agent/changesets",
+                "workspace/agent/sessions",
             ):
                 (self.root / relative).mkdir(parents=True, exist_ok=True)
 
@@ -728,6 +740,9 @@ class ProjectStore:
         review_records: list[dict[str, Any]] = []
         releases: list[dict[str, Any]] = []
         deliveries: list[dict[str, Any]] = []
+        agent_sessions: list[dict[str, Any]] = []
+        agent_events: list[dict[str, Any]] = []
+        changesets: list[dict[str, Any]] = []
         errors: list[str] = []
         superseded_revision_ids: set[str] = set()
         current_revision_ids: set[str] = set()
@@ -1061,6 +1076,42 @@ class ProjectStore:
             except (StorageError, KeyError, TypeError, ValueError) as exc:
                 errors.append(f"{relative_to_root(self.root, receipt_path)}: {exc}")
 
+        # Agent audit records are durable history, while the context package and
+        # patch remain disposable workspace inputs.  They are intentionally
+        # schema-light here: the API performs the stricter Controller validation
+        # before accepting any action.
+        for path in sorted((self.history / "agent" / "sessions").glob("*.json")):
+            try:
+                record = self.read_json(path)
+                if str(record.get("id", "")) != path.stem:
+                    raise StorageError("agent session path does not match its id")
+                if str(record.get("project_id", "")) != project_id:
+                    raise StorageError("agent session belongs to a different project")
+                record["file_path"] = relative_to_root(self.root, path)
+                agent_sessions.append(record)
+            except (StorageError, KeyError, TypeError, ValueError) as exc:
+                errors.append(f"{relative_to_root(self.root, path)}: {exc}")
+        for path in sorted((self.history / "agent" / "events").glob("*/*.json")):
+            try:
+                record = self.read_json(path)
+                if str(record.get("project_id", "")) != project_id:
+                    raise StorageError("agent event belongs to a different project")
+                record["file_path"] = relative_to_root(self.root, path)
+                agent_events.append(record)
+            except (StorageError, KeyError, TypeError, ValueError) as exc:
+                errors.append(f"{relative_to_root(self.root, path)}: {exc}")
+        for path in sorted((self.history / "changesets").glob("*.json")):
+            try:
+                record = self.read_json(path)
+                if str(record.get("id", "")) != path.stem:
+                    raise StorageError("ChangeSet path does not match its id")
+                if str(record.get("project_id", "")) != project_id:
+                    raise StorageError("ChangeSet belongs to a different project")
+                record["file_path"] = relative_to_root(self.root, path)
+                changesets.append(record)
+            except (StorageError, KeyError, TypeError, ValueError) as exc:
+                errors.append(f"{relative_to_root(self.root, path)}: {exc}")
+
         return ProjectScanResult(
             assets,
             revisions,
@@ -1072,6 +1123,9 @@ class ProjectStore:
             releases,
             deliveries,
             errors,
+            agent_sessions,
+            agent_events,
+            changesets,
         )
 
     def resolve_rendition_path(self, stored_path: str) -> Path:

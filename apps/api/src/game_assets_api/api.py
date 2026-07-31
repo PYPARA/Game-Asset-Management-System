@@ -12,9 +12,14 @@ from sqlalchemy.orm import Session
 
 from .database import Database
 from .domain import (
+    AgentDiagnoseRequest,
+    AgentEventRead,
+    AgentSessionCreate,
+    AgentSessionRead,
     AssetCreate,
     AssetRead,
     ArtifactRead,
+    ChangeSetRead,
     DeliveryRead,
     ExportConfigRead,
     ExportConfigUpdate,
@@ -66,10 +71,13 @@ from .domain import (
     SystemInfo,
 )
 from .models import (
+    AgentEvent,
+    AgentSession,
     Asset,
     AssetRelation,
     AssetRevision,
     Artifact,
+    ChangeSet,
     Delivery,
     GenerationAttempt,
     GenerationJob,
@@ -109,6 +117,13 @@ from .production import (
     refresh_plan_status,
     resume_recoverable_jobs,
     update_extra_call_budget,
+)
+from .agent import (
+    _persist_agent_audit,
+    build_context_package,
+    diagnose_job,
+    list_agent_events,
+    record_agent_event,
 )
 from .delivery import (
     DeliveryError,
@@ -706,6 +721,241 @@ def get_plan(plan_id: str, session: Session = Depends(db)) -> GenerationPlan:
 def inspect_plan(plan_id: str, session: Session = Depends(db)) -> dict[str, Any]:
     plan = require(session, GenerationPlan, plan_id, "generation plan")
     return inspect_run(session, plan)
+
+
+@router.post("/jobs/{job_id}/agent/diagnose", response_model=AgentSessionRead)
+async def diagnose_job_with_codex(
+    job_id: str,
+    request: Request,
+    payload: AgentDiagnoseRequest = AgentDiagnoseRequest(),
+    session: Session = Depends(db),
+) -> AgentSession:
+    """Ask the isolated Codex adapter for one structured diagnosis.
+
+    Adapter failures are represented as an ``awaiting_user`` session rather than
+    an HTTP 5xx, so the deterministic manual remediation UI remains usable.
+    """
+
+    job = require(session, GenerationJob, job_id, "generation job")
+    adapter = getattr(request.app.state, "codex_adapter", None)
+    if adapter is None:
+        from .codex_adapter import UnavailableCodexAdapter
+
+        adapter = UnavailableCodexAdapter()
+    return await diagnose_job(
+        session,
+        job,
+        adapter=adapter,
+        finding_ids=payload.finding_ids,
+        budget=payload.budget,
+        requested_reason=payload.reason,
+    )
+
+
+@router.get("/jobs/{job_id}/agent/context")
+def get_agent_context(job_id: str, session: Session = Depends(db)) -> dict[str, Any]:
+    job = require(session, GenerationJob, job_id, "generation job")
+    context, context_hash = build_context_package(session, job)
+    return {"context_hash": context_hash, "context": context}
+
+
+@router.get("/agent/sessions", response_model=list[AgentSessionRead])
+def list_agent_sessions(
+    project_id: str | None = None,
+    plan_id: str | None = None,
+    job_id: str | None = None,
+    status: str | None = None,
+    session: Session = Depends(db),
+) -> list[AgentSession]:
+    statement = select(AgentSession)
+    if project_id:
+        statement = statement.where(AgentSession.project_id == project_id)
+    if plan_id:
+        statement = statement.where(AgentSession.plan_id == plan_id)
+    if job_id:
+        statement = statement.where(AgentSession.job_id == job_id)
+    if status:
+        statement = statement.where(AgentSession.status == status)
+    return list(session.scalars(statement.order_by(AgentSession.created_at.desc())).all())
+
+
+@router.post("/agent/sessions", response_model=AgentSessionRead, status_code=status.HTTP_201_CREATED)
+async def create_agent_session(
+    payload: AgentSessionCreate,
+    request: Request,
+    session: Session = Depends(db),
+) -> AgentSession:
+    job = require(session, GenerationJob, payload.job_id, "generation job")
+    adapter = getattr(request.app.state, "codex_adapter", None)
+    if adapter is None:
+        from .codex_adapter import UnavailableCodexAdapter
+
+        adapter = UnavailableCodexAdapter()
+    return await diagnose_job(
+        session,
+        job,
+        adapter=adapter,
+        finding_ids=payload.finding_ids,
+        budget=payload.budget,
+        requested_reason=payload.reason,
+    )
+
+
+@router.get("/agent/sessions/{session_id}", response_model=AgentSessionRead)
+def get_agent_session(session_id: str, session: Session = Depends(db)) -> AgentSession:
+    return require(session, AgentSession, session_id, "agent session")
+
+
+@router.get("/agent/sessions/{session_id}/events", response_model=list[AgentEventRead])
+def get_agent_session_events(
+    session_id: str, session: Session = Depends(db)
+) -> list[AgentEvent]:
+    require(session, AgentSession, session_id, "agent session")
+    return list_agent_events(session, session_id)
+
+
+@router.get("/agent/sessions/{session_id}/context")
+def get_agent_session_context(session_id: str, session: Session = Depends(db)) -> dict[str, Any]:
+    value = require(session, AgentSession, session_id, "agent session")
+    return {
+        "session_id": value.id,
+        "context_hash": value.context_hash,
+        "context_path": value.context_path,
+        "context": value.context_json,
+    }
+
+
+@router.post("/agent/sessions/{session_id}/diagnose", response_model=AgentSessionRead)
+async def diagnose_existing_agent_session(
+    session_id: str,
+    request: Request,
+    payload: AgentDiagnoseRequest = AgentDiagnoseRequest(),
+    session: Session = Depends(db),
+) -> AgentSession:
+    existing = require(session, AgentSession, session_id, "agent session")
+    if not existing.job_id:
+        raise ServiceError(409, "agent session has no Job to diagnose")
+    job = require(session, GenerationJob, existing.job_id, "generation job")
+    adapter = getattr(request.app.state, "codex_adapter", None)
+    if adapter is None:
+        from .codex_adapter import UnavailableCodexAdapter
+
+        adapter = UnavailableCodexAdapter()
+    return await diagnose_job(
+        session,
+        job,
+        adapter=adapter,
+        finding_ids=payload.finding_ids,
+        budget=payload.budget,
+        requested_reason=payload.reason,
+    )
+
+
+@router.get("/changesets", response_model=list[ChangeSetRead])
+def list_changesets(
+    project_id: str | None = None,
+    session_id: str | None = None,
+    status: str | None = None,
+    session: Session = Depends(db),
+) -> list[ChangeSet]:
+    statement = select(ChangeSet)
+    if project_id:
+        statement = statement.where(ChangeSet.project_id == project_id)
+    if session_id:
+        statement = statement.where(ChangeSet.session_id == session_id)
+    if status:
+        statement = statement.where(ChangeSet.status == status)
+    return list(session.scalars(statement.order_by(ChangeSet.created_at.desc())).all())
+
+
+@router.get("/changesets/{changeset_id}", response_model=ChangeSetRead)
+def get_changeset(changeset_id: str, session: Session = Depends(db)) -> ChangeSet:
+    return require(session, ChangeSet, changeset_id, "changeset")
+
+
+@router.get("/changesets/{changeset_id}/patch", response_class=FileResponse)
+def get_changeset_patch(changeset_id: str, session: Session = Depends(db)) -> FileResponse:
+    changeset = require(session, ChangeSet, changeset_id, "changeset")
+    project = require(session, Project, changeset.project_id, "project")
+    try:
+        patch_path = ProjectStore(project.root_path).resolve_rendition_path(changeset.patch_path)
+    except StorageError as exc:
+        raise HTTPException(409, "ChangeSet patch path is outside the registered project") from exc
+    if not patch_path.is_file() or sha256_file(patch_path) != changeset.patch_hash:
+        raise HTTPException(404, "ChangeSet patch is missing or hash does not match")
+    return FileResponse(
+        patch_path,
+        media_type="text/plain; charset=utf-8",
+        filename=f"{changeset.id}.patch",
+        headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"},
+    )
+
+
+def _decide_changeset(
+    changeset_id: str,
+    *,
+    decision: str,
+    reason: str | None,
+    session: Session,
+) -> ChangeSet:
+    changeset = require(session, ChangeSet, changeset_id, "changeset")
+    if changeset.status != "pending_approval":
+        raise ServiceError(409, "changeset has already been decided")
+    if decision == "approved":
+        project = require(session, Project, changeset.project_id, "project")
+        try:
+            patch_path = ProjectStore(project.root_path).resolve_rendition_path(changeset.patch_path)
+        except StorageError as exc:
+            raise ServiceError(409, "ChangeSet patch path is outside the registered project") from exc
+        if not patch_path.is_file() or sha256_file(patch_path) != changeset.patch_hash:
+            raise ServiceError(409, "ChangeSet patch is missing or hash does not match")
+    changeset.status = decision
+    changeset.decision_reason = reason
+    changeset.decided_at = utcnow()
+    agent_session = session.get(AgentSession, changeset.session_id)
+    if agent_session:
+        agent_session.status = "completed" if decision == "approved" else "awaiting_user"
+        agent_session.stop_reason = f"changeset.{decision}"
+        agent_session.updated_at = utcnow()
+        record_agent_event(
+            session,
+            agent_session,
+            f"changeset.{decision}",
+            data={"changeset_id": changeset.id, "reason": reason or ""},
+        )
+        _persist_agent_audit(session, agent_session)
+    session.commit()
+    return changeset
+
+
+@router.post("/changesets/{changeset_id}/approve", response_model=ChangeSetRead)
+def approve_changeset(
+    changeset_id: str,
+    payload: dict[str, str] | None = None,
+    session: Session = Depends(db),
+) -> ChangeSet:
+    # Approval records intent only.  Applying a patch and all Git operations stay
+    # outside this API and require a separate, human-controlled workflow.
+    return _decide_changeset(
+        changeset_id,
+        decision="approved",
+        reason=(payload or {}).get("reason"),
+        session=session,
+    )
+
+
+@router.post("/changesets/{changeset_id}/reject", response_model=ChangeSetRead)
+def reject_changeset(
+    changeset_id: str,
+    payload: dict[str, str] | None = None,
+    session: Session = Depends(db),
+) -> ChangeSet:
+    return _decide_changeset(
+        changeset_id,
+        decision="rejected",
+        reason=(payload or {}).get("reason"),
+        session=session,
+    )
 
 
 @router.patch("/generation-plans/{plan_id}/budget", response_model=GenerationPlanRead)

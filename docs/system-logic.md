@@ -1,6 +1,6 @@
 # 系统主逻辑
 
-本文首先说明 Game Asset Management System（下文简称 GAMS）截至 2026-07-30 的当前正式运行模型。标记为“目标”的章节记录 M3/M4 尚未实现的生产监督与交付契约，不得把目标状态解读为当前能力。本文不包含一次性迁移过程。
+本文首先说明 Game Asset Management System（下文简称 GAMS）截至 2026-07-31 的当前正式运行模型。标记为“目标”的章节记录 M5 及以后尚未实现的生产能力，不得把目标状态解读为当前能力。本文不包含一次性迁移过程。
 
 ## 一句话模型
 
@@ -151,7 +151,7 @@ stateDiagram-v2
     hard_qa --> semantic_qa: 无阻塞硬 Finding
     hard_qa --> remediating: 可修复问题
     semantic_qa --> candidate_ready: M2 确定性证据已完备
-    semantic_qa --> remediating: 人工或未来 Agent 选择返工
+    semantic_qa --> remediating: 人工或 Codex Agent 选择返工
     remediating --> output_received: 产生新 Artifact
     remediating --> awaiting_user: 越权、重复或超预算
     candidate_ready --> approved: 人工批准
@@ -159,7 +159,7 @@ stateDiagram-v2
     released --> delivered: M3 checkout 应用与验证通过
 ```
 
-Provider 返回只会进入 `output_received`。硬 QA 或预算不满足时，任务进入 remediation、`awaiting_user` 或失败；不能直接进入 `candidate_ready`。M2 的 `semantic_qa` 是生成结构化证据并等待可审查边界，不宣称已完成 Codex 语义诊断；自动语义 Finding 与策略选择属于 M4。当前人工动作和未来 Codex 动作都必须由 GAMS Controller 校验后执行。
+Provider 返回只会进入 `output_received`。硬 QA 或预算不满足时，任务进入 remediation、`awaiting_user` 或失败；不能直接进入 `candidate_ready`。M2 的 `semantic_qa` 生成结构化证据并等待可审查边界，M4 可请求隔离 Codex Agent 生成语义 Finding 与策略建议；人工动作和 Codex 动作都必须由 GAMS Controller 校验后执行。
 
 计划确认冻结每项任务的供应商、模型、运行配置、基础调用量、预计成本、网络重试和额外返工预算。同请求网络重试默认最多 2 次；额外调用建议值为 `max(2, ceil(基础调用量 × 20%))`，用户可以下调；单资产额外付费返工默认最多 2 轮。达到任一硬上限即进入 `awaiting_user`。
 
@@ -199,9 +199,9 @@ Release Manifest v1 记录稳定 Key、修订、内容哈希、依赖哈希、Ar
 
 `project.yaml` 中的 `export` 只声明游戏仓库内的内容、Manifest 和资源目标；当前 Release API 不会写任意外部 checkout。把 Release 同步到游戏仓库属于显式导出步骤。游戏仓库接收确定性生成内容与发布资源后，应能脱离 GAMS 独立构建和运行。
 
-## 目标 Release → Export → Delivery（未实现）
+## Release → Export → Delivery 事务
 
-目标链路把批准、Release 和外部交付拆成三个事务：
+当前链路把批准、Release 和外部交付拆成三个事务：
 
 ```mermaid
 flowchart LR

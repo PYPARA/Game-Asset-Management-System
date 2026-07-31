@@ -370,6 +370,106 @@ class RemediationAction(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class AgentSession(Base):
+    """Durable audit record for one isolated Codex diagnosis.
+
+    Agent sessions are deliberately separate from the production state machine.  A
+    session may propose an action, but only the Controller can accept and execute
+    it.  ``context_json`` is a redacted, read-only input package; it never contains
+    provider or Codex credentials.
+    """
+
+    __tablename__ = "agent_sessions"
+
+    id: Mapped[str] = mapped_column(String(48), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    plan_id: Mapped[str | None] = mapped_column(
+        ForeignKey("generation_plans.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    job_id: Mapped[str | None] = mapped_column(
+        ForeignKey("generation_jobs.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    asset_id: Mapped[str | None] = mapped_column(
+        ForeignKey("assets.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    thread_id: Mapped[str | None] = mapped_column(String(240), nullable=True, index=True)
+    adapter: Mapped[str] = mapped_column(String(120), default="unavailable")
+    adapter_version: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    schema_version: Mapped[int] = mapped_column(Integer, default=1)
+    status: Mapped[str] = mapped_column(String(40), default="created", index=True)
+    context_hash: Mapped[str] = mapped_column(String(64))
+    context_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    context_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    sandbox_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    allowed_actions_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    writable_allowlist_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    budget_limit: Mapped[int] = mapped_column(Integer, default=1)
+    budget_used: Mapped[int] = mapped_column(Integer, default=0)
+    diagnostic_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    result_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    stop_reason: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class AgentEvent(Base):
+    """Stable GAMS event projection of an adapter/thread event."""
+
+    __tablename__ = "agent_events"
+
+    sequence: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[str] = mapped_column(String(48), unique=True, default=new_id)
+    session_id: Mapped[str] = mapped_column(
+        ForeignKey("agent_sessions.id", ondelete="CASCADE"), index=True
+    )
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    plan_id: Mapped[str | None] = mapped_column(
+        ForeignKey("generation_plans.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    job_id: Mapped[str | None] = mapped_column(
+        ForeignKey("generation_jobs.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    asset_id: Mapped[str | None] = mapped_column(
+        ForeignKey("assets.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    event_type: Mapped[str] = mapped_column(String(100), index=True)
+    thread_id: Mapped[str | None] = mapped_column(String(240), nullable=True)
+    turn_id: Mapped[str | None] = mapped_column(String(240), nullable=True)
+    data_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ChangeSet(Base):
+    """A review-only patch proposal; it is never applied by the Agent."""
+
+    __tablename__ = "change_sets"
+
+    id: Mapped[str] = mapped_column(String(48), primary_key=True, default=new_id)
+    session_id: Mapped[str] = mapped_column(
+        ForeignKey("agent_sessions.id", ondelete="CASCADE"), index=True
+    )
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    target_repository: Mapped[str] = mapped_column(String(240))
+    baseline_commit: Mapped[str | None] = mapped_column(String(240), nullable=True)
+    patch_path: Mapped[str] = mapped_column(Text)
+    patch_hash: Mapped[str] = mapped_column(String(64))
+    files_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    validation_commands_json: Mapped[list[list[str]]] = mapped_column(JSON, default=list)
+    risk: Mapped[str] = mapped_column(Text, default="")
+    summary: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(40), default="pending_approval", index=True)
+    decision_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class QARun(Base):
     __tablename__ = "qa_runs"
 

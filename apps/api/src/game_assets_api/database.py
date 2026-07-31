@@ -87,6 +87,9 @@ class Database:
                 ("billable", "BOOLEAN NOT NULL DEFAULT 1"),
                 ("estimated_cost", "FLOAT"),
             ),
+            "agent_events": (
+                ("asset_id", "VARCHAR(36)"),
+            ),
             "releases": (
                 ("manifest_version", "INTEGER NOT NULL DEFAULT 1"),
                 ("snapshot_hash", "VARCHAR(80)"),
@@ -124,6 +127,7 @@ class Database:
                     "ix_generation_attempts_idempotency_key",
                     "idempotency_key",
                 ),
+                ("agent_events", "ix_agent_events_asset_id", "asset_id"),
                 ("deliveries", "ix_deliveries_project_id", "project_id"),
                 ("deliveries", "ix_deliveries_release_id", "release_id"),
                 ("deliveries", "ix_deliveries_status", "status"),

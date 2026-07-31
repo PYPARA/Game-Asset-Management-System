@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 from pathlib import Path
 from typing import Any
@@ -10,8 +11,10 @@ from sqlalchemy import select
 
 from .database import Database
 from .delivery import DeliveryError, apply_export, export_preview, release_preflight, verify_export
-from .domain import ProviderKind, ReleaseCreate, RunInspectRead
-from .models import GenerationPlan, Project, ProviderProfile, Release
+from .codex_adapter import build_codex_adapter
+from .domain import AgentSessionRead, ProviderKind, ReleaseCreate, RunInspectRead
+from .models import GenerationJob, GenerationPlan, Project, ProviderProfile, Release
+from .agent import diagnose_job
 from .production import inspect_run, resume_recoverable_jobs
 from .services import create_release
 from .settings import Settings
@@ -29,6 +32,11 @@ def _parser() -> argparse.ArgumentParser:
     resume = run_commands.add_parser("resume", help="resume only jobs with persisted safe state")
     resume.add_argument("plan_id")
     resume.add_argument("--json", action="store_true", dest="as_json")
+    agent = subcommands.add_parser("agent", help="request an isolated Codex diagnosis")
+    agent_commands = agent.add_subparsers(dest="agent_command", required=True)
+    diagnose = agent_commands.add_parser("diagnose", help="diagnose one persisted Job")
+    diagnose.add_argument("job_id")
+    diagnose.add_argument("--json", action="store_true", dest="as_json")
     release = subcommands.add_parser("release", help="validate or create immutable Releases")
     release_commands = release.add_subparsers(dest="release_command", required=True)
     preflight = release_commands.add_parser("preflight", help="check approved assets for a v2 Release")
@@ -122,6 +130,29 @@ def _resume(settings: Settings, plan_id: str, *, as_json: bool) -> int:
         ]
     _print(payload, as_json=as_json)
     return 0
+
+
+def _diagnose(settings: Settings, job_id: str, *, as_json: bool) -> int:
+    database = _database(settings)
+    adapter = build_codex_adapter(
+        settings.codex_command,
+        timeout_seconds=settings.codex_timeout_seconds,
+    )
+    with database.sessions() as session:
+        job = session.get(GenerationJob, job_id)
+        if job is None:
+            raise SystemExit(f"generation job not found: {job_id}")
+        result = asyncio.run(
+            diagnose_job(
+                session,
+                job,
+                adapter=adapter,
+                budget=settings.agent_budget,
+            )
+        )
+        payload = AgentSessionRead.model_validate(result).model_dump(mode="json")
+    _print(payload, as_json=as_json)
+    return 0 if payload["status"] == "completed" else 2
 
 
 def _serve(settings: Settings) -> int:
@@ -259,6 +290,8 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(_inspect(settings, arguments.plan_id, as_json=arguments.as_json))
     if arguments.command == "run" and arguments.run_command == "resume":
         raise SystemExit(_resume(settings, arguments.plan_id, as_json=arguments.as_json))
+    if arguments.command == "agent" and arguments.agent_command == "diagnose":
+        raise SystemExit(_diagnose(settings, arguments.job_id, as_json=arguments.as_json))
     if arguments.command == "release" and arguments.release_command == "preflight":
         raise SystemExit(_release_preflight(settings, arguments.project, as_json=arguments.as_json))
     if arguments.command == "release" and arguments.release_command == "create":

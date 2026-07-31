@@ -118,6 +118,7 @@ class RemediationKind(StrEnum):
     REGENERATE = "regenerate"
     IMAGE_EDIT = "image_edit"
     AWAIT_USER = "await_user"
+    PROPOSE_CHANGESET = "propose_changeset"
 
 
 class RemediationStatus(StrEnum):
@@ -127,6 +128,15 @@ class RemediationStatus(StrEnum):
     COMPLETED = "completed"
     REJECTED = "rejected"
     FAILED = "failed"
+
+
+class AgentSessionStatus(StrEnum):
+    CREATED = "created"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    AWAITING_USER = "awaiting_user"
+    FAILED = "failed"
+    UNAVAILABLE = "unavailable"
 
 
 class FindingSeverity(StrEnum):
@@ -550,6 +560,98 @@ class RemediationCreate(BaseModel):
     expected_additional_calls: int = Field(default=0, ge=0, le=10)
 
 
+class AgentDiagnoseRequest(BaseModel):
+    """Optional limits for a single Codex diagnosis turn."""
+
+    finding_ids: list[str] = Field(default_factory=list)
+    budget: int = Field(default=1, ge=1, le=20)
+    reason: str | None = Field(default=None, max_length=2_000)
+
+
+class AgentSessionCreate(AgentDiagnoseRequest):
+    job_id: str
+
+
+class AgentProposal(BaseModel):
+    """Versioned adapter output. Unknown fields remain auditable but actions do not."""
+
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+    schema_version: int = Field(default=1, ge=1, le=10)
+    finding_ids: list[str] = Field(default_factory=list)
+    action: str
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    expected_additional_calls: int = Field(default=0, ge=0, le=10)
+    reason: str = Field(min_length=1, max_length=4_000)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    findings: list[dict[str, Any]] = Field(default_factory=list)
+    input_hash: str | None = Field(default=None, min_length=8, max_length=128)
+    thread_id: str | None = None
+    turn_id: str | None = None
+
+
+class AgentSessionRead(ORMModel):
+    id: str
+    project_id: str
+    plan_id: str | None
+    job_id: str | None
+    asset_id: str | None
+    thread_id: str | None
+    adapter: str
+    adapter_version: str | None
+    schema_version: int
+    status: str
+    context_hash: str
+    context_path: str | None
+    context: dict[str, Any] = Field(default_factory=dict, validation_alias="context_json")
+    sandbox: dict[str, Any] = Field(default_factory=dict, validation_alias="sandbox_json")
+    allowed_actions: list[str] = Field(default_factory=list, validation_alias="allowed_actions_json")
+    writable_allowlist: list[str] = Field(default_factory=list, validation_alias="writable_allowlist_json")
+    budget_limit: int
+    budget_used: int
+    diagnostic_reason: str | None
+    result: dict[str, Any] = Field(default_factory=dict, validation_alias="result_json")
+    stop_reason: str | None
+    created_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None
+
+
+class AgentEventRead(ORMModel):
+    sequence: int
+    id: str
+    session_id: str
+    project_id: str
+    plan_id: str | None
+    job_id: str | None
+    asset_id: str | None
+    event_type: str
+    thread_id: str | None
+    turn_id: str | None
+    data: dict[str, Any] = Field(default_factory=dict, validation_alias="data_json")
+    created_at: datetime
+
+
+class ChangeSetRead(ORMModel):
+    id: str
+    session_id: str
+    project_id: str
+    target_repository: str
+    baseline_commit: str | None
+    patch_path: str
+    patch_hash: str
+    files: list[str] = Field(default_factory=list, validation_alias="files_json")
+    validation_commands: list[list[str]] = Field(
+        default_factory=list, validation_alias="validation_commands_json"
+    )
+    risk: str
+    summary: str
+    status: str
+    decision_reason: str | None
+    created_at: datetime
+    decided_at: datetime | None
+
+
 class RemediationRead(ORMModel):
     id: str
     project_id: str
@@ -576,6 +678,9 @@ class RunInspectRead(BaseModel):
     evidence: list[RunEvidenceRead]
     actions: list[RemediationRead]
     events: list[RunEventRead]
+    agent_sessions: list[AgentSessionRead] = Field(default_factory=list)
+    agent_events: list[AgentEventRead] = Field(default_factory=list)
+    changesets: list[ChangeSetRead] = Field(default_factory=list)
 
 
 class QARunCreate(BaseModel):

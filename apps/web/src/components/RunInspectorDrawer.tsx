@@ -17,6 +17,7 @@ import {
 } from "@phosphor-icons/react";
 import {
   createRunRemediation,
+  diagnoseRunWithCodex,
   fetchRunInspection,
   resumeGenerationPlan,
   runEvidenceUrl,
@@ -25,6 +26,7 @@ import {
 } from "../lib/api";
 import { useModalFocus } from "../hooks/useModalFocus";
 import type {
+  AgentSessionRun,
   GenerationJobRun,
   ProductionFindingRun,
   RunEvidenceItem,
@@ -96,6 +98,15 @@ const eventLabels: Record<string, string> = {
   "run.recovered": "任务从持久状态恢复",
   "run.resumed": "任务已安全恢复",
   "worker.started": "媒体 Worker 启动",
+  "agent.turn_started": "Agent 诊断开始",
+  "agent.diagnosis_ready": "Agent 诊断完成",
+  "agent.unavailable": "Agent 不可用，转人工",
+  "agent.config_applied": "白名单配置已更新",
+  "action.proposed": "Agent 提出动作",
+  "action.rejected": "Agent 动作被拒绝",
+  "changeset.created": "ChangeSet 待审批",
+  "changeset.approved": "ChangeSet 已记录批准",
+  "changeset.rejected": "ChangeSet 已驳回",
 };
 
 function formatCost(value: number | null | undefined): string {
@@ -188,6 +199,8 @@ export function RunInspectorDrawer({
   const [budgetValue, setBudgetValue] = useState(0);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
+  const [agentBusy, setAgentBusy] = useState(false);
+  const [agentSession, setAgentSession] = useState<AgentSessionRun | null>(null);
   const focusKey = focusAssetIds.join("|");
   const inspectionQuery = useQuery({
     queryKey: ["run-inspection", planId],
@@ -229,6 +242,15 @@ export function RunInspectorDrawer({
   }, [focusKey, inspection?.plan.id, inspection?.jobs.length, open]);
 
   useEffect(() => {
+    if (!selectedJobId) return;
+    const latestSession = (inspection?.agent_sessions ?? [])
+      .filter((item) => item.job_id === selectedJobId)
+      .sort((left, right) => left.created_at.localeCompare(right.created_at))
+      .at(-1);
+    setAgentSession(latestSession ?? null);
+  }, [inspection?.agent_sessions, selectedJobId]);
+
+  useEffect(() => {
     if (!selectedJob || !inspection) return;
     const nextAction = suggestedAction(selectedJob, inspection.findings);
     setAction(nextAction);
@@ -255,6 +277,29 @@ export function RunInspectorDrawer({
   const refresh = async () => {
     await inspectionQuery.refetch();
     onChanged();
+  };
+
+  const diagnoseWithCodex = async () => {
+    if (!selectedJob) return;
+    setAgentBusy(true);
+    setMessage("");
+    try {
+      const result = await diagnoseRunWithCodex(
+        selectedJob.id,
+        selectedFindings.filter((finding) => finding.blocking && !finding.resolved_at).map((finding) => finding.id),
+      );
+      setAgentSession(result);
+      setMessage(
+        result.status === "completed"
+          ? "Codex 已提交 Controller 白名单动作。"
+          : `Codex 已降级为人工处理：${result.stop_reason ?? result.diagnostic_reason ?? "需要人工决定"}`,
+      );
+      await refresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Codex 诊断不可用，已保留人工处理入口。");
+    } finally {
+      setAgentBusy(false);
+    }
   };
 
   const submitRemediation = async () => {
@@ -380,6 +425,10 @@ export function RunInspectorDrawer({
                   ))}
                 </div>
                 <div className="manual-fallback-note"><Wrench size={16} /><p><strong>无需 Codex 也可处理</strong>证据、停止原因、预算和所有白名单动作均可在此人工检查与选择。</p></div>
+                <button className="button secondary agent-diagnose-button" type="button" onClick={diagnoseWithCodex} disabled={agentBusy || !selectedJob || !actionableJobStatuses.has(selectedJob.status)}>
+                  {agentBusy ? "正在请求 Codex…" : "请求 Codex 诊断"}
+                </button>
+                {agentSession ? <div className={`agent-session-note ${agentSession.status}`}><strong>Agent {agentSession.status}</strong><small>{agentSession.stop_reason ?? agentSession.diagnostic_reason ?? `上下文 ${agentSession.context_hash.slice(0, 12)}`}</small></div> : null}
               </nav>
 
               <section className="run-detail-pane">

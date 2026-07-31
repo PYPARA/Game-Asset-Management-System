@@ -14,6 +14,7 @@ FastAPI 后端只监听本机回环地址。Project 根目录文件是权威数�
 - M2 生成计划冻结 DAG、预算与并发；Runner 使用 lease/heartbeat、持久 Attempt 和事件流恢复执行，并为人工返工生成 Finding 与视觉证据。
 - M2.1 支持多个 OpenAI 兼容供应商、全局文字/图片默认路由和任务级供应商/模型覆盖；确认后的 Job 保存冻结供应商快照且不自动回退。
 - M3 支持 `gams release preflight|create`、`gams export preview|apply|verify|rollback`，以及对应 `/api/exports/*`、`/api/deliveries` API。Apply 使用 checkout 内 staging、argv 验证命令、受管文件哈希和最后写入的 `gams-lock.json`；失败会恢复上一版本，重复交付产生 `no_op` 收据。
+- M4 提供隔离的 Codex stdio 适配器（通过 `GAME_ASSETS_CODEX_COMMAND` 显式配置）、只读上下文包、AgentSession/AgentEvent 审计、结构化诊断和 `/api/changesets` 审批记录；适配器不可用、输出异常、输入过期、越权或预算触顶均降级人工处理，绝不执行 Git 或修改 SQLite/审核/Release/Delivery 事实。
 - 系统不支持其他项目布局或外部媒体路径协议。
 
 ## 供应商与模型路由
@@ -25,6 +26,12 @@ FastAPI 后端只监听本机回环地址。Project 根目录文件是权威数�
 - `GenerationTask` 的 `provider_profile_id` 与 `model` 是新计划的实际路由；计划顶层 `provider_profile_id` 仅作为旧客户端兼容回退。
 - API Key 不进入请求响应、SQLite、Project、事件或 Job 快照；后端仅在当前进程内按供应商 ID 持有已解锁明文。
 
+## Codex 监督
+
+- `POST /api/jobs/{job_id}/agent/diagnose` 生成一次只读上下文并请求结构化 Agent 提案；`GET /api/jobs/{job_id}/agent/context` 可检查脱敏上下文哈希。
+- `GET /api/agent/sessions`、`GET /api/agent/sessions/{id}/events` 提供线程、turn、预算、Finding、动作和人工降级理由。
+- `GET /api/changesets`、`GET /api/changesets/{id}/patch`、`POST .../approve|reject` 只记录审批，不应用补丁或执行 Git。
+
 ## 常用命令
 
 ```bash
@@ -32,6 +39,10 @@ uv run --project apps/api game-assets-api
 uv run --project apps/api pytest
 uv run --project apps/api gams run inspect <plan-id> --json
 uv run --project apps/api gams run resume <plan-id> --json
+uv run --project apps/api gams agent diagnose <job-id> --json
 ```
 
 OpenAPI 在服务启动后位于 `http://127.0.0.1:8787/openapi.json`。
+
+Codex 适配器默认关闭。只有在本机提供经过固定和审核的 stdio JSON 命令时才设置
+`GAME_ASSETS_CODEX_COMMAND`；命令只收到脱敏上下文，所有提案仍由 Controller 校验。

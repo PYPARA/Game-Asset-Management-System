@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .api import router
+from .codex_adapter import build_codex_adapter
 from .database import Database
 from .providers import CredentialVault
 from .runner import JobRunner
@@ -22,6 +23,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     database = Database(settings)
     vault = CredentialVault()
     runner = JobRunner(database.sessions, vault, settings)
+    codex_adapter = build_codex_adapter(
+        settings.codex_command,
+        timeout_seconds=settings.codex_timeout_seconds,
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -46,6 +51,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.database = database
     app.state.vault = vault
     app.state.runner = runner
+    app.state.codex_adapter = codex_adapter
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,

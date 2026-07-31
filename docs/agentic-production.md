@@ -1,14 +1,14 @@
 # Codex 监督式智能生产
 
-> 文档状态：M2 确定性 Controller/Worker 已实现；M4 Codex Supervisor 仍为目标设计
+> 文档状态：M2 确定性 Controller/Worker 与 M4 Codex Supervisor 已实现；M5 真实游戏试点仍待开始
 > 设计输入：Codex 会话 `019f6bee-1442-7331-a919-c585f462ffec` 及 GAMS 当前生产代码
-> 本文同时标明当前确定性能力和后续 Agent 边界；当前 GAMS 尚未内嵌 Codex Agent。
+> 本文同时标明当前确定性能力和 Agent 边界；Codex 仍通过可选、隔离的 stdio 适配器接入，未配置时自动人工降级。
 
-## 当前实现边界（2026-07-30）
+## 当前实现边界（2026-07-31）
 
 M2.1 已实现生成计划显式确认、任务级冻结供应商/模型、跨供应商 DAG 真实数据流、计划/供应商独立并发、lease/heartbeat、幂等 Attempt、预算、崩溃恢复、持久事件、Finding、Evidence、白名单 RemediationAction 和确定性媒体 Worker。Web 运行检查器允许人工查看证据并执行 `retry`、`tool_repair`、`regenerate`、`image_edit` 或 `await_user`，因此 Codex 不可用不会阻断确定性生产；模型不可用也不会自动切换路由。
 
-尚未实现的是 M4 的 Codex SDK/App Server 适配、AgentSession、自动语义/视觉诊断、Agent 结构化动作提案和 ChangeSet；M3 的 Manifest v2、外部 checkout Delivery 与 `gams-lock.json` 也不属于 M2。
+M4 已实现 Codex 适配边界、AgentSession/AgentEvent、自动结构化诊断和审计 ChangeSet；适配器不可用时仍保持人工降级。M3 的 Manifest v2、外部 checkout Delivery 与 `gams-lock.json` 继续由确定性层管理。
 
 ## 结论
 
@@ -58,11 +58,11 @@ GAMS 的目标是把这套循环变成可审计产品能力，而不是让 Agent
 |---|---|---|
 | `output_received` | 供应商返回了可记录的输出 | 响应已落为不可变原始 Artifact；尚未证明图片可用 |
 | `hard_qa` | 正在或已经执行确定性检查 | 输入 Artifact 哈希固定，检查结果已写入 Finding |
-| `semantic_qa` | 语义检查边界；M2 生成可人工检查的视觉证据，M4 再加入自动诊断 | 硬 QA 不含阻塞 Finding，视觉证据包已生成 |
+| `semantic_qa` | 语义检查边界；确定性证据可人工检查，M4 可请求隔离 Agent 自动诊断 | 硬 QA 不含阻塞 Finding，视觉证据包已生成 |
 | `candidate_ready` | 候选满足自动检查，可供人工审核 | 所有阻塞 Finding 已解决，预算与证据完整 |
 | `approved` | 人工批准了精确修订和媒体 Blob | 审核绑定修订、依赖哈希和 Artifact 哈希 |
 | `released` | 当前为不可变 Release v1；M3 升级到 Manifest v2 | 当前 v1 或未来 v2 全量预检通过 |
-| `delivered` | M3 目标：Release 已应用到游戏 checkout 并通过验证 | `gams-lock.json` 和 Delivery 收据已写入 |
+| `delivered` | M3 已实现：Release 已应用到游戏 checkout 并通过验证 | `gams-lock.json` 和 Delivery 收据已写入 |
 
 `remediating`、`awaiting_user`、`cancelled` 和 `failed` 是控制状态，不得伪装成上述成功阶段。
 
@@ -96,7 +96,7 @@ Controller 按 DAG 形成最多 6 项的依赖批次。批次上限用于控制�
 - 像素或感知差异图；不适用时记录原因。
 - 硬 QA 报告及全部结构化 Finding。
 - 供应商请求 ID、模型快照、Prompt/参考输入哈希和 Artifact 血缘。
-- 当前记录人工所选动作、预计额外调用数、理由与输入哈希；M4 再增加 Codex 诊断与置信度。
+- 当前记录人工或 Agent 所选动作、预计额外调用数、理由、置信度与输入哈希。
 
 证据必须存入 Project 的不可变历史或可提升 Artifact；联系表等可重建缓存可以放在 workspace。正式 Finding 不能只存在于 Codex 对话文本中。
 
@@ -176,7 +176,7 @@ Finding code 使用稳定命名空间；自然语言解释可以变化，但 Con
 - `regenerate`：调整 Prompt/参考后重新生成完整输出。
 - `image_edit`：保留原图并执行局部或参考图编辑。
 - `await_user`：停止当前范围并说明所需人工决定。
-- `propose_changeset`：M4 目标；为超出 Project 白名单的代码或文档变更生成补丁提案，M2 尚不接受该动作。
+- `propose_changeset`：为超出 Project 白名单的代码或文档变更生成补丁提案；只写入隔离补丁区并等待人工审批，不直接应用。
 
 示例输出：
 
@@ -245,7 +245,7 @@ AgentSession 至少记录：
 
 ## Codex 集成方式
 
-目标制作台通过一个隔离适配层调用官方 Python SDK。Python SDK 在本机控制 Codex App Server，并支持线程、连续 turn、沙箱和流式结果；制作台把 Agent 事件转发为 GAMS 事件，但不让 Codex 成为事实源。
+制作台通过一个隔离适配层调用官方 Python SDK 或本机 App Server。当前实现提供固定的本地 stdio JSON 通道；适配器在本机控制线程/turn，制作台把 Agent 事件转发为 GAMS 事件，但不让 Codex 成为事实源。
 
 截至本文基线，官方文档将 Python SDK 标为 beta，App Server 的部分接口和 WebSocket transport 标为实验性能力。因此实现必须：
 
@@ -308,7 +308,7 @@ GAMS 对 UI 提供自己的稳定持久事件，而不是直接暴露供应商�
 - `budget.changed`
 - `run.awaiting_user`、`run.recovered`、`run.resumed`
 
-M4 再增加 `agent.turn_started`、`agent.diagnosis_ready`、`action.proposed/rejected` 和 `changeset.*`；这些当前尚未实现。
+M4 增加 `agent.turn_started`、`agent.diagnosis_ready`、`agent.unavailable`、`agent.config_applied`、`action.proposed/rejected` 和 `changeset.*`；事件由 GAMS 持久化并可从 `history/agent` 重建。
 
 每个事件带 Project、plan、job、asset、attempt、时间戳和因果事件 ID。UI 断线后通过持久事件游标续接；Codex 的文本增量只用于展示，最终状态以 Controller 事件为准。
 
@@ -337,4 +337,4 @@ M2 当前已覆盖：
 - Codex 不可用时的人工降级，不丢失 Job 或 Finding。
 - 并发与 DAG 真实产物注入、崩溃恢复、未知交付、未知动作/Worker 拒绝、过期输入拒绝、证据哈希和旧 SQLite 兼容升级。
 
-M4 仍需覆盖 Agent JSON Schema、服装误删/身份/构图等语义诊断、ChangeSet 白名单和 Agent 不执行 Git 操作；M3 仍需覆盖 Delivery 事务与游戏构建验收。
+M4 已覆盖 Agent JSON Schema、语义 Finding、ChangeSet 路径白名单和 Agent 不执行 Git 操作；M5 继续覆盖真实游戏 checkout 的构建与 E2E 验收。

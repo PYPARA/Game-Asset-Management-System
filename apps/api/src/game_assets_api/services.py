@@ -34,10 +34,13 @@ from .domain import (
     TaskKind,
 )
 from .models import (
+    AgentEvent,
+    AgentSession,
     Asset,
     AssetRelation,
     AssetRevision,
     Artifact,
+    ChangeSet,
     Delivery,
     GenerationJob,
     GenerationPlan,
@@ -563,6 +566,9 @@ def _scan_project(session: Session, project: Project) -> ScanReport:
     reviews = scanned.reviews
     releases = scanned.releases
     deliveries = scanned.deliveries
+    agent_sessions = scanned.agent_sessions
+    agent_events = scanned.agent_events
+    changesets = scanned.changesets
     errors = scanned.errors
     indexed_assets = 0
     indexed_revisions = 0
@@ -575,6 +581,9 @@ def _scan_project(session: Session, project: Project) -> ScanReport:
     known_review_ids: set[str] = set()
     known_release_ids: set[str] = set()
     known_delivery_ids: set[str] = set()
+    known_agent_session_ids: set[str] = set()
+    known_agent_event_ids: set[str] = set()
+    known_changeset_ids: set[str] = set()
     for data in assets:
         try:
             identifier = str(data["id"])
@@ -914,6 +923,113 @@ def _scan_project(session: Session, project: Project) -> ScanReport:
             delivery.created_at = _parse_datetime(data.get("created_at"))
         except (KeyError, TypeError, ValueError) as exc:
             errors.append(f"delivery {data.get('id', '<unknown>')}: {exc}")
+    for data in agent_sessions:
+        try:
+            identifier = str(data["id"])
+            known_agent_session_ids.add(identifier)
+            row = session.get(AgentSession, identifier)
+            if row is None:
+                row = AgentSession(
+                    id=identifier,
+                    project_id=project.id,
+                    context_hash=str(data.get("context_hash", "")),
+                )
+                session.add(row)
+            row.project_id = project.id
+            plan_id = str(data["plan_id"]) if data.get("plan_id") else None
+            job_id = str(data["job_id"]) if data.get("job_id") else None
+            asset_id = str(data["asset_id"]) if data.get("asset_id") else None
+            row.plan_id = plan_id if plan_id and session.get(GenerationPlan, plan_id) else None
+            row.job_id = job_id if job_id and session.get(GenerationJob, job_id) else None
+            row.asset_id = asset_id if asset_id and session.get(Asset, asset_id) else None
+            row.thread_id = data.get("thread_id")
+            row.adapter = str(data.get("adapter", "unknown"))
+            row.adapter_version = data.get("adapter_version")
+            row.schema_version = int(data.get("schema_version", 1))
+            row.status = str(data.get("status", "awaiting_user"))
+            row.context_hash = str(data.get("context_hash", ""))
+            row.context_path = data.get("context_path")
+            row.context_json = dict(data.get("context", {}))
+            row.sandbox_json = dict(data.get("sandbox", {}))
+            row.allowed_actions_json = list(data.get("allowed_actions", []))
+            row.writable_allowlist_json = list(data.get("writable_allowlist", []))
+            row.budget_limit = int(data.get("budget_limit", 1))
+            row.budget_used = int(data.get("budget_used", 0))
+            row.diagnostic_reason = data.get("diagnostic_reason")
+            row.result_json = dict(data.get("result", {}))
+            row.stop_reason = data.get("stop_reason")
+            row.created_at = _parse_datetime(data.get("created_at"))
+            row.updated_at = _parse_datetime(data.get("updated_at"))
+            row.completed_at = _parse_datetime(data["completed_at"]) if data.get("completed_at") else None
+        except (KeyError, TypeError, ValueError) as exc:
+            errors.append(f"agent session {data.get('id', '<unknown>')}: {exc}")
+    session.flush()
+    for data in agent_events:
+        try:
+            identifier = str(data["id"])
+            known_agent_event_ids.add(identifier)
+            if session.get(AgentSession, str(data["session_id"])) is None:
+                raise ValueError("agent event references an unknown session")
+            row = session.scalar(select(AgentEvent).where(AgentEvent.id == identifier))
+            if row is None:
+                row = AgentEvent(
+                    id=identifier,
+                    session_id=str(data["session_id"]),
+                    project_id=project.id,
+                    event_type=str(data.get("event_type", "unknown")),
+                )
+                session.add(row)
+            row.session_id = str(data["session_id"])
+            row.project_id = project.id
+            plan_id = str(data["plan_id"]) if data.get("plan_id") else None
+            job_id = str(data["job_id"]) if data.get("job_id") else None
+            row.plan_id = plan_id if plan_id and session.get(GenerationPlan, plan_id) else None
+            row.job_id = job_id if job_id and session.get(GenerationJob, job_id) else None
+            asset_id = str(data["asset_id"]) if data.get("asset_id") else None
+            row.asset_id = asset_id if asset_id and session.get(Asset, asset_id) else None
+            row.event_type = str(data.get("event_type", "unknown"))
+            row.thread_id = data.get("thread_id")
+            row.turn_id = data.get("turn_id")
+            row.data_json = dict(data.get("data", {}))
+            row.created_at = _parse_datetime(data.get("created_at"))
+        except (KeyError, TypeError, ValueError) as exc:
+            errors.append(f"agent event {data.get('id', '<unknown>')}: {exc}")
+    session.flush()
+    for data in changesets:
+        try:
+            identifier = str(data["id"])
+            known_changeset_ids.add(identifier)
+            if session.get(AgentSession, str(data["session_id"])) is None:
+                raise ValueError("ChangeSet references an unknown session")
+            row = session.get(ChangeSet, identifier)
+            if row is None:
+                row = ChangeSet(
+                    id=identifier,
+                    session_id=str(data["session_id"]),
+                    project_id=project.id,
+                    target_repository=str(data.get("target_repository", "project")),
+                    patch_path=str(data.get("patch_path", "")),
+                    patch_hash=str(data.get("patch_hash", "")),
+                    summary=str(data.get("summary", "")),
+                )
+                session.add(row)
+            row.session_id = str(data["session_id"])
+            row.project_id = project.id
+            row.target_repository = str(data.get("target_repository", "project"))
+            row.baseline_commit = data.get("baseline_commit")
+            row.patch_path = str(data.get("patch_path", ""))
+            row.patch_hash = str(data.get("patch_hash", ""))
+            row.files_json = list(data.get("files", []))
+            row.validation_commands_json = list(data.get("validation_commands", []))
+            row.risk = str(data.get("risk", ""))
+            row.summary = str(data.get("summary", ""))
+            row.status = str(data.get("status", "pending_approval"))
+            row.decision_reason = data.get("decision_reason")
+            row.created_at = _parse_datetime(data.get("created_at"))
+            row.decided_at = _parse_datetime(data["decided_at"]) if data.get("decided_at") else None
+        except (KeyError, TypeError, ValueError) as exc:
+            errors.append(f"changeset {data.get('id', '<unknown>')}: {exc}")
+    session.flush()
     if not errors:
         project_assets = list(
             session.scalars(select(Asset).where(Asset.project_id == project.id)).all()
@@ -968,6 +1084,21 @@ def _scan_project(session: Session, project: Project) -> ScanReport:
         ).all():
             if delivery.id not in known_delivery_ids:
                 session.delete(delivery)
+        for row in session.scalars(
+            select(AgentSession).where(AgentSession.project_id == project.id)
+        ).all():
+            if row.id not in known_agent_session_ids:
+                session.delete(row)
+        for row in session.scalars(
+            select(AgentEvent).where(AgentEvent.project_id == project.id)
+        ).all():
+            if row.id not in known_agent_event_ids:
+                session.delete(row)
+        for row in session.scalars(
+            select(ChangeSet).where(ChangeSet.project_id == project.id)
+        ).all():
+            if row.id not in known_changeset_ids:
+                session.delete(row)
         for relation in session.scalars(
             select(AssetRelation).where(AssetRelation.project_id == project.id)
         ).all():

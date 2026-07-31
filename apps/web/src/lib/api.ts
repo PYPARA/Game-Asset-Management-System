@@ -1,5 +1,6 @@
 import type {
   AssetRevision,
+  AgentSessionRun,
   GameAsset,
   GenerationJobRun,
   GenerationPlanInput,
@@ -1045,6 +1046,17 @@ export async function createRunRemediation(
   return request<RemediationRun>(`/jobs/${encodeURIComponent(jobId)}/remediations`, {
     method: "POST",
     body: JSON.stringify(payload),
+  });
+}
+
+export async function diagnoseRunWithCodex(
+  jobId: string,
+  findingIds: string[] = [],
+): Promise<AgentSessionRun> {
+  return request<AgentSessionRun>(`/jobs/${encodeURIComponent(jobId)}/agent/diagnose`, {
+    method: "POST",
+    body: JSON.stringify({ finding_ids: findingIds }),
+    timeoutMs: 60_000,
   });
 }
 

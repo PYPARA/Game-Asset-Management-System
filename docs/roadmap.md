@@ -1,7 +1,7 @@
 # GAMS 路线图
 
 > 文档状态：已确认的目标计划
-> 当前验收日期：2026-07-30
+> 当前验收日期：2026-07-31
 > 本文同时记录“当前能力”和“目标能力”。只有带“已完成”验收记录的里程碑属于当前能力；其余目标不得理解为已经实现。
 
 ## 产品方向
@@ -17,7 +17,7 @@ GAMS 的 v1 目标不是单纯调用图片供应商，而是建立一条可恢�
 
 ## 当前基线
 
-当前系统处于“M3 Release 与游戏交付已完成，M4 智能监督尚未完成”的阶段。下面是截至 2026-07-31 从代码和验收记录确认的状态。
+当前系统处于“M4 Codex 监督已完成，M5 试点尚未开始”的阶段。下面是截至 2026-07-31 从代码和验收记录确认的状态。
 
 | 能力 | 当前状态 | 说明 |
 |---|---|---|
@@ -31,7 +31,7 @@ GAMS 的 v1 目标不是单纯调用图片供应商，而是建立一条可恢�
 | 人工审核 | 已实现 | 媒体批准会提升耐久 Artifact、创建 promotion 修订并绑定 Artifact/依赖哈希；硬 QA 不通过时拒绝批准。 |
 | Release | 已实现 M3 | Release v1 保持兼容；M3 使用 Manifest v2、snapshot hash、完整预检和可重建索引。 |
 | 游戏仓库交付 | 已实现 M3 | 支持 checkout 绑定、preview/apply/verify/rollback、staging、`gams-lock.json`、篡改保护、失败恢复和 Delivery 收据。 |
-| Codex 监督 Agent | 未实现 | 确定性 Finding、Evidence、RemediationAction 和人工检查器已存在；内嵌会话、自动语义诊断、AgentSession 与 ChangeSet 仍属于 M4。 |
+| Codex 监督 Agent | 已实现 M4 | 通过隔离 stdio 适配层生成只读上下文和结构化 Finding；AgentSession/AgentEvent 可审计，固定动作交回 Controller，越权代码/文档修改只形成待批准 ChangeSet，失败统一人工降级。 |
 | 叙事地图 | 未开始 | 类型化关系模型已具备，UI 安排在 v1.1。 |
 
 历史验收快照记录了前端 25 项测试、API 23 项测试和 Emperor Project 扫描通过；这些数字属于 [设计 QA 基线](../design-qa.md)，不是持续监控结果。当前 M0–M3 验收结果见下方带日期的记录。
@@ -233,7 +233,7 @@ M1 已满足 M2 和 M3 的共同事实源前置条件。M4 必须建立在 M2.1 
 
 范围：
 
-- 通过官方 Python SDK/本机 App Server 适配层内嵌 Codex 会话。
+- 通过隔离 `CodexAdapter` 接入官方 Python SDK/本机 App Server；当前提供固定 stdio JSON 通道，SDK 不可用时明确人工降级。
 - 生成只读上下文包、联系表、差异图和结构化 Finding。
 - 只接受固定 `RemediationAction`，由 Controller 校验并执行。
 - 允许白名单内自动修改 Prompt、生产参数、后处理配置和 Agent 管理的生产文档。
@@ -246,6 +246,16 @@ M1 已满足 M2 和 M3 的共同事实源前置条件。M4 必须建立在 M2.1 
 - Agent 输出不符合 Schema、动作未知、预算耗尽或服务不可用时均 fail closed。
 - Codex 无法直接修改 SQLite、审核决定、批准对象、Release Manifest 或 Git 历史。
 - 同一阻塞 Finding 第二次出现时切换策略，第三次出现时停止并等待人工。
+
+#### M4 验收记录（2026-07-31）
+
+状态：已完成。
+
+- `CodexAdapter` 默认 fail closed；显式配置的 stdio JSON 适配器只接收脱敏上下文并在隔离 workspace 运行，不继承供应商或 Codex 密钥。
+- `AgentSession`、`AgentEvent`、上下文哈希、线程/turn、预算、诊断理由、动作接受/拒绝原因和结果均写入 SQLite 索引及 `history/agent` 可重建记录。
+- `/jobs/{id}/agent/diagnose`、`/agent/sessions`、`/changesets` 和 `gams agent diagnose` 已接通；固定 `retry`、`tool_repair`、`regenerate`、`image_edit`、`await_user` 动作复用 Controller 校验，`propose_changeset` 只进入审批区。
+- 结构化 Finding 可引用联系表/差异图证据；Schema 错误、未知动作、过期输入、低置信度、预算/策略边界和适配器不可用均进入 `awaiting_user`。代码、游戏代码和手写文档提案保存为不可自动应用的 ChangeSet。
+- API 55 项、Web 39 项、Web 生产构建、Python 编译和 Alembic/SQLite 升级检查通过；M4 额外覆盖 Agent 降级、ChangeSet 路径白名单和删除 SQLite 后审计恢复。
 
 详细设计见 [Codex 监督式智能生产](agentic-production.md)。
 
@@ -299,13 +309,12 @@ M1 已满足 M2 和 M3 的共同事实源前置条件。M4 必须建立在 M2.1 
 
 - `gams run inspect|resume`；Web/API 也提供计划创建、显式确认、预算调整、运行检查、持久事件和返工动作。
 - 多供应商 CRUD/归档/恢复、模型目录与分类、全局文字/图片默认路由，以及任务级 `provider_profile_id` / `model` 冻结路由。
-- `Artifact`、`Finding`、运行 Evidence，以及 `retry`、`tool_repair`、`regenerate`、`image_edit`、`await_user` 五种 `RemediationAction`。
+- `Artifact`、`Finding`、运行 Evidence，以及 `retry`、`tool_repair`、`regenerate`、`image_edit`、`await_user` 五种 Controller `RemediationAction`；M4 另提供 `propose_changeset` Agent 提案和审计 ChangeSet。
 - Release v1 的 fail-closed 创建 API；M3 的 Manifest v2、Delivery API/UI、CLI 和可重建收据。
 
 仍属于后续目标：
 
 - 独立的 `gams plan validate|confirm` CLI 和 `gams release preflight|create` CLI。
-- M4 的 `propose_changeset`、`AgentSession`、Codex 事件和 ChangeSet 审批。
 - M5 真实游戏 checkout 试点及完整游戏侧验收。
 
 ## 全局验收原则
