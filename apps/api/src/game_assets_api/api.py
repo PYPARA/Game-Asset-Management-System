@@ -15,6 +15,12 @@ from .domain import (
     AssetCreate,
     AssetRead,
     ArtifactRead,
+    DeliveryRead,
+    ExportConfigRead,
+    ExportConfigUpdate,
+    ExportRequest,
+    ExportRollbackRequest,
+    ExportVerifyRequest,
     GenerationAttemptRead,
     GenerationJobRead,
     GenerationPlanCreate,
@@ -46,6 +52,7 @@ from .domain import (
     RelationCreate,
     RelationRead,
     ReleaseCreate,
+    ReleasePreflightRead,
     ReleaseRead,
     RenditionRead,
     ReviewCreate,
@@ -63,6 +70,7 @@ from .models import (
     AssetRelation,
     AssetRevision,
     Artifact,
+    Delivery,
     GenerationAttempt,
     GenerationJob,
     GenerationPlan,
@@ -101,6 +109,14 @@ from .production import (
     refresh_plan_status,
     resume_recoverable_jobs,
     update_extra_call_budget,
+)
+from .delivery import (
+    DeliveryError,
+    apply_export,
+    export_preview,
+    list_deliveries,
+    release_preflight,
+    verify_export,
 )
 from .services import (
     ServiceError,
@@ -1091,3 +1107,121 @@ def add_release(payload: ReleaseCreate, session: Session = Depends(db)) -> Relea
 @router.get("/releases/{release_id}", response_model=ReleaseRead)
 def get_release(release_id: str, session: Session = Depends(db)) -> Release:
     return require(session, Release, release_id, "release")
+
+
+@router.get("/projects/{project_id}/export-config", response_model=ExportConfigRead)
+def get_export_config(project_id: str, session: Session = Depends(db)) -> dict[str, Any]:
+    project = require(session, Project, project_id, "project")
+    store = ProjectStore(project.root_path)
+    try:
+        return {
+            "project_id": project.id,
+            "project": store.export_contract(),
+            "local": store.local_export_config(),
+        }
+    except StorageError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.put("/projects/{project_id}/export-config", response_model=ExportConfigRead)
+def put_export_config(
+    project_id: str,
+    payload: ExportConfigUpdate,
+    session: Session = Depends(db),
+) -> dict[str, Any]:
+    project = require(session, Project, project_id, "project")
+    store = ProjectStore(project.root_path)
+    try:
+        local = store.update_local_export_config(game_root=payload.game_root)
+        return {"project_id": project.id, "project": store.export_contract(), "local": local}
+    except StorageError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get("/releases/{release_id}/preflight", response_model=ReleasePreflightRead)
+def preflight_release_endpoint(
+    release_id: str,
+    project_id: str | None = None,
+    session: Session = Depends(db),
+) -> dict[str, Any]:
+    if project_id is None:
+        release = session.get(Release, release_id)
+        if release is None:
+            raise HTTPException(status_code=404, detail=f"release not found: {release_id}")
+        project_id = release.project_id
+    try:
+        return release_preflight(session, project_id=project_id, release_id=release_id)
+    except DeliveryError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+@router.post("/exports/preview")
+def export_preview_endpoint(payload: ExportRequest, session: Session = Depends(db)) -> dict[str, Any]:
+    try:
+        return export_preview(
+            session,
+            project_id=payload.project_id,
+            release_id=payload.release_id,
+            game_root=payload.game_root,
+        )
+    except DeliveryError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+@router.post("/exports/apply", response_model=DeliveryRead, status_code=status.HTTP_201_CREATED)
+def export_apply_endpoint(payload: ExportRequest, session: Session = Depends(db)) -> Delivery:
+    try:
+        return apply_export(
+            session,
+            project_id=payload.project_id,
+            release_id=payload.release_id,
+            game_root=payload.game_root,
+            run_commands=payload.run_commands,
+        )
+    except DeliveryError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+@router.post("/exports/verify")
+def export_verify_endpoint(
+    payload: ExportVerifyRequest, session: Session = Depends(db)
+) -> dict[str, Any]:
+    try:
+        return verify_export(
+            session,
+            project_id=payload.project_id,
+            release_id=payload.release_id,
+            game_root=payload.game_root,
+            run_commands=payload.run_commands,
+        )
+    except DeliveryError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+@router.post("/exports/rollback", response_model=DeliveryRead, status_code=status.HTTP_201_CREATED)
+def export_rollback_endpoint(
+    payload: ExportRollbackRequest, session: Session = Depends(db)
+) -> Delivery:
+    try:
+        preview = export_preview(
+            session,
+            project_id=payload.project_id,
+            release_id=payload.release_id,
+            game_root=payload.game_root,
+        )
+        return apply_export(
+            session,
+            project_id=payload.project_id,
+            release_id=payload.release_id,
+            game_root=payload.game_root,
+            run_commands=payload.run_commands,
+            rollback_from=preview.get("previous_release_id"),
+        )
+    except DeliveryError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+@router.get("/deliveries", response_model=list[DeliveryRead])
+def get_deliveries(project_id: str, session: Session = Depends(db)) -> list[Delivery]:
+    require(session, Project, project_id, "project")
+    return list_deliveries(session, project_id=project_id)

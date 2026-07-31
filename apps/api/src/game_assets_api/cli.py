@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 from typing import Any
 
 import uvicorn
 from sqlalchemy import select
 
 from .database import Database
-from .domain import ProviderKind, RunInspectRead
-from .models import GenerationPlan, ProviderProfile
+from .delivery import DeliveryError, apply_export, export_preview, release_preflight, verify_export
+from .domain import ProviderKind, ReleaseCreate, RunInspectRead
+from .models import GenerationPlan, Project, ProviderProfile, Release
 from .production import inspect_run, resume_recoverable_jobs
+from .services import create_release
 from .settings import Settings
 
 
@@ -26,6 +29,24 @@ def _parser() -> argparse.ArgumentParser:
     resume = run_commands.add_parser("resume", help="resume only jobs with persisted safe state")
     resume.add_argument("plan_id")
     resume.add_argument("--json", action="store_true", dest="as_json")
+    release = subcommands.add_parser("release", help="validate or create immutable Releases")
+    release_commands = release.add_subparsers(dest="release_command", required=True)
+    preflight = release_commands.add_parser("preflight", help="check approved assets for a v2 Release")
+    preflight.add_argument("project")
+    preflight.add_argument("--json", action="store_true", dest="as_json")
+    create = release_commands.add_parser("create", help="create an immutable Release Manifest v2")
+    create.add_argument("project")
+    create.add_argument("--name", required=True)
+    create.add_argument("--json", action="store_true", dest="as_json")
+    export = subcommands.add_parser("export", help="deliver a Release to a game checkout")
+    export_commands = export.add_subparsers(dest="export_command", required=True)
+    for command in ("preview", "apply", "verify", "rollback"):
+        export_parser = export_commands.add_parser(command)
+        export_parser.add_argument("release", nargs="?" if command == "verify" else None)
+        export_parser.add_argument("--project", required=True)
+        export_parser.add_argument("--game-root")
+        export_parser.add_argument("--run-commands", action="store_true")
+        export_parser.add_argument("--json", action="store_true", dest="as_json")
     return parser
 
 
@@ -115,6 +136,120 @@ def _serve(settings: Settings) -> int:
     return 0
 
 
+def _resolve_project(session, value: str) -> Project:
+    path = Path(value).expanduser()
+    project = None
+    if path.is_absolute() or "/" in value or "\\" in value:
+        try:
+            project = session.query(Project).filter(Project.root_path == str(path.resolve())).first()
+        except OSError:
+            project = None
+    if project is None:
+        project = session.get(Project, value)
+    if project is None:
+        raise SystemExit(f"project not found: {value}")
+    return project
+
+
+def _release_preflight(settings: Settings, value: str, *, as_json: bool) -> int:
+    database = _database(settings)
+    with database.sessions() as session:
+        project = _resolve_project(session, value)
+        # A preflight before Release creation uses the same deterministic v2
+        # checks as the service; the release command itself remains explicit.
+        from .services import _release_preflight as collect_release_preflight
+
+        entries, _assets, issues = collect_release_preflight(session, project=project)
+        payload = {
+            "project_id": project.id,
+            "manifest_version": 2,
+            "blocking": bool(issues),
+            "issues": issues,
+            "asset_count": len(entries),
+        }
+    _print(payload, as_json=as_json)
+    return 0 if not payload["blocking"] else 2
+
+
+def _create_release(settings: Settings, value: str, name: str, *, as_json: bool) -> int:
+    database = _database(settings)
+    with database.sessions() as session:
+        project = _resolve_project(session, value)
+        release = create_release(
+            session,
+            ReleaseCreate(project_id=project.id, name=name, format_version=2),
+        )
+        payload = {
+            "id": release.id,
+            "project_id": release.project_id,
+            "name": release.name,
+            "manifest_version": release.manifest_version,
+            "manifest_path": release.manifest_path,
+            "manifest_hash": release.manifest_hash,
+            "snapshot_hash": release.snapshot_hash,
+            "asset_count": release.asset_count,
+        }
+    _print(payload, as_json=as_json)
+    return 0
+
+
+def _export(settings: Settings, arguments: argparse.Namespace) -> int:
+    database = _database(settings)
+    with database.sessions() as session:
+        if arguments.export_command == "verify":
+            payload = verify_export(
+                session,
+                project_id=arguments.project,
+                release_id=arguments.release,
+                game_root=arguments.game_root,
+                run_commands=arguments.run_commands,
+            )
+        elif arguments.export_command == "preview":
+            payload = export_preview(
+                session,
+                project_id=arguments.project,
+                release_id=arguments.release,
+                game_root=arguments.game_root,
+            )
+        elif arguments.export_command == "apply":
+            payload = apply_export(
+                session,
+                project_id=arguments.project,
+                release_id=arguments.release,
+                game_root=arguments.game_root,
+                run_commands=arguments.run_commands,
+            )
+        else:
+            preview = export_preview(
+                session,
+                project_id=arguments.project,
+                release_id=arguments.release,
+                game_root=arguments.game_root,
+            )
+            payload = apply_export(
+                session,
+                project_id=arguments.project,
+                release_id=arguments.release,
+                game_root=arguments.game_root,
+                run_commands=arguments.run_commands,
+                rollback_from=preview.get("previous_release_id"),
+            )
+        if hasattr(payload, "__table__"):
+            payload = {
+                "id": payload.id,
+                "project_id": payload.project_id,
+                "release_id": payload.release_id,
+                "status": payload.status,
+                "display_path": payload.display_path,
+                "files": payload.files_json,
+                "validation_results": payload.validation_results_json,
+            }
+    _print(payload, as_json=arguments.as_json)
+    if arguments.export_command == "verify" and not payload.get("ok", False):
+        return 2
+    return 0
+
+
 def main(argv: list[str] | None = None) -> None:
     arguments = _parser().parse_args(argv)
     settings = Settings()
@@ -124,6 +259,15 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(_inspect(settings, arguments.plan_id, as_json=arguments.as_json))
     if arguments.command == "run" and arguments.run_command == "resume":
         raise SystemExit(_resume(settings, arguments.plan_id, as_json=arguments.as_json))
+    if arguments.command == "release" and arguments.release_command == "preflight":
+        raise SystemExit(_release_preflight(settings, arguments.project, as_json=arguments.as_json))
+    if arguments.command == "release" and arguments.release_command == "create":
+        raise SystemExit(_create_release(settings, arguments.project, arguments.name, as_json=arguments.as_json))
+    if arguments.command == "export":
+        try:
+            raise SystemExit(_export(settings, arguments))
+        except DeliveryError as exc:
+            raise SystemExit(f"export failed: {exc}") from exc
     raise SystemExit(2)
 
 

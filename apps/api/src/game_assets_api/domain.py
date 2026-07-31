@@ -624,6 +624,10 @@ class ReviewRead(ORMModel):
 class ReleaseCreate(BaseModel):
     project_id: str
     name: str
+    format_version: Literal[1, 2] = Field(
+        default=1,
+        description="Release manifest version; v1 remains available for legacy clients, v2 enables Delivery.",
+    )
     publish_media: bool = Field(
         default=True,
         deprecated=True,
@@ -635,10 +639,70 @@ class ReleaseRead(ORMModel):
     id: str
     project_id: str
     name: str
+    manifest_version: int = 1
     manifest_path: str
     manifest_hash: str
+    snapshot_hash: str | None = None
     asset_count: int
     created_at: datetime
+
+
+class ReleasePreflightRead(BaseModel):
+    project_id: str
+    release_id: str | None = None
+    manifest_version: int | None = None
+    manifest_hash: str | None = None
+    snapshot_hash: str | None = None
+    issues: list[str] = Field(default_factory=list)
+    blocking: bool = False
+    assets: list[dict[str, Any]] = Field(default_factory=list)
+    export_config: dict[str, Any] = Field(default_factory=dict)
+
+
+class ExportRequest(BaseModel):
+    project_id: str
+    release_id: str
+    game_root: str | None = None
+    run_commands: bool = True
+
+
+class ExportVerifyRequest(BaseModel):
+    project_id: str
+    release_id: str | None = None
+    game_root: str | None = None
+    run_commands: bool = False
+
+
+class ExportRollbackRequest(ExportRequest):
+    pass
+
+
+class DeliveryRead(ORMModel):
+    id: str
+    project_id: str
+    release_id: str
+    release_manifest_hash: str
+    snapshot_hash: str
+    checkout_fingerprint: str
+    display_path: str
+    status: str
+    previous_release_id: str | None
+    files: list[dict[str, Any]] = Field(default_factory=list, validation_alias="files_json")
+    validation_results: list[dict[str, Any]] = Field(
+        default_factory=list, validation_alias="validation_results_json"
+    )
+    rollback: dict[str, Any] | None = Field(default=None, validation_alias="rollback_json")
+    created_at: datetime
+
+
+class ExportConfigRead(BaseModel):
+    project_id: str
+    project: dict[str, Any] = Field(default_factory=dict)
+    local: dict[str, Any] = Field(default_factory=dict)
+
+
+class ExportConfigUpdate(BaseModel):
+    game_root: str | None = None
 
 
 class ScanReport(BaseModel):

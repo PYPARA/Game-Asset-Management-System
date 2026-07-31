@@ -87,6 +87,11 @@ class Database:
                 ("billable", "BOOLEAN NOT NULL DEFAULT 1"),
                 ("estimated_cost", "FLOAT"),
             ),
+            "releases": (
+                ("manifest_version", "INTEGER NOT NULL DEFAULT 1"),
+                ("snapshot_hash", "VARCHAR(80)"),
+            ),
+            "deliveries": (),
         }
         with self.engine.begin() as connection:
             for table, additions in columns.items():
@@ -119,7 +124,15 @@ class Database:
                     "ix_generation_attempts_idempotency_key",
                     "idempotency_key",
                 ),
+                ("deliveries", "ix_deliveries_project_id", "project_id"),
+                ("deliveries", "ix_deliveries_release_id", "release_id"),
+                ("deliveries", "ix_deliveries_status", "status"),
             ):
+                if not connection.exec_driver_sql(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+                    (table,),
+                ).first():
+                    continue
                 connection.exec_driver_sql(
                     f'CREATE INDEX IF NOT EXISTS "{name}" ON "{table}" ("{column}")'
                 )

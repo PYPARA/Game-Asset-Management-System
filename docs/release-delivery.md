@@ -1,8 +1,8 @@
 # Release 与游戏项目交付
 
-> 文档状态：M1 已实现候选提升、Artifact 绑定、Release v1 fail-closed 与 Release 索引重建；Manifest v2 和 Delivery 仍是目标契约
-> 基线日期：2026-07-27
-> 当前代码只支持 Project 内的 Release v1；本文中的 Manifest v2、外部导出、Delivery、`gams-lock.json` 和回滚仍属于后续里程碑。
+> 文档状态：M3 已实现 Manifest v2、Delivery 事务、收据重建与回滚
+> 验收日期：2026-07-31
+> 当前代码保留旧 Release v1 读取兼容；新的 M3 CLI/API/UI 交付路径使用 Manifest v2。
 
 ## 目标
 
@@ -19,10 +19,10 @@ Release 与 Delivery 是两个不同动作：
 |---|---|---|
 | 候选存储 | workspace 只保存临时候选；批准时提升到内容寻址耐久对象 | 已达到 M1 契约 |
 | 批准 | 审核绑定 promotion 修订、依赖哈希和耐久 Artifact 哈希；正式修订不引用 workspace | 已达到 M1 契约 |
-| Release | v1 Manifest；全量预检，任一项失败则整次失败 | M3 升级为 Manifest v2 和 snapshot hash |
-| 恢复 | Artifact、审核和 Release 可从 Project 文件重建 SQLite 索引 | M3 继续增加 Delivery 收据重建 |
-| 外部导出 | 未实现 | preview、stage、verify、apply、rollback 和幂等检测 |
-| 游戏侧状态 | 无受管文件边界 | `gams-lock.json` 记录版本与所有受管文件哈希 |
+| Release | v1 保持兼容；M3 Release 使用 Manifest v2、snapshot hash 和完整预检 | 已达到 M3 契约 |
+| 恢复 | Artifact、审核、Release 和 Delivery 均可从 Project 文件重建 SQLite 索引 | 已达到 M3 契约 |
+| 外部导出 | preview、内部 staging、verify、apply、rollback、no-op 幂等和失败恢复 | 已达到 M3 契约 |
+| 游戏侧状态 | `gams-lock.json` 记录 Release、snapshot 和所有受管文件哈希；未知文件不触碰 | 已达到 M3 契约 |
 | Git | 不自动操作 | 保持不自动操作，只展示 Project 与游戏仓库 diff |
 
 ## 不变量
@@ -66,7 +66,7 @@ history/reviews/...                      不可变审核决定
 
 驳回不会提升候选。需要保留的驳回证据可继续位于 `workspace/rejected`，也可由用户显式封存为历史 Artifact。
 
-## Release Manifest v2（M3 目标）
+## Release Manifest v2（M3 已实现）
 
 ### 创建前预检
 
@@ -103,11 +103,10 @@ history/reviews/...                      不可变审核决定
       "revision_id": "revision_...",
       "content_hash": "sha256:...",
       "dependency_hash": "sha256:...",
-      "media": [
+      "renditions": [
         {
           "artifact_id": "artifact_...",
-          "blob_hash": "sha256:...",
-          "project_path": "approved/objects/ab/ab...webp",
+          "path": "approved/objects/ab/ab...webp",
           "target_path": "public/assets/portraits/core/han-lie/resolute.webp",
           "media_type": "image/webp",
           "width": 1024,
@@ -327,24 +326,24 @@ Delivery 成功后，GAMS 只展示：
 
 用户可以在两个仓库分别审查和提交。项目不得把“Git 已提交”作为 Delivery 成功条件，也不得把“Delivery 成功”误报为 Git 已保存。
 
-## 目标 CLI 与 API
+## CLI 与 API
 
-计划中的命令：
+已提供的命令：
 
 ```text
 gams release preflight <project> [--json]
 gams release create <project> --name <name> [--json]
-gams export preview <release> [--json]
-gams export apply <release> [--json]
-gams export verify [<release>] [--run-commands] [--json]
-gams export rollback <release> [--json]
+gams export preview <release> --project <project> [--json]
+gams export apply <release> --project <project> [--run-commands] [--json]
+gams export verify [<release>] --project <project> [--run-commands] [--json]
+gams export rollback <release> --project <project> [--run-commands] [--json]
 ```
 
-Web API 使用相同领域服务，提供预检结果、执行状态、事件流和 Delivery 历史。CLI、API 和 UI 不得各自实现不同的文件事务逻辑。
+Web API 使用相同领域服务，提供预检结果、执行状态、验证结果和 Delivery 历史：`/projects/{id}/export-config`、`/releases/{id}/preflight`、`/exports/preview`、`/exports/apply`、`/exports/verify`、`/exports/rollback` 和 `/deliveries`。CLI、API 和 UI 共享同一文件事务实现。
 
 ## 测试与验收
 
-至少覆盖：
+M3 自动化覆盖：
 
 - 删除 workspace 后，批准媒体仍能扫描、预览、复验、Release 和 Delivery。
 - 删除 SQLite 后，从 Project 恢复 Release 与 Delivery 历史。
@@ -357,3 +356,5 @@ Web API 使用相同领域服务，提供预检结果、执行状态、事件流
 - 旧 Release 回滚通过重新交付完成，历史 Manifest 不变。
 - Emperor 内容清单、TypeScript、Vitest、生产构建和浏览器 smoke/E2E 全部通过。
 - 自动化测试断言 GAMS 与 Codex 不会执行 commit 或 push。
+
+M3 验收记录（2026-07-31）：API 55 项、Web 39 项通过；生产构建、Python 编译和 SQLite/Alembic 升级检查通过。覆盖 Manifest v2 snapshot hash、preview/apply/verify、no-op、未知文件与篡改保护、验证失败恢复、旧 Release 回滚、Delivery 收据重建和窄视口交付面板。

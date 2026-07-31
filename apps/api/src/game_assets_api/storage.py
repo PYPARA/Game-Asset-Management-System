@@ -40,6 +40,7 @@ class ProjectScanResult:
     artifacts: list[dict[str, Any]]
     reviews: list[dict[str, Any]]
     releases: list[dict[str, Any]]
+    deliveries: list[dict[str, Any]]
     errors: list[str]
 
 
@@ -191,6 +192,7 @@ class ProjectStore:
                 "history/objects",
                 "history/reviews",
                 "history/qa",
+                "history/deliveries",
                 "releases",
                 "imports",
                 "workspace/candidates",
@@ -217,9 +219,12 @@ class ProjectStore:
                     "name": name,
                     "default_language": default_language,
                     "export": {
+                        "format_version": 1,
                         "content_path": "src/generated/content",
                         "manifest_path": "src/generated/game-assets/assetManifest.ts",
                         "assets_path": "public/assets",
+                        "lock_path": "gams-lock.json",
+                        "validation_commands": [],
                     },
                 },
             )
@@ -256,6 +261,41 @@ class ProjectStore:
                 raise StorageError("project contract id does not match the registered project")
             contract["name"] = name
             atomic_write_yaml(project_path, contract)
+
+    def export_contract(self) -> dict[str, Any]:
+        """Return the committed export contract with safe defaults applied."""
+
+        contract = self.read_yaml(self.root / "project.yaml")
+        if contract.get("format_version") != 1:
+            raise StorageError("unsupported project format")
+        configured = contract.get("export")
+        if configured is not None and not isinstance(configured, dict):
+            raise StorageError("export must be a mapping")
+        defaults: dict[str, Any] = {
+            "format_version": 1,
+            "content_path": "src/generated/content",
+            "manifest_path": "src/generated/game-assets/assetManifest.ts",
+            "assets_path": "public/assets",
+            "lock_path": "gams-lock.json",
+            "validation_commands": [],
+        }
+        result = {**defaults, **(configured or {})}
+        if not isinstance(result.get("validation_commands"), list):
+            raise StorageError("export.validation_commands must be a list")
+        return result
+
+    def local_export_config(self) -> dict[str, Any]:
+        path = self.root / "project.local.yaml"
+        if not path.exists():
+            return {"game_root": None}
+        value = self.read_yaml(path)
+        return value if isinstance(value, dict) else {"game_root": None}
+
+    def update_local_export_config(self, *, game_root: str | None) -> dict[str, Any]:
+        value = {"game_root": game_root}
+        with self.lock():
+            atomic_write_yaml(self.root / "project.local.yaml", value)
+        return value
 
     @staticmethod
     def read_yaml(path: Path) -> dict[str, Any]:
@@ -554,6 +594,23 @@ class ProjectStore:
                 atomic_write_json(path, record, immutable=True)
         return relative_to_root(self.root, path)
 
+    def delivery_path(self, receipt: dict[str, Any]) -> Path:
+        receipt_id = str(receipt["id"])
+        if "/" in receipt_id or "\\" in receipt_id or receipt_id in {".", ".."}:
+            raise StorageError("invalid delivery id")
+        created_at = str(receipt.get("created_at") or datetime.now(UTC).isoformat())
+        try:
+            date = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise StorageError("delivery created_at must be an ISO timestamp") from exc
+        return self.history / "deliveries" / f"{date.year:04d}" / f"{date.month:02d}" / f"{receipt_id}.json"
+
+    def write_delivery(self, receipt: dict[str, Any]) -> str:
+        path = self.delivery_path(receipt)
+        with self.lock():
+            atomic_write_json(path, receipt, immutable=True)
+        return relative_to_root(self.root, path)
+
     def commit_media_approval(
         self,
         *,
@@ -670,6 +727,7 @@ class ProjectStore:
         artifacts: list[dict[str, Any]] = []
         review_records: list[dict[str, Any]] = []
         releases: list[dict[str, Any]] = []
+        deliveries: list[dict[str, Any]] = []
         errors: list[str] = []
         superseded_revision_ids: set[str] = set()
         current_revision_ids: set[str] = set()
@@ -684,6 +742,7 @@ class ProjectStore:
                 artifacts,
                 review_records,
                 releases,
+                deliveries,
                 ["project.yaml is missing"],
             )
 
@@ -945,12 +1004,21 @@ class ProjectStore:
                 release_id = str(manifest["release_id"])
                 if release_id != manifest_path.parent.name:
                     raise StorageError("release id does not match its directory")
-                if manifest.get("format_version") != 1:
+                if manifest.get("format_version") not in {1, 2}:
                     raise StorageError("unsupported release manifest format")
                 if str(manifest.get("project_id", "")) != project_id:
                     raise StorageError("release belongs to a different project")
                 if not isinstance(manifest.get("assets"), list):
                     raise StorageError("release assets must be a list")
+                if manifest.get("format_version") == 2:
+                    snapshot_payload = {
+                        "format_version": 2,
+                        "project_id": project_id,
+                        "assets": manifest["assets"],
+                    }
+                    expected_snapshot = f"sha256:{sha256_bytes(canonical_json(snapshot_payload))}"
+                    if manifest.get("snapshot_hash") != expected_snapshot:
+                        raise StorageError("release snapshot hash is invalid")
                 releases.append(
                     {
                         "id": release_id,
@@ -958,12 +1026,40 @@ class ProjectStore:
                         "name": str(manifest.get("name") or release_id),
                         "manifest_path": relative_to_root(self.root, manifest_path),
                         "manifest_hash": sha256_file(manifest_path),
+                        "manifest_version": int(manifest.get("format_version", 1)),
+                        "snapshot_hash": manifest.get("snapshot_hash"),
                         "asset_count": len(manifest["assets"]),
                         "created_at": manifest.get("created_at"),
                     }
                 )
             except (StorageError, KeyError, TypeError, ValueError) as exc:
                 errors.append(f"{relative_to_root(self.root, manifest_path)}: {exc}")
+
+        for receipt_path in sorted((self.history / "deliveries").glob("**/*.json")):
+            try:
+                receipt = self.read_json(receipt_path)
+                required = {
+                    "id",
+                    "project_id",
+                    "release_id",
+                    "release_manifest_hash",
+                    "snapshot_hash",
+                    "checkout_fingerprint",
+                    "display_path",
+                    "status",
+                    "created_at",
+                }
+                missing = sorted(required - receipt.keys())
+                if missing:
+                    raise StorageError(f"delivery receipt is missing: {', '.join(missing)}")
+                if str(receipt["project_id"]) != project_id:
+                    raise StorageError("delivery belongs to a different project")
+                if self.delivery_path(receipt) != receipt_path:
+                    raise StorageError("delivery receipt path does not match its id or date")
+                receipt["file_path"] = relative_to_root(self.root, receipt_path)
+                deliveries.append(receipt)
+            except (StorageError, KeyError, TypeError, ValueError) as exc:
+                errors.append(f"{relative_to_root(self.root, receipt_path)}: {exc}")
 
         return ProjectScanResult(
             assets,
@@ -974,6 +1070,7 @@ class ProjectStore:
             artifacts,
             review_records,
             releases,
+            deliveries,
             errors,
         )
 

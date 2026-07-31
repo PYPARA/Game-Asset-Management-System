@@ -423,7 +423,29 @@ class Release(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
     name: Mapped[str] = mapped_column(String(200))
+    manifest_version: Mapped[int] = mapped_column(Integer, default=1)
     manifest_path: Mapped[str] = mapped_column(Text)
     manifest_hash: Mapped[str] = mapped_column(String(64))
+    snapshot_hash: Mapped[str | None] = mapped_column(String(80), nullable=True)
     asset_count: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class Delivery(Base):
+    """Rebuildable lookup index for immutable Project delivery receipts."""
+
+    __tablename__ = "deliveries"
+
+    id: Mapped[str] = mapped_column(String(48), primary_key=True)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    release_id: Mapped[str] = mapped_column(ForeignKey("releases.id", ondelete="CASCADE"), index=True)
+    release_manifest_hash: Mapped[str] = mapped_column(String(80))
+    snapshot_hash: Mapped[str] = mapped_column(String(80))
+    checkout_fingerprint: Mapped[str] = mapped_column(String(80))
+    display_path: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(40), index=True)
+    previous_release_id: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    files_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    validation_results_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    rollback_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

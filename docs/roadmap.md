@@ -17,7 +17,7 @@ GAMS 的 v1 目标不是单纯调用图片供应商，而是建立一条可恢�
 
 ## 当前基线
 
-当前系统处于“M2.1 多供应商与任务级模型路由已完成，M3 外部交付与 M4 智能监督尚未完成”的阶段。下面是截至 2026-07-30 从代码和验收记录确认的状态。
+当前系统处于“M3 Release 与游戏交付已完成，M4 智能监督尚未完成”的阶段。下面是截至 2026-07-31 从代码和验收记录确认的状态。
 
 | 能力 | 当前状态 | 说明 |
 |---|---|---|
@@ -29,12 +29,12 @@ GAMS 的 v1 目标不是单纯调用图片供应商，而是建立一条可恢�
 | 生成计划工作台 | 已实现 M2.1 | Web 可编辑 Prompt、尺寸、Schema、依赖、参考任务、任务供应商与模型，按供应商展示成本并要求两步显式确认。 |
 | 图片归一化与硬 QA | 已实现 M2 | 尺寸、编码、Alpha、体积、色键、智能抠图适配、边缘清理、联系表与差异证据已接通；Codex 自动语义诊断仍属于 M4。 |
 | 人工审核 | 已实现 | 媒体批准会提升耐久 Artifact、创建 promotion 修订并绑定 Artifact/依赖哈希；硬 QA 不通过时拒绝批准。 |
-| Release | 部分实现 | Release v1 已全量预检、fail-closed 且可重建索引；Manifest v2、snapshot hash 与 Delivery 尚未实现。 |
-| 游戏仓库交付 | 未实现 | `project.local.yaml` 已预留 checkout 绑定，但没有 preview/apply/verify/rollback。 |
+| Release | 已实现 M3 | Release v1 保持兼容；M3 使用 Manifest v2、snapshot hash、完整预检和可重建索引。 |
+| 游戏仓库交付 | 已实现 M3 | 支持 checkout 绑定、preview/apply/verify/rollback、staging、`gams-lock.json`、篡改保护、失败恢复和 Delivery 收据。 |
 | Codex 监督 Agent | 未实现 | 确定性 Finding、Evidence、RemediationAction 和人工检查器已存在；内嵌会话、自动语义诊断、AgentSession 与 ChangeSet 仍属于 M4。 |
 | 叙事地图 | 未开始 | 类型化关系模型已具备，UI 安排在 v1.1。 |
 
-历史验收快照记录了前端 25 项测试、API 23 项测试和 Emperor Project 扫描通过；这些数字属于 [设计 QA 基线](../design-qa.md)，不是持续监控结果。当前 M0–M2.1 验收结果见下方带日期的记录。
+历史验收快照记录了前端 25 项测试、API 23 项测试和 Emperor Project 扫描通过；这些数字属于 [设计 QA 基线](../design-qa.md)，不是持续监控结果。当前 M0–M3 验收结果见下方带日期的记录。
 
 ## P0 风险状态
 
@@ -60,11 +60,9 @@ Release v1 现在先收集完整问题列表；批准失效、依赖变化、QA 
 
 预检失败不写 Manifest、不改变资产发布状态；正式文件写入中途失败会恢复 Release 指针、Catalog 和本次 Manifest。
 
-### P0-4（Release 部分已关闭）：Project 恢复边界
+### P0-4（M3 已关闭）：Project 恢复边界
 
-Artifact、真实审核决定和 Release 已能从 Project 文件重建 SQLite 索引。外部游戏 checkout 的 Delivery 收据、受管文件哈希和 lock 文件尚未实现，继续由 M3 负责。
-
-M3 的目标仍是让 Delivery 和受管文件哈希同样由 Project 文件恢复，SQLite 只作为索引。
+Artifact、真实审核决定、Release 和 Delivery 已能从 Project 文件重建 SQLite 索引。外部游戏 checkout 的受管文件哈希保存在 `gams-lock.json`，Project 只保存不可变 Delivery 收据。
 
 ### P0-5（M2 已关闭）：并发、租约与预算形成硬约束
 
@@ -222,6 +220,15 @@ M1 已满足 M2 和 M3 的共同事实源前置条件。M4 必须建立在 M2.1 
 
 详细契约见 [Release 与游戏项目交付](release-delivery.md)。
 
+#### M3 验收记录（2026-07-31）
+
+状态：已完成。
+
+- Release v2 写入可重现的 snapshot hash；旧 v1 API/索引保持可检查。
+- CLI、API 和 Web 共享 preview/apply/verify/rollback；apply 使用 checkout staging、最后写入 lock、argv 验证命令和失败恢复。
+- 自动化覆盖 no-op、未知文件保护、受管文件篡改阻止、验证失败回滚、旧 Release 回滚、Delivery 收据重建和删除 SQLite 后恢复索引。
+- API 55 项、Web 39 项、Web 生产构建、Python 编译和 Alembic/SQLite 升级检查通过。
+
 ### M4：Codex 监督 Agent
 
 范围：
@@ -293,14 +300,13 @@ M1 已满足 M2 和 M3 的共同事实源前置条件。M4 必须建立在 M2.1 
 - `gams run inspect|resume`；Web/API 也提供计划创建、显式确认、预算调整、运行检查、持久事件和返工动作。
 - 多供应商 CRUD/归档/恢复、模型目录与分类、全局文字/图片默认路由，以及任务级 `provider_profile_id` / `model` 冻结路由。
 - `Artifact`、`Finding`、运行 Evidence，以及 `retry`、`tool_repair`、`regenerate`、`image_edit`、`await_user` 五种 `RemediationAction`。
-- Release v1 的 fail-closed 创建 API。
+- Release v1 的 fail-closed 创建 API；M3 的 Manifest v2、Delivery API/UI、CLI 和可重建收据。
 
 仍属于后续目标：
 
 - 独立的 `gams plan validate|confirm` CLI 和 `gams release preflight|create` CLI。
-- `gams export preview|apply|verify|rollback --json`、Delivery API/UI 与历史。
 - M4 的 `propose_changeset`、`AgentSession`、Codex 事件和 ChangeSet 审批。
-- M3 的 `Delivery`、目标 checkout 文件哈希、验证结果、收据与回滚信息。
+- M5 真实游戏 checkout 试点及完整游戏侧验收。
 
 ## 全局验收原则
 

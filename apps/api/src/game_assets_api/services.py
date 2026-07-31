@@ -38,6 +38,7 @@ from .models import (
     AssetRelation,
     AssetRevision,
     Artifact,
+    Delivery,
     GenerationJob,
     GenerationPlan,
     Project,
@@ -561,6 +562,7 @@ def _scan_project(session: Session, project: Project) -> ScanReport:
     artifacts = scanned.artifacts
     reviews = scanned.reviews
     releases = scanned.releases
+    deliveries = scanned.deliveries
     errors = scanned.errors
     indexed_assets = 0
     indexed_revisions = 0
@@ -572,6 +574,7 @@ def _scan_project(session: Session, project: Project) -> ScanReport:
     known_artifact_ids: set[str] = set()
     known_review_ids: set[str] = set()
     known_release_ids: set[str] = set()
+    known_delivery_ids: set[str] = set()
     for data in assets:
         try:
             identifier = str(data["id"])
@@ -876,10 +879,41 @@ def _scan_project(session: Session, project: Project) -> ScanReport:
             release.name = str(data["name"])
             release.manifest_path = str(data["manifest_path"])
             release.manifest_hash = str(data["manifest_hash"])
+            release.manifest_version = int(data.get("manifest_version", 1))
+            release.snapshot_hash = data.get("snapshot_hash")
             release.asset_count = int(data["asset_count"])
             release.created_at = _parse_datetime(data.get("created_at"))
         except (KeyError, TypeError, ValueError) as exc:
             errors.append(f"release {data.get('id', '<unknown>')}: {exc}")
+    # Delivery rows reference Releases.  There is no ORM relationship on the
+    # rebuild-only index, so make the parent inserts visible before adding
+    # receipts when SQLite foreign keys are enabled.
+    session.flush()
+    for data in deliveries:
+        try:
+            identifier = str(data["id"])
+            known_delivery_ids.add(identifier)
+            release_id = str(data["release_id"])
+            if session.get(Release, release_id) is None:
+                raise ValueError(f"delivery references unknown release: {release_id}")
+            delivery = session.get(Delivery, identifier)
+            if delivery is None:
+                delivery = Delivery(id=identifier, project_id=project.id, release_id=release_id)
+                session.add(delivery)
+            delivery.project_id = project.id
+            delivery.release_id = release_id
+            delivery.release_manifest_hash = str(data["release_manifest_hash"])
+            delivery.snapshot_hash = str(data["snapshot_hash"])
+            delivery.checkout_fingerprint = str(data["checkout_fingerprint"])
+            delivery.display_path = str(data["display_path"])
+            delivery.status = str(data["status"])
+            delivery.previous_release_id = data.get("previous_release_id")
+            delivery.files_json = list(data.get("files", []))
+            delivery.validation_results_json = list(data.get("validation_results", []))
+            delivery.rollback_json = data.get("rollback")
+            delivery.created_at = _parse_datetime(data.get("created_at"))
+        except (KeyError, TypeError, ValueError) as exc:
+            errors.append(f"delivery {data.get('id', '<unknown>')}: {exc}")
     if not errors:
         project_assets = list(
             session.scalars(select(Asset).where(Asset.project_id == project.id)).all()
@@ -929,6 +963,11 @@ def _scan_project(session: Session, project: Project) -> ScanReport:
         ).all():
             if release.id not in known_release_ids:
                 session.delete(release)
+        for delivery in session.scalars(
+            select(Delivery).where(Delivery.project_id == project.id)
+        ).all():
+            if delivery.id not in known_delivery_ids:
+                session.delete(delivery)
         for relation in session.scalars(
             select(AssetRelation).where(AssetRelation.project_id == project.id)
         ).all():
@@ -2004,19 +2043,29 @@ def create_release(session: Session, payload: ReleaseCreate) -> Release:
         id=new_id(),
         project_id=project.id,
         name=payload.name,
+        manifest_version=payload.format_version,
         manifest_path="pending",
         manifest_hash="pending",
+        snapshot_hash=None,
         asset_count=len(entries),
         created_at=utcnow(),
     )
     manifest = {
-        "format_version": 1,
+        "format_version": payload.format_version,
         "release_id": release.id,
         "name": release.name,
         "project_id": project.id,
         "created_at": release.created_at.isoformat(),
         "assets": sorted(entries, key=lambda entry: entry["key"]),
     }
+    if payload.format_version == 2:
+        snapshot_payload = {
+            "format_version": 2,
+            "project_id": project.id,
+            "assets": manifest["assets"],
+        }
+        release.snapshot_hash = f"sha256:{sha256_bytes(canonical_json(snapshot_payload))}"
+        manifest["snapshot_hash"] = release.snapshot_hash
     session.add(release)
     session.flush()
     release.manifest_path, release.manifest_hash = store.commit_release(

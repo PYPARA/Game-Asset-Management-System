@@ -5,8 +5,12 @@ import type {
   GenerationPlanInput,
   GenerationPlanRun,
   GenerationProviderProfile,
+  DeliveryRecord,
+  ExportConfig,
+  ExportPreview,
   JobSummary,
   ProjectSummary,
+  ReleaseSummary,
   ProviderDefaults,
   ProviderModelRecord,
   QACheck,
@@ -47,6 +51,72 @@ export const emptyWorkbenchPayload: WorkbenchPayload = {
   assets: [],
   job: emptyJob,
 };
+
+export async function fetchReleases(projectId: string): Promise<ReleaseSummary[]> {
+  return request<ReleaseSummary[]>(`/releases?project_id=${encodeURIComponent(projectId)}`);
+}
+
+export async function fetchExportConfig(projectId: string): Promise<ExportConfig> {
+  return request<ExportConfig>(`/projects/${encodeURIComponent(projectId)}/export-config`);
+}
+
+export async function updateExportConfig(projectId: string, gameRoot: string | null): Promise<ExportConfig> {
+  return request<ExportConfig>(`/projects/${encodeURIComponent(projectId)}/export-config`, {
+    method: "PUT",
+    body: JSON.stringify({ game_root: gameRoot }),
+  });
+}
+
+export async function previewExport(
+  projectId: string,
+  releaseId: string,
+  gameRoot?: string,
+): Promise<ExportPreview> {
+  return request<ExportPreview>("/exports/preview", {
+    method: "POST",
+    body: JSON.stringify({ project_id: projectId, release_id: releaseId, game_root: gameRoot }),
+  });
+}
+
+export async function applyExport(
+  projectId: string,
+  releaseId: string,
+  gameRoot?: string,
+  runCommands = true,
+): Promise<DeliveryRecord> {
+  return request<DeliveryRecord>("/exports/apply", {
+    method: "POST",
+    body: JSON.stringify({ project_id: projectId, release_id: releaseId, game_root: gameRoot, run_commands: runCommands }),
+  });
+}
+
+export async function verifyExport(
+  projectId: string,
+  releaseId?: string,
+  gameRoot?: string,
+  runCommands = false,
+): Promise<Record<string, unknown>> {
+  return request<Record<string, unknown>>("/exports/verify", {
+    method: "POST",
+    body: JSON.stringify({ project_id: projectId, release_id: releaseId, game_root: gameRoot, run_commands: runCommands }),
+  });
+}
+
+export async function rollbackExport(
+  projectId: string,
+  releaseId: string,
+  gameRoot?: string,
+  runCommands = true,
+): Promise<DeliveryRecord> {
+  return request<DeliveryRecord>("/exports/rollback", {
+    method: "POST",
+    body: JSON.stringify({ project_id: projectId, release_id: releaseId, game_root: gameRoot, run_commands: runCommands }),
+  });
+}
+
+export async function fetchDeliveries(projectId: string): Promise<DeliveryRecord[]> {
+  return request<DeliveryRecord[]>(`/deliveries?project_id=${encodeURIComponent(projectId)}`);
+}
 
 export class ApiError extends Error {
   readonly status: number;

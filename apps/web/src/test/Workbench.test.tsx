@@ -53,6 +53,11 @@ function mockAssetApi(jobs: unknown[] = [], options: MockAssetApiOptions = {}) {
         })));
       }
       if (url === "/api/provider-defaults") return json({ text: null, image: null, updated_at: null });
+      if (url.startsWith("/api/releases?")) return json([]);
+      if (url === "/api/projects/project-1/export-config") {
+        return json({ project_id: "project-1", project: {}, local: { game_root: null } });
+      }
+      if (url.startsWith("/api/deliveries?")) return json([]);
       const unlockMatch = /^\/api\/providers\/([^/]+)\/unlock$/.exec(url);
       if (unlockMatch && init?.method === "POST") {
         const providerId = decodeURIComponent(unlockMatch[1]);
@@ -199,6 +204,19 @@ describe("制作台", () => {
     expect(screen.getByRole("dialog", { name: "供应商与模型机架" })).toBeInTheDocument();
     expect(screen.getByText("本机安全边界")).toBeInTheDocument();
     expect(screen.getByText(/无法抵御同源脚本注入/)).toBeInTheDocument();
+  });
+
+  it("打开 Release 交付抽屉并读取本机 checkout 配置", async () => {
+    mockAssetApi();
+    const user = userEvent.setup();
+    renderWorkbench();
+
+    await user.click(await screen.findByRole("button", { name: "Release 与游戏交付" }));
+
+    expect(screen.getByRole("dialog", { name: "Release 与游戏交付" })).toBeInTheDocument();
+    expect(screen.getByText("绑定游戏 checkout")).toBeInTheDocument();
+    expect(screen.queryByText("当前只有 Release v1；请用 M3 CLI/API 创建 Manifest v2。")).not.toBeInTheDocument();
+    expect(screen.getByText("尚无外部交付记录。")).toBeInTheDocument();
   });
 
   it("启动时逐个解锁活动供应商，并隔离单个凭据失败", async () => {

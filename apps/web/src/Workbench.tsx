@@ -13,6 +13,7 @@ import {
   Article,
   CaretDown,
   CheckCircle,
+  CloudArrowUp,
   CrownSimple,
   DotsThree,
   FileText,
@@ -44,6 +45,7 @@ import { ProjectDialog } from "./components/ProjectDialog";
 import { AssetEditorDrawer } from "./components/AssetEditorDrawer";
 import { Inspector } from "./components/Inspector";
 import { SettingsDrawer } from "./components/SettingsDrawer";
+import { DeliveryDrawer } from "./components/DeliveryDrawer";
 import {
   emptyWorkbenchPayload,
   createAssetRevision,
@@ -182,6 +184,7 @@ export function Workbench() {
   const [rowSelection, setRowSelection] = useState<RowSelectionState>({});
   const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [deliveryOpen, setDeliveryOpen] = useState(false);
   const [projectDialogOpen, setProjectDialogOpen] = useState(false);
   const [projectToEdit, setProjectToEdit] = useState<ProjectSummary | null>(null);
   const [toast, setToast] = useState("");
@@ -545,6 +548,7 @@ export function Workbench() {
           </div>
         </div>
         <button className="icon-button" type="button" onClick={() => openProjectDialog()} aria-label="新建 Project" disabled={isError}><FolderOpen size={19} /></button>
+        <button className="icon-button" type="button" onClick={() => setDeliveryOpen(true)} aria-label="Release 与游戏交付" disabled={!data.project.id || isError}><CloudArrowUp size={19} /></button>
         <button className="icon-button" type="button" onClick={() => setSettingsOpen(true)} aria-label="供应商设置"><GearSix size={19} /></button>
         <div className="local-user"><span>本</span><strong>本机用户</strong></div>
       </header>
@@ -614,6 +618,7 @@ export function Workbench() {
               <ul>
                 <li><button type="button"><GitBranch size={18} /><span>本地提交</span></button></li>
                 <li><button type="button"><UploadSimple size={18} /><span>拉取 / 推送</span></button></li>
+                <li><button type="button" onClick={() => setDeliveryOpen(true)} disabled={!data.project.id || isError}><CloudArrowUp size={18} /><span>Release 交付</span></button></li>
               </ul>
             </section>
           </div>
@@ -829,6 +834,12 @@ export function Workbench() {
       ) : null}
 
       <SettingsDrawer open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+      <DeliveryDrawer
+        open={deliveryOpen}
+        projectId={data.project.id}
+        onClose={() => setDeliveryOpen(false)}
+        onMessage={setToast}
+      />
       <ProjectDialog
         open={projectDialogOpen}
         project={projectToEdit}

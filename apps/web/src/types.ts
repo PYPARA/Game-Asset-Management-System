@@ -329,3 +329,55 @@ export interface RunInspection {
   actions: RemediationRun[];
   events: RunEventItem[];
 }
+
+export interface ReleaseSummary {
+  id: string;
+  project_id: string;
+  name: string;
+  manifest_version: number;
+  manifest_path: string;
+  manifest_hash: string;
+  snapshot_hash: string | null;
+  asset_count: number;
+  created_at: string;
+}
+
+export interface ExportConfig {
+  project_id: string;
+  project: Record<string, unknown>;
+  local: { game_root?: string | null } & Record<string, unknown>;
+}
+
+export interface ExportPreview {
+  project_id: string;
+  release_id: string;
+  manifest_version: number;
+  manifest_hash: string;
+  snapshot_hash: string;
+  game_root?: string;
+  checkout_fingerprint?: string;
+  previous_release_id?: string | null;
+  issues: string[];
+  blocking: boolean;
+  no_op?: boolean;
+  assets?: Array<Record<string, unknown>>;
+  export_config?: Record<string, unknown>;
+  changes: Array<Record<string, unknown>>;
+  validation_commands?: Array<Record<string, unknown>>;
+}
+
+export interface DeliveryRecord {
+  id: string;
+  project_id: string;
+  release_id: string;
+  release_manifest_hash: string;
+  snapshot_hash: string;
+  checkout_fingerprint: string;
+  display_path: string;
+  status: string;
+  previous_release_id: string | null;
+  files: Array<Record<string, unknown>>;
+  validation_results: Array<Record<string, unknown>>;
+  rollback: Record<string, unknown> | null;
+  created_at: string;
+}

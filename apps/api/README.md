@@ -8,11 +8,12 @@ FastAPI 后端只监听本机回环地址。Project 根目录文件是权威数�
 - Catalog 使用分组 JSON 集合和统一 `snake_case` 字段。
 - History 保存内容寻址修订、Artifact 元数据、审核和 QA 记录。
 - 媒体候选批准时，原始来源提升到 `production/sources`，运行媒体提升到 `approved/objects`；正式修订不引用 workspace。
-- Release v1 在写 Manifest 前执行全量预检，任一批准失效、QA fail、路径碰撞或 Blob 损坏都会阻止整次 Release。
-- SQLite 中的 Artifact、审核和 Release 都能由 Project 文件重新扫描建立索引。
+- Release v1 保持兼容；M3 的 `gams release create` 和 `format_version: 2` 请求写入带 snapshot hash 的 Manifest v2，并在写文件前执行全量预检。
+- SQLite 中的 Artifact、审核、Release 和 Delivery 都能由 Project 文件重新扫描建立索引；Delivery 收据位于 `history/deliveries`。
 - Workspace 保存被忽略的候选、驳回、QA 报告与缓存。
 - M2 生成计划冻结 DAG、预算与并发；Runner 使用 lease/heartbeat、持久 Attempt 和事件流恢复执行，并为人工返工生成 Finding 与视觉证据。
 - M2.1 支持多个 OpenAI 兼容供应商、全局文字/图片默认路由和任务级供应商/模型覆盖；确认后的 Job 保存冻结供应商快照且不自动回退。
+- M3 支持 `gams release preflight|create`、`gams export preview|apply|verify|rollback`，以及对应 `/api/exports/*`、`/api/deliveries` API。Apply 使用 checkout 内 staging、argv 验证命令、受管文件哈希和最后写入的 `gams-lock.json`；失败会恢复上一版本，重复交付产生 `no_op` 收据。
 - 系统不支持其他项目布局或外部媒体路径协议。
 
 ## 供应商与模型路由
