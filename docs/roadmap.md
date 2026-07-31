@@ -17,7 +17,7 @@ GAMS 的 v1 目标不是单纯调用图片供应商，而是建立一条可恢�
 
 ## 当前基线
 
-当前系统处于“M5 Emperor 试点已接通；游戏 checkout 的既有 E2E 文案断言待维护者修正”的阶段。下面是截至 2026-07-31 从代码和验收记录确认的状态。
+当前系统处于“M6 v1 发布候选验收已接通；游戏 checkout 的既有 E2E 文案断言待维护者修正”的阶段。下面是截至 2026-07-31 从代码和验收记录确认的状态。
 
 | 能力 | 当前状态 | 说明 |
 |---|---|---|
@@ -33,9 +33,10 @@ GAMS 的 v1 目标不是单纯调用图片供应商，而是建立一条可恢�
 | 游戏仓库交付 | 已实现 M3 | 支持 checkout 绑定、preview/apply/verify/rollback、staging、`gams-lock.json`、篡改保护、失败恢复和 Delivery 收据。 |
 | Codex 监督 Agent | 已实现 M4 | 通过隔离 stdio 适配层生成只读上下文和结构化 Finding；AgentSession/AgentEvent 可审计，固定动作交回 Controller，越权代码/文档修改只形成待批准 ChangeSet，失败统一人工降级。 |
 | Emperor 试点 | 已实现 M5（游戏 E2E 待修） | 五项真实资产 replay、旧媒体内容寻址升级、Artifact/Finding/Action/Evidence 链、媒体基线 Release v2、隔离 checkout Delivery 和 `gams-lock.json` 已接通；`pnpm check`/`pnpm build` 通过，既有 E2E 测试仍寻找已改名的开始按钮。 |
+| v1 发布验收 | 已实现 M6（真实供应商 run 可选） | `gams acceptance m6`/`scripts/m6_acceptance.py` 提供 OpenAI-compatible 成功与故障矩阵、并发、磁盘不足、Delivery 中断、SQLite 删除重建和格式边界演练；用户操作、故障和升级手册已补齐。真实供应商连通性需显式提供 URL/API Key，Emperor E2E 文案阻塞仍由游戏仓库维护者处理。 |
 | 叙事地图 | 未开始 | 类型化关系模型已具备，UI 安排在 v1.1。 |
 
-历史验收快照记录了前端 25 项测试、API 23 项测试和 Emperor Project 扫描通过；这些数字属于 [设计 QA 基线](../design-qa.md)，不是持续监控结果。当前 M0–M5 验收结果见下方带日期的记录。
+历史验收快照记录了前端 25 项测试、API 23 项测试和 Emperor Project 扫描通过；这些数字属于 [设计 QA 基线](../design-qa.md)，不是持续监控结果。当前 M0–M6 验收结果见下方带日期的记录。
 
 ## P0 风险状态
 
@@ -304,6 +305,15 @@ M1 已满足 M2 和 M3 的共同事实源前置条件。M4 必须建立在 M2.1 
 - Emperor 全量版本可在独立 checkout 中通过类型检查、测试、构建和浏览器 smoke test。
 - 所有 P0/P1 缺陷关闭或有用户明确接受的降级方案。
 
+#### M6 验收记录（2026-07-31）
+
+状态：GAMS v1 发布候选门禁已完成；真实游戏 E2E 的消费端文案断言保留为外部降级项。
+
+- 新增 `gams acceptance m6` 和 `scripts/m6_acceptance.py`。默认离线验收使用真实 OpenAI-compatible HTTP 适配器和 loopback 故障注入服务，不写真实 Project、不执行 Git；报告为结构化 JSON，API Key 永不落盘。
+- 离线验收 17 项中 16 项通过、`provider.live_contract` 在未提供真实供应商 URL/Key 时明确 skipped、失败数为 0；覆盖成功、限流、5xx、鉴权、额度、内容策略、坏响应、并发、服务/Worker 崩溃、ENOSPC、Delivery 中断、SQLite 删除重建、Project scan 和格式边界。内容策略不再触发 JSON 模式二次请求。
+- 用户操作手册、故障手册和 Project/Manifest/SQLite 格式升级策略已写入 [user-guide.md](user-guide.md)、[troubleshooting.md](troubleshooting.md) 和 [format-upgrades.md](format-upgrades.md)；完整门禁和已知外部阻塞见 [M6 v1 发布验收记录](m6-release.md)。
+- API 现有测试与新增 M6 验收测试通过；隔离 Emperor checkout 的 `pnpm check`（15 项）和 `pnpm build` 通过，`pnpm test:e2e` 在当前 macOS 沙箱受 Playwright Chromium `EPERM` 阻塞（此前 Delivery 验证还记录了 `开始新朝`/`开创新朝` 断言不一致）。发布前仍需在目标真实供应商上显式运行 live contract，并在可启动浏览器的环境中重跑全量浏览器测试。
+
 ### M7：v1.1 叙事地图
 
 范围：
@@ -325,6 +335,7 @@ M1 已满足 M2 和 M3 的共同事实源前置条件。M4 必须建立在 M2.1 
 - `Artifact`、`Finding`、运行 Evidence，以及 `retry`、`tool_repair`、`regenerate`、`image_edit`、`await_user` 五种 Controller `RemediationAction`；M4 另提供 `propose_changeset` Agent 提案和审计 ChangeSet。
 - Release v1 的 fail-closed 创建 API；M3 的 Manifest v2、Delivery API/UI、CLI 和可重建收据。
 - M5 的旧媒体升级 API、显式 Release 资产子集、Emperor replay/证据脚本和失败可审计的 Delivery 报告。
+- M6 的 `gams acceptance m6`/`scripts/m6_acceptance.py` 验收收据、供应商故障矩阵、恢复演练和 v1 操作/升级手册。
 
 仍属于后续目标：
 

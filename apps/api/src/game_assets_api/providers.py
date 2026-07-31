@@ -391,6 +391,16 @@ class OpenAICompatibleProvider:
         except ProviderError as exc:
             if (
                 exc.status_code not in {400, 404, 422}
+                or exc.category
+                in {
+                    ErrorCategory.AUTH,
+                    ErrorCategory.BILLING,
+                    ErrorCategory.QUOTA,
+                    ErrorCategory.RATE_LIMIT,
+                    ErrorCategory.SERVER,
+                    ErrorCategory.NETWORK,
+                    ErrorCategory.CONTENT_POLICY,
+                }
                 or str(exc) == "provider model is unavailable"
             ):
                 raise

@@ -1,6 +1,6 @@
 # 架构说明
 
-> 阅读约定：未特别标注的内容描述截至 2026-07-31 的当前实现；“目标”内容描述 M6 及之后尚未实现的方向。两者不能混用。
+> 阅读约定：未特别标注的内容描述截至 2026-07-31 的当前实现；“目标”内容描述 M7 及之后尚未实现的方向。两者不能混用。
 
 ## 单一 Project 契约
 
@@ -76,7 +76,7 @@ Web 制作台是 Controller 的客户端，不另建业务事实源。Codex 目�
 - GAMS 代码、游戏代码和手写文档变更只生成待批准 ChangeSet。
 - M3 Delivery 使用 Manifest v2、checkout staging、受管文件哈希、验证命令和不可变收据。
 
-目标生产循环详见 [Codex 监督式智能生产](agentic-production.md)，候选提升、Release v2 和游戏 checkout 事务详见 [Release 与游戏项目交付](release-delivery.md)；M5 的重放步骤和已知游戏侧验收阻塞见 [M5 Emperor-Simulator 试点](m5-pilot.md)。
+目标生产循环详见 [Codex 监督式智能生产](agentic-production.md)，候选提升、Release v2 和游戏 checkout 事务详见 [Release 与游戏项目交付](release-delivery.md)；M5 的重放步骤和已知游戏侧验收阻塞见 [M5 Emperor-Simulator 试点](m5-pilot.md)，M6 发布验收、故障演练和格式升级见 [M6 v1 发布验收](m6-release.md)。
 
 ## 本机状态
 

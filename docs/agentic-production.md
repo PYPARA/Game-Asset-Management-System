@@ -1,6 +1,6 @@
 # Codex 监督式智能生产
 
-> 文档状态：M2 确定性 Controller/Worker、M4 Codex Supervisor 和 M5 试点 replay/Delivery 已实现；完整游戏 E2E 仍受 checkout 既有文案断言影响
+> 文档状态：M2 确定性 Controller/Worker、M4 Codex Supervisor、M5 试点 replay/Delivery 和 M6 发布验收已实现；完整游戏 E2E 仍受 checkout 既有文案断言影响
 > 设计输入：Codex 会话 `019f6bee-1442-7331-a919-c585f462ffec` 及 GAMS 当前生产代码
 > 本文同时标明当前确定性能力和 Agent 边界；Codex 仍通过可选、隔离的 stdio 适配器接入，未配置时自动人工降级。
 
@@ -337,4 +337,4 @@ M2 当前已覆盖：
 - Codex 不可用时的人工降级，不丢失 Job 或 Finding。
 - 并发与 DAG 真实产物注入、崩溃恢复、未知交付、未知动作/Worker 拒绝、过期输入拒绝、证据哈希和旧 SQLite 兼容升级。
 
-M4 已覆盖 Agent JSON Schema、语义 Finding、ChangeSet 路径白名单和 Agent 不执行 Git 操作；M5 已覆盖真实资产 replay、旧媒体升级、Release v2 和 checkout Delivery。隔离 checkout 的类型检查与构建通过，游戏仓库中既有的开始按钮文案断言需修正后才能完成最终 E2E 验收。
+M4 已覆盖 Agent JSON Schema、语义 Finding、ChangeSet 路径白名单和 Agent 不执行 Git 操作；M5 已覆盖真实资产 replay、旧媒体升级、Release v2 和 checkout Delivery；M6 已覆盖供应商故障矩阵、并发、崩溃/磁盘/Delivery/SQLite 恢复演练。隔离 checkout 的类型检查与构建通过，游戏仓库中既有的开始按钮文案断言需修正后才能完成最终 E2E 验收。

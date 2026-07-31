@@ -16,6 +16,7 @@ FastAPI 后端只监听本机回环地址。Project 根目录文件是权威数�
 - M3 支持 `gams release preflight|create`、`gams export preview|apply|verify|rollback`，以及对应 `/api/exports/*`、`/api/deliveries` API。Apply 使用 checkout 内 staging、argv 验证命令、受管文件哈希和最后写入的 `gams-lock.json`；失败会恢复上一版本，重复交付产生 `no_op` 收据。
 - M4 提供隔离的 Codex stdio 适配器（通过 `GAME_ASSETS_CODEX_COMMAND` 显式配置）、只读上下文包、AgentSession/AgentEvent 审计、结构化诊断和 `/api/changesets` 审批记录；适配器不可用、输出异常、输入过期、越权或预算触顶均降级人工处理，绝不执行 Git 或修改 SQLite/审核/Release/Delivery 事实。
 - M5 提供 `POST /api/projects/{id}/legacy-media-promotions` 的显式旧媒体升级、Release 的 `asset_keys` 子集和 CLI `--asset` 选项；`scripts/m5_pilot.py` 可在不调用供应商、不执行 Git 的前提下重放 Emperor 试点并记录失败 Delivery 验证。
+- M6 提供 `gams acceptance m6`/`scripts/m6_acceptance.py`，用真实 OpenAI-compatible HTTP 适配器演练成功、限流、5xx、鉴权、额度、内容策略、坏响应、并发和恢复矩阵，并输出不含凭据的结构化 JSON 收据。
 - 系统不支持其他项目布局或外部媒体路径协议。
 
 ## 供应商与模型路由
@@ -41,6 +42,7 @@ uv run --project apps/api pytest
 uv run --project apps/api gams run inspect <plan-id> --json
 uv run --project apps/api gams run resume <plan-id> --json
 uv run --project apps/api gams agent diagnose <job-id> --json
+uv run --project apps/api gams acceptance m6 --output /tmp/gams-m6.json
 ```
 
 OpenAPI 在服务启动后位于 `http://127.0.0.1:8787/openapi.json`。

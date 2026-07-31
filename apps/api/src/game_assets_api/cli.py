@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +59,30 @@ def _parser() -> argparse.ArgumentParser:
         help="release an explicit stable asset key (repeatable)",
     )
     create.add_argument("--json", action="store_true", dest="as_json")
+    acceptance = subcommands.add_parser(
+        "acceptance", help="run repeatable release acceptance rehearsals"
+    )
+    acceptance_commands = acceptance.add_subparsers(dest="acceptance_command", required=True)
+    m6 = acceptance_commands.add_parser("m6", help="run the M6 v1 release rehearsal")
+    m6.add_argument(
+        "--output",
+        default="m6-acceptance.json",
+        help="structured JSON receipt path (default: ./m6-acceptance.json)",
+    )
+    m6.add_argument(
+        "--provider-url",
+        help="optional live OpenAI-compatible provider base URL",
+    )
+    m6.add_argument(
+        "--api-key",
+        default=os.environ.get("GAME_ASSETS_M6_API_KEY"),
+        help="optional live provider API key; prefer GAME_ASSETS_M6_API_KEY",
+    )
+    m6.add_argument(
+        "--require-live-provider",
+        action="store_true",
+        help="fail when a live provider URL and key are not supplied",
+    )
     export = subcommands.add_parser("export", help="deliver a Release to a game checkout")
     export_commands = export.add_subparsers(dest="export_command", required=True)
     for command in ("preview", "apply", "verify", "rollback"):
@@ -314,6 +339,20 @@ def _export(settings: Settings, arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _acceptance_m6(arguments: argparse.Namespace) -> int:
+    from .m6_acceptance import run_m6_acceptance, write_report
+
+    report = run_m6_acceptance(
+        live_provider_url=arguments.provider_url,
+        live_provider_api_key=arguments.api_key,
+        require_live_provider=arguments.require_live_provider,
+    )
+    output = write_report(report, arguments.output)
+    payload = {"output": str(output), **report["summary"]}
+    _print(payload, as_json=True)
+    return 0 if report["summary"]["ok"] else 2
+
+
 def main(argv: list[str] | None = None) -> None:
     arguments = _parser().parse_args(argv)
     settings = Settings()
@@ -349,6 +388,8 @@ def main(argv: list[str] | None = None) -> None:
             raise SystemExit(_export(settings, arguments))
         except DeliveryError as exc:
             raise SystemExit(f"export failed: {exc}") from exc
+    if arguments.command == "acceptance" and arguments.acceptance_command == "m6":
+        raise SystemExit(_acceptance_m6(arguments))
     raise SystemExit(2)
 
 

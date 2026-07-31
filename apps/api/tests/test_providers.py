@@ -29,6 +29,48 @@ def test_retry_policy_never_retries_auth_billing_or_content_policy() -> None:
     assert ProviderError("moderated", ErrorCategory.CONTENT_POLICY).retryable is False
 
 
+def test_content_policy_does_not_trigger_json_mode_fallback() -> None:
+    """A moderation response is a terminal human-handled decision.
+
+    The structured-text adapter may fall back from ``json_schema`` to
+    ``json_object`` for providers that reject the response-format feature, but
+    it must not send a second paid request after a content-policy rejection.
+    """
+
+    from game_assets_api.providers import OpenAICompatibleProvider, ProviderRuntimeConfig
+
+    class _ContentPolicyProvider(OpenAICompatibleProvider):
+        def __init__(self) -> None:
+            self.profile = ProviderRuntimeConfig(
+                id="content-policy-test",
+                kind="openai_compatible",
+                base_url="https://example.invalid/v1",
+                text_model="text",
+                image_model="image",
+                quality="standard",
+                allow_private_network=False,
+            )
+            self.calls = 0
+
+        async def _chat(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            self.calls += 1
+            raise ProviderError("blocked", ErrorCategory.CONTENT_POLICY, status_code=400)
+
+    import asyncio
+
+    provider = _ContentPolicyProvider()
+    with pytest.raises(ProviderError) as raised:
+        asyncio.run(
+            provider.structured_text(
+                prompt="blocked",
+                schema={"type": "object"},
+                model="text",
+            )
+        )
+    assert raised.value.category == ErrorCategory.CONTENT_POLICY
+    assert provider.calls == 1
+
+
 def test_provider_url_policy() -> None:
     assert validate_base_url("https://api.example.com/v1", allow_private_network=False) == "https://api.example.com/v1"
     assert validate_base_url("http://127.0.0.1:8080/v1", allow_private_network=False).startswith("http://")

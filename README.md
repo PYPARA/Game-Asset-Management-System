@@ -26,13 +26,13 @@ workspace/     被 Git 忽略的候选、驳回、QA、缓存与日志
 
 ## 当前状态
 
-截至 2026-07-31，M0–M4 已完成。系统已具备 Project 发现/扫描、资产与不可变修订、关系、多供应商模型路由、持久生成计划、硬 QA、人工审核、Release Manifest v2、可恢复 Delivery，以及隔离的 Codex 监督诊断；Web 制作台已接入真实 Project 数据，并提供生成计划、运行检查器、Agent 诊断和 Release 交付面板。
+截至 2026-07-31，M0–M6 的 GAMS 能力已完成。系统已具备 Project 发现/扫描、资产与不可变修订、关系、多供应商模型路由、持久生成计划、硬 QA、人工审核、Release Manifest v2、可恢复 Delivery，以及隔离的 Codex 监督诊断；Web 制作台已接入真实 Project 数据，并提供生成计划、运行检查器、Agent 诊断和 Release 交付面板。
 
 M2 Controller 会冻结 DAG、Prompt、尺寸、调用预算和并发约束；Runner 实施 provider/plan 双重并发、lease、heartbeat、幂等 Attempt、上游产物注入和崩溃恢复。供应商输出依次经过 `output_received`、硬 QA、证据生成和 `candidate_ready`；QA fail 进入结构化 Finding 与 `awaiting_user`，用户可以在没有 Codex 的情况下选择 Worker 修复、重试、重新生成或图像编辑。未知供应商交付不会自动重试。
 
 M2.1 允许同时配置多个 OpenAI 兼容供应商，独立保存文字/图片默认模型、模型目录、并发、重试和价格。全局文字与图片路由只用于创建新任务；每项任务可以覆盖供应商和模型，确认时会把实际路由和运行配置冻结到 Job。模型下线、拒绝或凭据锁定不会触发自动换模型或跨供应商回退，而是保留 DAG 等待关系并进入明确的人工处理状态。
 
-M5 Emperor-Simulator 试点脚本、旧媒体升级、显式资产子集 Release 和可审计 Delivery 已接通；隔离 checkout 的类型检查与构建通过，游戏侧既有 E2E 文案断言仍需由游戏仓库维护者修正后重跑。Codex SDK/App Server 不可用时会保留完整上下文并降级人工处理；代码、游戏仓库和手写文档变更只生成待批准 ChangeSet。Provider 返回图片不等于批准、Release 或 Delivery；Delivery 仍要求用户明确选择 checkout、Release 和验证动作。
+M5 Emperor-Simulator 试点脚本、旧媒体升级、显式资产子集 Release 和可审计 Delivery 已接通；M6 新增 `gams acceptance m6`/`scripts/m6_acceptance.py`，可离线演练真实 OpenAI-compatible HTTP 故障矩阵、并发、磁盘不足、Delivery 中断、SQLite 删除重建和格式边界，并输出结构化验收收据。隔离 checkout 的类型检查与构建通过，游戏侧 E2E 仍需在可启动浏览器的环境中重跑（当前沙箱出现 Playwright `EPERM`，且已有文案断言仍需维护者修正）。Codex SDK/App Server 不可用时会保留完整上下文并降级人工处理；代码、游戏仓库和手写文档变更只生成待批准 ChangeSet。Provider 返回图片不等于批准、Release 或 Delivery；Delivery 仍要求用户明确选择 checkout、Release 和验证动作。
 
 实施顺序、P0 风险和每个里程碑的完成标准见 [路线图](docs/roadmap.md)。
 
@@ -76,6 +76,10 @@ npm test
 - [Codex 监督式智能生产](docs/agentic-production.md)
 - [Release 与游戏项目交付](docs/release-delivery.md)
 - [M5 Emperor-Simulator 试点](docs/m5-pilot.md)
+- [M6 v1 发布验收](docs/m6-release.md)
+- [用户操作手册](docs/user-guide.md)
+- [故障手册](docs/troubleshooting.md)
+- [格式升级策略](docs/format-upgrades.md)
 - [资产库分类](docs/asset-library.md)
 - [API 说明](apps/api/README.md)
 - [设计参考](docs/design/README.md)
