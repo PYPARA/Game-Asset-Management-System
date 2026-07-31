@@ -17,7 +17,7 @@ GAMS 的 v1 目标不是单纯调用图片供应商，而是建立一条可恢�
 
 ## 当前基线
 
-当前系统处于“M4 Codex 监督已完成，M5 试点尚未开始”的阶段。下面是截至 2026-07-31 从代码和验收记录确认的状态。
+当前系统处于“M5 Emperor 试点已接通；游戏 checkout 的既有 E2E 文案断言待维护者修正”的阶段。下面是截至 2026-07-31 从代码和验收记录确认的状态。
 
 | 能力 | 当前状态 | 说明 |
 |---|---|---|
@@ -32,9 +32,10 @@ GAMS 的 v1 目标不是单纯调用图片供应商，而是建立一条可恢�
 | Release | 已实现 M3 | Release v1 保持兼容；M3 使用 Manifest v2、snapshot hash、完整预检和可重建索引。 |
 | 游戏仓库交付 | 已实现 M3 | 支持 checkout 绑定、preview/apply/verify/rollback、staging、`gams-lock.json`、篡改保护、失败恢复和 Delivery 收据。 |
 | Codex 监督 Agent | 已实现 M4 | 通过隔离 stdio 适配层生成只读上下文和结构化 Finding；AgentSession/AgentEvent 可审计，固定动作交回 Controller，越权代码/文档修改只形成待批准 ChangeSet，失败统一人工降级。 |
+| Emperor 试点 | 已实现 M5（游戏 E2E 待修） | 五项真实资产 replay、旧媒体内容寻址升级、Artifact/Finding/Action/Evidence 链、媒体基线 Release v2、隔离 checkout Delivery 和 `gams-lock.json` 已接通；`pnpm check`/`pnpm build` 通过，既有 E2E 测试仍寻找已改名的开始按钮。 |
 | 叙事地图 | 未开始 | 类型化关系模型已具备，UI 安排在 v1.1。 |
 
-历史验收快照记录了前端 25 项测试、API 23 项测试和 Emperor Project 扫描通过；这些数字属于 [设计 QA 基线](../design-qa.md)，不是持续监控结果。当前 M0–M3 验收结果见下方带日期的记录。
+历史验收快照记录了前端 25 项测试、API 23 项测试和 Emperor Project 扫描通过；这些数字属于 [设计 QA 基线](../design-qa.md)，不是持续监控结果。当前 M0–M5 验收结果见下方带日期的记录。
 
 ## P0 风险状态
 
@@ -275,6 +276,18 @@ M1 已满足 M2 和 M3 的共同事实源前置条件。M4 必须建立在 M2.1 
 - 在 Emperor checkout 中依次通过 `pnpm check`、`pnpm build` 和 `pnpm test:e2e`。
 - GAMS 与 Codex 只展示两个仓库的 diff，不执行 add、commit 或 push。
 
+#### M5 验收记录（2026-07-31）
+
+状态：GAMS 试点链路已完成；外部游戏 E2E 有一个已知、可定位的消费端阻塞。
+
+- [M5 试点记录](m5-pilot.md) 和 `scripts/m5_pilot.py` 提供可重放命令；默认五项资产覆盖透明立绘、同角色编辑、图标、背景和 CG，`--include-media-baseline` 额外迁移现有 186 项媒体。
+- 真实 Emperor Project 已完成 186 项 legacy media 升级；试点 Release `ae33b74b-9865-4945-833d-a3fc1cddc109` 的 snapshot hash 为 `sha256:cda89d6c68bc7cd14ff3b4fa0b3c7247bd25966a44a8f94a9946d3af8ca3b43b`。
+- 迁移后 Project 重建索引为 1,144 assets、1,330 revisions、372 artifacts、2 releases，扫描错误为 0。
+- `POST /api/projects/{id}/legacy-media-promotions` 可显式升级旧 `approved/assets/**` 批准媒体，创建内容寻址 Source/Runtime Artifact、Promotion Revision、QA 与依赖哈希 Review；重复执行保持幂等并保留旧 Revision。
+- Release API/CLI 支持 `asset_keys`/`--asset` 显式子集；M5 运行使用媒体基线 Release v2，避免游戏 Manifest 因试点选集而不完整。
+- 隔离 Emperor checkout 的 `pnpm check`（15 项 Vitest + TypeScript）和 `pnpm build` 通过；`pnpm test:e2e` 在浏览器环境中运行，但四项测试仍查找 `开始新朝`，当前 UI 为 `开创新朝`。Delivery 已回滚、记录失败验证结果，原始脏 checkout 未被修改。
+- GAMS API 全量测试、Python 编译和 `git diff --check` 通过；GAMS/Codex 未执行任何 Git 写操作。
+
 ### M6：v1 发布
 
 范围：
@@ -311,11 +324,12 @@ M1 已满足 M2 和 M3 的共同事实源前置条件。M4 必须建立在 M2.1 
 - 多供应商 CRUD/归档/恢复、模型目录与分类、全局文字/图片默认路由，以及任务级 `provider_profile_id` / `model` 冻结路由。
 - `Artifact`、`Finding`、运行 Evidence，以及 `retry`、`tool_repair`、`regenerate`、`image_edit`、`await_user` 五种 Controller `RemediationAction`；M4 另提供 `propose_changeset` Agent 提案和审计 ChangeSet。
 - Release v1 的 fail-closed 创建 API；M3 的 Manifest v2、Delivery API/UI、CLI 和可重建收据。
+- M5 的旧媒体升级 API、显式 Release 资产子集、Emperor replay/证据脚本和失败可审计的 Delivery 报告。
 
 仍属于后续目标：
 
 - 独立的 `gams plan validate|confirm` CLI 和 `gams release preflight|create` CLI。
-- M5 真实游戏 checkout 试点及完整游戏侧验收。
+- M5 游戏 checkout 的完整 E2E 验收（等待游戏仓库修正既有按钮文案断言）。
 
 ## 全局验收原则
 

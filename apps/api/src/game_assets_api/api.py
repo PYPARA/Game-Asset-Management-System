@@ -31,6 +31,8 @@ from .domain import (
     GenerationPlanCreate,
     GenerationPlanRead,
     GenerationStatus,
+    LegacyMediaMigrationCreate,
+    LegacyMediaMigrationResult,
     FindingRead,
     Message,
     PlanBudgetUpdate,
@@ -143,6 +145,7 @@ from .services import (
     create_review,
     create_revision,
     discover_projects,
+    migrate_legacy_media_approvals,
     register_project,
     require,
     run_qa,
@@ -282,6 +285,24 @@ def scan(project_id: str, session: Session = Depends(db)) -> ScanReport:
 @router.post("/projects/{project_id}/rebuild", response_model=ScanReport)
 def rebuild(project_id: str, session: Session = Depends(db)) -> ScanReport:
     return scan_project(session, require(session, Project, project_id, "project"))
+
+
+@router.post(
+    "/projects/{project_id}/legacy-media-promotions",
+    response_model=LegacyMediaMigrationResult,
+)
+def promote_legacy_media(
+    project_id: str,
+    payload: LegacyMediaMigrationCreate,
+    session: Session = Depends(db),
+) -> dict[str, Any]:
+    """Explicitly upgrade selected pre-M1 media approvals to durable Artifacts."""
+
+    return migrate_legacy_media_approvals(
+        session,
+        project_id=project_id,
+        asset_keys=payload.asset_keys,
+    )
 
 
 @router.get("/assets", response_model=list[AssetRead])

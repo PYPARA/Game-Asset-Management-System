@@ -1427,6 +1427,7 @@ def _approve_media_revision(
     asset: Asset,
     project: Project,
     payload: ReviewCreate,
+    target_path_override: str | None = None,
 ) -> ReviewDecision:
     renditions = list(
         session.scalars(select(Rendition).where(Rendition.revision_id == revision.id)).all()
@@ -1507,6 +1508,8 @@ def _approve_media_revision(
             "byte_size": runtime_size,
         }
     )
+    if target_path_override is not None:
+        promoted_rendition_data["target_path"] = target_path_override
     promoted_content["rendition"] = promoted_rendition_data
     promoted_revision = AssetRevision(
         id=promoted_revision_id,
@@ -1573,7 +1576,7 @@ def _approve_media_revision(
         media_type=candidate_rendition.media_type,
         source_path=source_path,
         normalized_path=runtime_path,
-        target_path=candidate_rendition.target_path,
+        target_path=(target_path_override or candidate_rendition.target_path),
         sha256=runtime_hash,
         width=candidate_rendition.width,
         height=candidate_rendition.height,
@@ -1859,6 +1862,268 @@ def create_review(session: Session, payload: ReviewCreate) -> ReviewDecision:
     return decision
 
 
+def migrate_legacy_media_approvals(
+    session: Session,
+    *,
+    project_id: str,
+    asset_keys: list[str],
+) -> dict[str, Any]:
+    """Promote explicitly selected pre-M1 media approvals into the current contract.
+
+    Early Project imports stored a media revision and an approval decision but did
+    not create content-addressed Artifact objects or a dependency-bound review.
+    This operation is deliberately explicit: it never runs during project scans,
+    never rewrites an old revision, and refuses missing or non-media keys. Each
+    successful item creates a new promotion revision through the same atomic path
+    used by normal human approval. Re-running the command is idempotent.
+    """
+
+    project = require(session, Project, project_id, "project")
+    requested = [str(key).strip() for key in asset_keys]
+    if not requested or any(not key for key in requested):
+        raise ServiceError(422, "asset_keys must contain at least one non-empty key")
+    if len(set(requested)) != len(requested):
+        raise ServiceError(422, "asset_keys must not contain duplicates")
+
+    assets = {
+        asset.key: asset
+        for asset in session.scalars(
+            select(Asset).where(Asset.project_id == project.id, Asset.key.in_(requested))
+        ).all()
+    }
+    missing = sorted(set(requested) - set(assets))
+    if missing:
+        raise ServiceError(404, f"assets not found: {', '.join(missing)}")
+
+    store = ProjectStore(project.root_path)
+    prepared: list[tuple[Asset, AssetRevision, Rendition]] = []
+    skipped: list[dict[str, str]] = []
+    for key in requested:
+        asset = assets[key]
+        if asset.kind != "media":
+            raise ServiceError(422, f"{key}: only media assets can be legacy-promoted")
+        if asset.content_status != ContentStatus.APPROVED.value:
+            raise ServiceError(409, f"{key}: asset is not approved")
+        if not asset.current_revision_id:
+            raise ServiceError(409, f"{key}: approved asset has no current revision")
+        revision = session.get(AssetRevision, asset.current_revision_id)
+        if revision is None or revision.asset_id != asset.id or revision.format != "media":
+            raise ServiceError(409, f"{key}: current media revision is missing")
+        content = revision.content_json if isinstance(revision.content_json, dict) else {}
+        content_rendition = content.get("rendition") if isinstance(content, dict) else None
+        if not isinstance(content_rendition, dict):
+            raise ServiceError(409, f"{key}: current media revision has no rendition")
+
+        existing_runtime = content_rendition.get("artifact_id")
+        existing_source = content_rendition.get("source_artifact_id")
+        if existing_runtime and existing_source:
+            approval = session.scalar(
+                select(ReviewDecision)
+                .where(
+                    ReviewDecision.revision_id == revision.id,
+                    ReviewDecision.verdict == ReviewVerdict.APPROVE.value,
+                    ReviewDecision.is_valid.is_(True),
+                )
+                .order_by(ReviewDecision.created_at.desc())
+                .limit(1)
+            )
+            if approval is not None and approval.artifact_bindings:
+                skipped.append({"key": key, "revision_id": revision.id, "reason": "already_promoted"})
+                continue
+
+        source_path = content_rendition.get("source_path")
+        runtime_path = content_rendition.get("normalized_path") or source_path
+        if not isinstance(source_path, str) or not isinstance(runtime_path, str):
+            raise ServiceError(409, f"{key}: legacy rendition paths are invalid")
+        try:
+            source_file = safe_join(store.root, source_path)
+            runtime_file = safe_join(store.root, runtime_path)
+        except StorageError as exc:
+            raise ServiceError(409, f"{key}: {exc}") from exc
+        if not source_file.is_file():
+            raise ServiceError(409, f"{key}: source blob is missing: {source_path}")
+        if not runtime_file.is_file():
+            raise ServiceError(409, f"{key}: runtime blob is missing: {runtime_path}")
+        runtime_hash = sha256_file(runtime_file)
+        if runtime_hash != str(content_rendition.get("sha256")):
+            raise ServiceError(409, f"{key}: runtime blob hash does not match the legacy rendition")
+        prepared.append(
+            (
+                asset,
+                revision,
+                Rendition(
+                    id=stable_id("rendition", revision.id, runtime_hash),
+                    revision_id=revision.id,
+                    media_type=str(content_rendition.get("media_type", "image/webp")),
+                    source_path=source_path,
+                    normalized_path=str(content_rendition.get("normalized_path") or ""),
+                    target_path=content_rendition.get("target_path"),
+                    sha256=runtime_hash,
+                    width=(int(content_rendition["width"]) if content_rendition.get("width") is not None else None),
+                    height=(int(content_rendition["height"]) if content_rendition.get("height") is not None else None),
+                    byte_size=int(content_rendition.get("byte_size", runtime_file.stat().st_size)),
+                    created_at=revision.created_at,
+                ),
+            )
+        )
+
+    migrated: list[dict[str, str]] = []
+    for asset, revision, legacy_rendition in prepared:
+        # The scan normally created the Rendition row. Reusing it preserves its
+        # immutable identity; the fallback is only for an index that was rebuilt
+        # before the legacy media file became available.
+        existing_renditions = list(
+            session.scalars(
+                select(Rendition).where(Rendition.revision_id == revision.id)
+            ).all()
+        )
+        if len(existing_renditions) > 1:
+            raise ServiceError(409, f"{asset.key}: media revision has multiple renditions")
+        rendition = existing_renditions[0] if existing_renditions else None
+        if rendition is None:
+            session.add(legacy_rendition)
+            session.flush()
+            rendition = legacy_rendition
+        revision.review_status = "pending"
+        latest_qa = session.scalar(
+            select(QARun)
+            .where(QARun.rendition_id == rendition.id)
+            .order_by(QARun.created_at.desc())
+            .limit(1)
+        )
+        if latest_qa is None:
+            run_qa(
+                session,
+                QARunCreate(
+                    rendition_id=rendition.id,
+                    expected_width=rendition.width,
+                    expected_height=rendition.height,
+                    max_bytes=rendition.byte_size,
+                ),
+            )
+        previous_revision_id = revision.id
+        legacy_target = str(
+            (revision.content_json.get("rendition") or {}).get("target_path") or rendition.target_path or ""
+        )
+        target_override = (
+            "public/assets/" + legacy_target.removeprefix("approved/assets/")
+            if legacy_target.startswith("approved/assets/")
+            else legacy_target
+        )
+        decision = _approve_media_revision(
+            session,
+            revision=revision,
+            asset=asset,
+            project=project,
+            payload=ReviewCreate(
+                revision_id=revision.id,
+                verdict=ReviewVerdict.APPROVE,
+                notes="M5 legacy approval promotion; original revision retained",
+            ),
+            target_path_override=target_override or None,
+        )
+        promoted = session.get(ReviewDecision, decision.id)
+        if promoted is None:
+            raise ServiceError(500, f"{asset.key}: promoted review was not indexed")
+        migrated.append(
+            {
+                "key": asset.key,
+                "source_revision_id": previous_revision_id,
+                "revision_id": promoted.revision_id,
+                "review_id": promoted.id,
+            }
+        )
+
+    # A legacy project can contain relations between the selected assets. The
+    # first promotion may therefore change a later approval's dependency hash.
+    # Rebind the latest approval once, after the complete batch has settled; the
+    # old review remains immutable and is retained as historical evidence.
+    refreshed_keys = set(requested)
+    if refreshed_keys:
+        for asset in session.scalars(
+            select(Asset).where(Asset.project_id == project.id, Asset.key.in_(refreshed_keys))
+        ).all():
+            if not asset.current_revision_id:
+                continue
+            revision = session.get(AssetRevision, asset.current_revision_id)
+            if revision is None or revision.review_status != "approved":
+                continue
+            expected_dependency = dependency_hash(session, revision)
+            approval = session.scalar(
+                select(ReviewDecision)
+                .where(
+                    ReviewDecision.revision_id == revision.id,
+                    ReviewDecision.verdict == ReviewVerdict.APPROVE.value,
+                    ReviewDecision.is_valid.is_(True),
+                )
+                .order_by(ReviewDecision.created_at.desc())
+                .limit(1)
+            )
+            if approval is not None and approval.dependency_hash == expected_dependency:
+                continue
+            session.execute(
+                ReviewDecision.__table__.update()
+                .where(ReviewDecision.asset_id == asset.id, ReviewDecision.is_valid.is_(True))
+                .values(is_valid=False)
+            )
+            bindings: list[dict[str, str]] = []
+            content = revision.content_json if isinstance(revision.content_json, dict) else {}
+            rendition_data = content.get("rendition") if isinstance(content, dict) else None
+            if isinstance(rendition_data, dict):
+                for role, field in (("source", "source_artifact_id"), ("runtime", "artifact_id")):
+                    artifact_id = rendition_data.get(field)
+                    if not artifact_id:
+                        continue
+                    artifact = session.get(Artifact, str(artifact_id))
+                    if artifact is None or artifact.revision_id != revision.id or artifact.role != role:
+                        raise ServiceError(409, f"{asset.key}: promoted artifact binding is missing")
+                    bindings.append({"artifact_id": artifact.id, "role": role, "sha256": artifact.sha256})
+            refreshed = ReviewDecision(
+                id=new_id(),
+                revision_id=revision.id,
+                asset_id=asset.id,
+                verdict=ReviewVerdict.APPROVE.value,
+                notes="M5 dependency refresh after batch promotion",
+                dependency_hash=expected_dependency,
+                is_valid=True,
+                created_at=utcnow(),
+            )
+            session.add(refreshed)
+            session.flush()
+            for binding in bindings:
+                session.add(
+                    ReviewArtifact(
+                        id=stable_id(
+                            "review_artifact",
+                            refreshed.id,
+                            binding["artifact_id"],
+                            binding["role"],
+                        ),
+                        review_id=refreshed.id,
+                        artifact_id=binding["artifact_id"],
+                        role=binding["role"],
+                        sha256=binding["sha256"],
+                    )
+                )
+            store.write_review(
+                kind=asset.kind,
+                key=asset.key,
+                review={
+                    "id": refreshed.id,
+                    "asset_id": asset.id,
+                    "revision_id": revision.id,
+                    "verdict": refreshed.verdict,
+                    "notes": refreshed.notes,
+                    "dependency_hash": expected_dependency,
+                    "artifacts": bindings,
+                    "created_at": refreshed.created_at.isoformat(),
+                },
+            )
+            asset.publication_status = PublicationStatus.READY.value
+        session.commit()
+    return {"project_id": project.id, "migrated": migrated, "skipped": skipped, "errors": []}
+
+
 def run_qa(session: Session, payload: QARunCreate) -> QARun:
     rendition = require(session, Rendition, payload.rendition_id, "rendition")
     revision = require(session, AssetRevision, rendition.revision_id, "revision")
@@ -1911,25 +2176,54 @@ def run_qa(session: Session, payload: QARunCreate) -> QARun:
 
 
 def _release_preflight(
-    session: Session, *, project: Project
+    session: Session, *, project: Project, asset_keys: list[str] | None = None
 ) -> tuple[list[dict[str, Any]], list[Asset], list[str]]:
     store = ProjectStore(project.root_path)
-    assets = list(
-        session.scalars(
-            select(Asset)
-            .where(
-                Asset.project_id == project.id,
-                Asset.content_status == ContentStatus.APPROVED.value,
-            )
-            .order_by(Asset.key)
-        ).all()
-    )
     entries: list[dict[str, Any]] = []
     valid_assets: list[Asset] = []
     issues: list[str] = []
     target_owners: dict[str, str] = {}
+    if asset_keys is not None:
+        requested = [str(key).strip() for key in asset_keys]
+        if not requested or any(not key for key in requested):
+            issues.append("asset_keys must contain at least one non-empty stable key")
+            requested = []
+        duplicates = sorted({key for key in requested if requested.count(key) > 1})
+        if duplicates:
+            issues.append(f"asset_keys contains duplicates: {', '.join(duplicates)}")
+        selected = list(
+            session.scalars(
+                select(Asset)
+                .where(Asset.project_id == project.id, Asset.key.in_(requested))
+                .order_by(Asset.key)
+            ).all()
+        )
+        selected_by_key = {asset.key: asset for asset in selected}
+        for key in requested:
+            asset = selected_by_key.get(key)
+            if asset is None:
+                issues.append(f"{key}: asset does not exist in the project")
+            elif asset.content_status != ContentStatus.APPROVED.value:
+                issues.append(f"{key}: asset is not approved")
+        assets = [selected_by_key[key] for key in sorted(set(requested)) if key in selected_by_key]
+        assets = [asset for asset in assets if asset.content_status == ContentStatus.APPROVED.value]
+    else:
+        assets = list(
+            session.scalars(
+                select(Asset)
+                .where(
+                    Asset.project_id == project.id,
+                    Asset.content_status == ContentStatus.APPROVED.value,
+                )
+                .order_by(Asset.key)
+            ).all()
+        )
     if not assets:
-        issues.append("the project has no approved assets")
+        issues.append(
+            "the requested asset set has no approved assets"
+            if asset_keys is not None
+            else "the project has no approved assets"
+        )
 
     for asset in assets:
         if not asset.current_revision_id:
@@ -2165,7 +2459,9 @@ def _release_preflight(
 
 def create_release(session: Session, payload: ReleaseCreate) -> Release:
     project = require(session, Project, payload.project_id, "project")
-    entries, released_assets, issues = _release_preflight(session, project=project)
+    entries, released_assets, issues = _release_preflight(
+        session, project=project, asset_keys=payload.asset_keys
+    )
     if issues:
         raise ServiceError(409, "release preflight failed:\n- " + "\n- ".join(issues))
 

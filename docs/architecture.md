@@ -1,6 +1,6 @@
 # 架构说明
 
-> 阅读约定：未特别标注的内容描述截至 2026-07-31 的当前实现；“目标”内容描述 M5 及之后尚未实现的方向。两者不能混用。
+> 阅读约定：未特别标注的内容描述截至 2026-07-31 的当前实现；“目标”内容描述 M6 及之后尚未实现的方向。两者不能混用。
 
 ## 单一 Project 契约
 
@@ -26,7 +26,8 @@ workspace/     候选、驳回、QA 报告、缓存和日志
 5. 图片归一化后执行硬 QA，生成 Finding、联系表和对比证据。QA fail 进入 `awaiting_user`；人工可选择注册 Worker、重试、重新生成或图像编辑，所有动作校验输入哈希和预算后才入队。
 6. 人工批准媒体时，把原始来源提升到 `production/sources/<hash>`、运行媒体提升到 `approved/objects/<hash>`，写入 Artifact 元数据和只引用耐久对象的 promotion 修订，最后更新 Catalog 指针。
 7. 审核记录绑定准确修订、依赖哈希以及来源/运行 Artifact 哈希。文件事务失败时恢复 Catalog 和本次正式记录；正确但孤立的内容寻址 Blob 可由后续垃圾回收处理。
-8. Release v1 对全部已批准资产执行 fail-closed 预检，成功后写不可变 Manifest；`target_path` 仅作为后续 Delivery 的逻辑目标，Release 不再从 workspace 发布媒体。
+8. Release v1 对全部已批准资产执行 fail-closed 预检，Release v2 还可以接受显式稳定 Key 子集；成功后写不可变 Manifest。`target_path` 仅作为后续 Delivery 的逻辑目标，Release 不再从 workspace 发布媒体。
+9. M5 旧媒体升级是显式 API 操作：它把 legacy `approved/assets/**` 输入复制为内容寻址 Artifact，创建 Promotion Revision 和依赖哈希 Review；扫描不会隐式改写历史。试点脚本随后写入可重建的 Plan/Job/Attempt/Finding/Action/Evidence 链，并把媒体基线 Delivery 到独立游戏 checkout。
 
 SQLite 是可重建索引。项目扫描会按磁盘权威状态重建资产、修订、Artifact、rendition、QA、审核、关系和 Release；任务队列等本地运行状态继续保存在 SQLite。
 
@@ -75,7 +76,7 @@ Web 制作台是 Controller 的客户端，不另建业务事实源。Codex 目�
 - GAMS 代码、游戏代码和手写文档变更只生成待批准 ChangeSet。
 - M3 Delivery 使用 Manifest v2、checkout staging、受管文件哈希、验证命令和不可变收据。
 
-目标生产循环详见 [Codex 监督式智能生产](agentic-production.md)，候选提升、Release v2 和游戏 checkout 事务详见 [Release 与游戏项目交付](release-delivery.md)。
+目标生产循环详见 [Codex 监督式智能生产](agentic-production.md)，候选提升、Release v2 和游戏 checkout 事务详见 [Release 与游戏项目交付](release-delivery.md)；M5 的重放步骤和已知游戏侧验收阻塞见 [M5 Emperor-Simulator 试点](m5-pilot.md)。
 
 ## 本机状态
 

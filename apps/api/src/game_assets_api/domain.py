@@ -733,11 +733,29 @@ class ReleaseCreate(BaseModel):
         default=1,
         description="Release manifest version; v1 remains available for legacy clients, v2 enables Delivery.",
     )
+    asset_keys: list[str] | None = Field(
+        default=None,
+        description=(
+            "Optional explicit stable-key subset. When omitted, every approved asset is released; "
+            "an empty list is rejected so a Release can never be silently empty."
+        ),
+    )
     publish_media: bool = Field(
         default=True,
         deprecated=True,
         description="Compatibility field; Release v1 records durable objects and never performs Delivery.",
     )
+
+
+class LegacyMediaMigrationCreate(BaseModel):
+    asset_keys: list[str] = Field(min_length=1, description="Approved legacy media keys to promote")
+
+
+class LegacyMediaMigrationResult(BaseModel):
+    project_id: str
+    migrated: list[dict[str, str]] = Field(default_factory=list)
+    skipped: list[dict[str, str]] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
 
 
 class ReleaseRead(ORMModel):

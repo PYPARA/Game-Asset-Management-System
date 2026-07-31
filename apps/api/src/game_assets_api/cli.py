@@ -41,10 +41,22 @@ def _parser() -> argparse.ArgumentParser:
     release_commands = release.add_subparsers(dest="release_command", required=True)
     preflight = release_commands.add_parser("preflight", help="check approved assets for a v2 Release")
     preflight.add_argument("project")
+    preflight.add_argument(
+        "--asset",
+        dest="asset_keys",
+        action="append",
+        help="limit the preflight to an explicit stable asset key (repeatable)",
+    )
     preflight.add_argument("--json", action="store_true", dest="as_json")
     create = release_commands.add_parser("create", help="create an immutable Release Manifest v2")
     create.add_argument("project")
     create.add_argument("--name", required=True)
+    create.add_argument(
+        "--asset",
+        dest="asset_keys",
+        action="append",
+        help="release an explicit stable asset key (repeatable)",
+    )
     create.add_argument("--json", action="store_true", dest="as_json")
     export = subcommands.add_parser("export", help="deliver a Release to a game checkout")
     export_commands = export.add_subparsers(dest="export_command", required=True)
@@ -182,7 +194,13 @@ def _resolve_project(session, value: str) -> Project:
     return project
 
 
-def _release_preflight(settings: Settings, value: str, *, as_json: bool) -> int:
+def _release_preflight(
+    settings: Settings,
+    value: str,
+    *,
+    asset_keys: list[str] | None,
+    as_json: bool,
+) -> int:
     database = _database(settings)
     with database.sessions() as session:
         project = _resolve_project(session, value)
@@ -190,10 +208,13 @@ def _release_preflight(settings: Settings, value: str, *, as_json: bool) -> int:
         # checks as the service; the release command itself remains explicit.
         from .services import _release_preflight as collect_release_preflight
 
-        entries, _assets, issues = collect_release_preflight(session, project=project)
+        entries, _assets, issues = collect_release_preflight(
+            session, project=project, asset_keys=asset_keys
+        )
         payload = {
             "project_id": project.id,
             "manifest_version": 2,
+            "asset_keys": asset_keys,
             "blocking": bool(issues),
             "issues": issues,
             "asset_count": len(entries),
@@ -202,13 +223,25 @@ def _release_preflight(settings: Settings, value: str, *, as_json: bool) -> int:
     return 0 if not payload["blocking"] else 2
 
 
-def _create_release(settings: Settings, value: str, name: str, *, as_json: bool) -> int:
+def _create_release(
+    settings: Settings,
+    value: str,
+    name: str,
+    *,
+    asset_keys: list[str] | None,
+    as_json: bool,
+) -> int:
     database = _database(settings)
     with database.sessions() as session:
         project = _resolve_project(session, value)
         release = create_release(
             session,
-            ReleaseCreate(project_id=project.id, name=name, format_version=2),
+            ReleaseCreate(
+                project_id=project.id,
+                name=name,
+                format_version=2,
+                asset_keys=asset_keys,
+            ),
         )
         payload = {
             "id": release.id,
@@ -293,9 +326,24 @@ def main(argv: list[str] | None = None) -> None:
     if arguments.command == "agent" and arguments.agent_command == "diagnose":
         raise SystemExit(_diagnose(settings, arguments.job_id, as_json=arguments.as_json))
     if arguments.command == "release" and arguments.release_command == "preflight":
-        raise SystemExit(_release_preflight(settings, arguments.project, as_json=arguments.as_json))
+        raise SystemExit(
+            _release_preflight(
+                settings,
+                arguments.project,
+                asset_keys=arguments.asset_keys,
+                as_json=arguments.as_json,
+            )
+        )
     if arguments.command == "release" and arguments.release_command == "create":
-        raise SystemExit(_create_release(settings, arguments.project, arguments.name, as_json=arguments.as_json))
+        raise SystemExit(
+            _create_release(
+                settings,
+                arguments.project,
+                arguments.name,
+                asset_keys=arguments.asset_keys,
+                as_json=arguments.as_json,
+            )
+        )
     if arguments.command == "export":
         try:
             raise SystemExit(_export(settings, arguments))

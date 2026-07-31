@@ -1,6 +1,6 @@
 # 系统主逻辑
 
-本文首先说明 Game Asset Management System（下文简称 GAMS）截至 2026-07-31 的当前正式运行模型。标记为“目标”的章节记录 M5 及以后尚未实现的生产能力，不得把目标状态解读为当前能力。本文不包含一次性迁移过程。
+本文首先说明 Game Asset Management System（下文简称 GAMS）截至 2026-07-31 的当前正式运行模型。标记为“目标”的章节记录 M6 及以后尚未实现的生产能力，不得把目标状态解读为当前能力。本文把 M5 旧媒体升级作为显式、可审计的一次性迁移操作，不把它混入普通扫描过程。
 
 ## 一句话模型
 
@@ -236,7 +236,7 @@ Release 创建前检查完整目标集合。任何批准失效、QA fail、依�
 - 回滚通过重新导出旧 Release 完成，不修改历史 Release。
 - GAMS 不执行 Git 操作；验证后只展示 Project 与游戏仓库 diff。
 
-完整 Manifest、lock、Emperor-Simulator 路径和验收命令见 [Release 与游戏项目交付](release-delivery.md)。
+完整 Manifest、lock、Emperor-Simulator 路径和验收命令见 [Release 与游戏项目交付](release-delivery.md)；M5 replay、旧媒体升级和已知游戏侧验收阻塞见 [M5 Emperor-Simulator 试点](m5-pilot.md)。
 
 ## Git 与本机状态边界
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -116,7 +117,31 @@ def export_config(store: ProjectStore) -> dict[str, Any]:
         argv = command["argv"]
         if not argv or any(not isinstance(value, str) or not value for value in argv):
             raise DeliveryError(422, f"export.validation_commands[{index}].argv is invalid")
-        commands.append({"argv": list(argv), "label": str(command.get("label") or " ".join(argv))})
+        raw_env = command.get("env", {})
+        if raw_env is None:
+            raw_env = {}
+        if not isinstance(raw_env, dict):
+            raise DeliveryError(422, f"export.validation_commands[{index}].env must be an object")
+        env: dict[str, str] = {}
+        for name, value in raw_env.items():
+            if (
+                not isinstance(name, str)
+                or not re.fullmatch(r"(?:CI|PNPM_[A-Z0-9_]+|npm_config_[a-z0-9_]+)", name)
+                or not isinstance(value, str)
+                or "\x00" in value
+            ):
+                raise DeliveryError(
+                    422,
+                    f"export.validation_commands[{index}].env contains an unsupported entry",
+                )
+            env[name] = value
+        commands.append(
+            {
+                "argv": list(argv),
+                "label": str(command.get("label") or " ".join(argv)),
+                "env": env,
+            }
+        )
     try:
         format_version = int(configured.get("format_version", 1))
     except (TypeError, ValueError) as exc:
@@ -360,6 +385,14 @@ def _generated_files(
         files.append({"path": f"{config['content_path'].rstrip('/')}/registry.ts", "bytes": content_bytes, "kind": "content"})
 
     manifest_assets = []
+    runtime_entries: list[dict[str, Any]] = []
+    preload_groups = {
+        "portrait": "portraits-core",
+        "background": "backgrounds",
+        "cg": "cgs",
+        "icon": "icons",
+        "ending": "endings",
+    }
     for item in assets:
         media = []
         for rendition in item["renditions"]:
@@ -368,6 +401,26 @@ def _generated_files(
             )})
             source_path = safe_join(store.root, rendition["path"])
             files.append({"path": rendition["target_path"], "source": source_path, "kind": "media"})
+            content = item.get("content") if isinstance(item.get("content"), dict) else {}
+            fallback_key = content.get("fallback_key")
+            runtime_entry: dict[str, Any] = {
+                "key": item["key"],
+                "type": item.get("subtype") or "media",
+                "path": rendition["target_path"],
+                "width": rendition.get("width"),
+                "height": rendition.get("height"),
+                "preloadGroup": content.get("preload_group")
+                or preload_groups.get(str(item.get("subtype")), "media"),
+            }
+            if content.get("character_id") is not None:
+                runtime_entry["characterId"] = content["character_id"]
+            if content.get("expression") is not None:
+                runtime_entry["expression"] = content["expression"]
+            if fallback_key:
+                runtime_entry["fallbackKey"] = fallback_key
+            else:
+                runtime_entry["fallbackPolicy"] = content.get("fallback_policy") or "none"
+            runtime_entries.append(runtime_entry)
         manifest_assets.append({
             key: item.get(key)
             for key in ("key", "kind", "subtype", "revision_id", "content_hash", "dependency_hash")
@@ -379,10 +432,21 @@ def _generated_files(
         "snapshot_hash": manifest.get("snapshot_hash"),
         "assets": manifest_assets,
     }
+    # The JSON Release remains the canonical v2 snapshot. The generated
+    # TypeScript adapter exposes the stable array contract consumed by Emperor's
+    # runtime (and keeps the type aliases broad enough for other game projects).
     manifest_bytes = (
-        "export const assetManifest = "
+        "export type AssetType = string;\n"
+        "export type AssetPreloadGroup = string;\n"
+        "export interface AssetManifestEntryBase { key: string; type: AssetType; path: string; width: number; height: number; preloadGroup: AssetPreloadGroup; characterId?: string; expression?: string }\n"
+        "export type AssetManifestEntry = AssetManifestEntryBase & ({ fallbackKey: string; fallbackPolicy?: never } | { fallbackKey?: never; fallbackPolicy: string })\n"
+        "export const releaseManifest = "
         + json.dumps(manifest_payload, ensure_ascii=False, sort_keys=True, indent=2)
-        + " as const;\nexport default assetManifest;\n"
+        + " as const;\n"
+        "export const assetManifest = "
+        + json.dumps(sorted(runtime_entries, key=lambda value: value["key"]), ensure_ascii=False, indent=2)
+        + " as const satisfies readonly AssetManifestEntry[];\n"
+        "export default assetManifest;\n"
     ).encode("utf-8")
     files.append({"path": config["manifest_path"], "bytes": manifest_bytes, "kind": "manifest"})
     return sorted(files, key=lambda value: value["path"])
@@ -597,6 +661,7 @@ def _run_commands(root: Path, commands: list[dict[str, Any]]) -> list[dict[str, 
                 capture_output=True,
                 text=True,
                 timeout=600,
+                env={**os.environ, **command.get("env", {})},
             )
             result = {
                 "argv": argv,

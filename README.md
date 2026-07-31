@@ -32,7 +32,7 @@ M2 Controller 会冻结 DAG、Prompt、尺寸、调用预算和并发约束；Ru
 
 M2.1 允许同时配置多个 OpenAI 兼容供应商，独立保存文字/图片默认模型、模型目录、并发、重试和价格。全局文字与图片路由只用于创建新任务；每项任务可以覆盖供应商和模型，确认时会把实际路由和运行配置冻结到 Job。模型下线、拒绝或凭据锁定不会触发自动换模型或跨供应商回退，而是保留 DAG 等待关系并进入明确的人工处理状态。
 
-尚未完成的是 M5 真实游戏试点。Codex SDK/App Server 不可用时会保留完整上下文并降级人工处理；代码、游戏仓库和手写文档变更只生成待批准 ChangeSet。Provider 返回图片不等于批准、Release 或 Delivery；Delivery 仍要求用户明确选择 checkout、Release 和验证动作。
+M5 Emperor-Simulator 试点脚本、旧媒体升级、显式资产子集 Release 和可审计 Delivery 已接通；隔离 checkout 的类型检查与构建通过，游戏侧既有 E2E 文案断言仍需由游戏仓库维护者修正后重跑。Codex SDK/App Server 不可用时会保留完整上下文并降级人工处理；代码、游戏仓库和手写文档变更只生成待批准 ChangeSet。Provider 返回图片不等于批准、Release 或 Delivery；Delivery 仍要求用户明确选择 checkout、Release 和验证动作。
 
 实施顺序、P0 风险和每个里程碑的完成标准见 [路线图](docs/roadmap.md)。
 
@@ -75,6 +75,7 @@ npm test
 - [架构说明](docs/architecture.md)
 - [Codex 监督式智能生产](docs/agentic-production.md)
 - [Release 与游戏项目交付](docs/release-delivery.md)
+- [M5 Emperor-Simulator 试点](docs/m5-pilot.md)
 - [资产库分类](docs/asset-library.md)
 - [API 说明](apps/api/README.md)
 - [设计参考](docs/design/README.md)
