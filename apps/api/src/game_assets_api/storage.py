@@ -65,6 +65,12 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def json_bytes(value: Any) -> bytes:
+    """Serialize JSON in the same stable, human-readable form used on disk."""
+
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8") + b"\n"
+
+
 def stable_id(prefix: str, *values: str) -> str:
     digest = hashlib.sha256("\0".join(values).encode("utf-8")).hexdigest()[:24]
     return f"{prefix}_{digest}"
@@ -111,7 +117,7 @@ def atomic_write_bytes(path: Path, content: bytes, *, immutable: bool = False) -
 
 
 def atomic_write_json(path: Path, content: Any, *, immutable: bool = False) -> str:
-    data = json.dumps(content, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8") + b"\n"
+    data = json_bytes(content)
     atomic_write_bytes(path, data, immutable=immutable)
     return sha256_bytes(data)
 
@@ -153,6 +159,34 @@ class ProjectLockRegistry:
 
 
 LOCKS = ProjectLockRegistry()
+
+
+PROJECT_SPEC_DEFINITIONS: tuple[dict[str, Any], ...] = (
+    {
+        "key": "design.style_bible.primary",
+        "kind": "design",
+        "subtype": "style_bible",
+        "title": "风格圣经",
+        "format": "markdown",
+        "source_path": "production/style-bible.md",
+        "metadata": {
+            "style_markdown_path": "production/style-bible.md",
+            "style_profile_path": "production/style-bible.json",
+        },
+    },
+    {
+        "key": "production.prompt_recipe.emperor_primary",
+        "kind": "production",
+        "subtype": "prompt_recipe",
+        "title": "Emperor 主 Prompt 配方",
+        "format": "json",
+        "source_path": "production/prompt-recipes/emperor-primary.json",
+        "metadata": {
+            "recipe_path": "production/prompt-recipes/emperor-primary.json",
+            "recipe_id": "emperor_primary",
+        },
+    },
+)
 
 
 class ProjectStore:
@@ -511,6 +545,386 @@ class ProjectStore:
                     "revision_id": revision_id,
                 },
             )
+
+    def commit_project_spec_change(
+        self,
+        *,
+        descriptor: dict[str, Any],
+        history_records: list[dict[str, Any]] | None = None,
+        reviews: list[dict[str, Any]] | None = None,
+        published_files: dict[str, bytes] | None = None,
+    ) -> dict[str, str]:
+        """Commit a project-spec descriptor, history and optional source writes atomically.
+
+        Project specifications are ordinary Catalog assets, but their approved
+        content is also mirrored to a human-maintained file under ``production``.
+        Keeping the Catalog pointer, immutable history and source/profile write in
+        one rollback boundary prevents a half-approved document when a filesystem
+        operation fails.
+        """
+
+        key = str(descriptor.get("key", ""))
+        if not STABLE_KEY_RE.fullmatch(key):
+            raise StorageError("invalid stable asset key")
+        history_records = history_records or []
+        reviews = reviews or []
+        published_files = published_files or {}
+
+        with self.lock():
+            try:
+                existing_path, collection, existing = self._find_asset(key)
+            except StorageError:
+                existing_path = None
+                collection = self._read_collection(self.collection_path(descriptor))
+                existing = None
+
+            catalog_path = existing_path or self.collection_path(descriptor)
+            if existing is None:
+                collection = self._read_collection(catalog_path)
+                collection["assets"] = [
+                    item for item in collection["assets"] if item.get("key") != key
+                ]
+                collection["assets"].append(dict(descriptor))
+            else:
+                existing.update(descriptor)
+                collection["assets"] = [
+                    item for item in collection["assets"] if item.get("key") != key
+                ]
+                collection["assets"].append(existing)
+            collection["assets"] = sorted(
+                collection["assets"], key=lambda item: str(item.get("key", ""))
+            )
+
+            originals: dict[Path, bytes | None] = {catalog_path: catalog_path.read_bytes() if catalog_path.exists() else None}
+            history_paths: list[tuple[dict[str, Any], Path]] = []
+            review_paths: list[tuple[dict[str, Any], Path]] = []
+            for record in history_records:
+                path = self.history_object_path(record)
+                history_paths.append((record, path))
+                originals.setdefault(path, path.read_bytes() if path.exists() else None)
+            for review in reviews:
+                path = self.review_path(review)
+                review_paths.append((review, path))
+                originals.setdefault(path, path.read_bytes() if path.exists() else None)
+            publish_paths: list[tuple[Path, bytes]] = []
+            for relative, content in published_files.items():
+                path = safe_join(self.root, relative)
+                publish_paths.append((path, content))
+                originals.setdefault(path, path.read_bytes() if path.exists() else None)
+
+            written: dict[str, str] = {}
+            try:
+                for record, path in history_paths:
+                    if path.exists():
+                        if self.read_json(path) != record:
+                            raise ImmutableRevisionError(f"history object hash collision: {path}")
+                    else:
+                        atomic_write_json(path, record, immutable=True)
+                    if record.get("id"):
+                        written[str(record["id"])] = relative_to_root(self.root, path)
+                for review, path in review_paths:
+                    if path.exists():
+                        if self.read_json(path) != review:
+                            raise ImmutableRevisionError(f"immutable review already exists: {path}")
+                    else:
+                        atomic_write_json(path, review, immutable=True)
+                    if review.get("id"):
+                        written[str(review["id"])] = relative_to_root(self.root, path)
+                for path, content in publish_paths:
+                    atomic_write_bytes(path, content)
+                atomic_write_json(catalog_path, collection)
+            except Exception:
+                for path, original in originals.items():
+                    try:
+                        if original is None:
+                            path.unlink(missing_ok=True)
+                        else:
+                            atomic_write_bytes(path, original)
+                    except OSError:
+                        pass
+                raise
+            written[key] = relative_to_root(self.root, catalog_path)
+            return written
+
+    def sync_project_specs(self, scanned: ProjectScanResult) -> list[str]:
+        """Import and reconcile the two user-facing project specification files.
+
+        The method is deliberately idempotent.  A source hash identifies a
+        candidate revision; rejected or superseded hashes remain visible as drift
+        evidence and are never regenerated on every scan.
+        """
+
+        errors: list[str] = []
+        try:
+            project_id = str(self.read_yaml(self.root / "project.yaml")["id"])
+        except (StorageError, KeyError, TypeError, ValueError) as exc:
+            return [f"project.yaml: {exc}"]
+
+        assets_by_key = {
+            str(asset.get("key")): asset for asset in scanned.assets if asset.get("key")
+        }
+        revisions_by_asset: dict[str, list[dict[str, Any]]] = {}
+        for revision in scanned.revisions:
+            revisions_by_asset.setdefault(str(revision.get("asset_id", "")), []).append(revision)
+
+        def dependency_for(revision: dict[str, Any]) -> str:
+            return sha256_bytes(
+                canonical_json(
+                    {
+                        "revision": revision["id"],
+                        "input_hash": revision.get("input_hash", ""),
+                        "style_revision": revision.get("style_revision"),
+                        "prompt_recipe": revision.get("prompt_recipe"),
+                        "provider": revision.get("provider_snapshot", {}),
+                        "dependencies": [],
+                    }
+                )
+            )
+
+        def now_iso() -> str:
+            return datetime.now(UTC).isoformat()
+
+        def changed(before: dict[str, Any], after: dict[str, Any]) -> bool:
+            return canonical_json(before) != canonical_json(after)
+
+        for definition in PROJECT_SPEC_DEFINITIONS:
+            key = str(definition["key"])
+            source_relative = str(definition["source_path"])
+            source = safe_join(self.root, source_relative)
+            existing = assets_by_key.get(key)
+            metadata = dict(existing.get("metadata", {})) if existing else {}
+            metadata.update(
+                {
+                    "project_spec": True,
+                    "source_path": source_relative,
+                    **dict(definition.get("metadata", {})),
+                }
+            )
+
+            if not source.is_file():
+                if existing is None:
+                    # A fresh Project without either optional file should not
+                    # manufacture empty assets.  Once registered, however, the
+                    # last approved version remains in the Catalog.
+                    continue
+                metadata.update(
+                    {
+                        "source_missing": True,
+                        "source_observed_sha256": None,
+                        "source_drift_status": "missing",
+                        "source_error": None,
+                    }
+                )
+                updated = dict(existing)
+                updated["metadata"] = metadata
+                if changed(existing, updated):
+                    updated["updated_at"] = now_iso()
+                    self.commit_project_spec_change(descriptor=updated)
+                continue
+
+            try:
+                raw = source.read_bytes()
+                source_hash = sha256_bytes(raw)
+                if definition["format"] == "markdown":
+                    content: Any = raw.decode("utf-8")
+                else:
+                    content = json.loads(raw.decode("utf-8"))
+                    if not isinstance(content, dict):
+                        raise ValueError("prompt recipe must be a JSON object")
+                    if isinstance(content.get("id"), str) and content["id"].strip():
+                        metadata["recipe_id"] = content["id"].strip()
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                if existing is not None:
+                    metadata.update(
+                        {
+                            "source_missing": False,
+                            "source_observed_sha256": sha256_file(source) if source.is_file() else None,
+                            "source_drift_status": "invalid",
+                            "source_error": str(exc),
+                        }
+                    )
+                    updated = dict(existing)
+                    updated["metadata"] = metadata
+                    if changed(existing, updated):
+                        updated["updated_at"] = now_iso()
+                        self.commit_project_spec_change(descriptor=updated)
+                else:
+                    errors.append(f"{source_relative}: {exc}")
+                continue
+
+            if existing is None:
+                asset_id = stable_id("asset", project_id, key)
+                revision_id = stable_id("revision", asset_id, source_hash)
+                created_at = now_iso()
+                revision = {
+                    "id": revision_id,
+                    "asset_id": asset_id,
+                    "sequence": 1,
+                    "format": definition["format"],
+                    "content": content,
+                    "content_hash": sha256_bytes(canonical_json(content)),
+                    "parent_revision_id": None,
+                    "input_hash": source_hash,
+                    "style_revision": None,
+                    "prompt_recipe": None,
+                    "provider_snapshot": {},
+                    "review_status": "approved",
+                    "created_at": created_at,
+                }
+                review = {
+                    "id": stable_id("review", revision_id, "baseline"),
+                    "asset_id": asset_id,
+                    "revision_id": revision_id,
+                    "verdict": "approve",
+                    "notes": "首次扫描导入的已批准项目规范基线。",
+                    "dependency_hash": dependency_for(revision),
+                    "artifacts": [],
+                    "created_at": created_at,
+                }
+                metadata.update(
+                    {
+                        "source_sha256": source_hash,
+                        "source_observed_sha256": source_hash,
+                        "source_missing": False,
+                        "source_drift_status": "in_sync",
+                        "source_error": None,
+                    }
+                )
+                descriptor = {
+                    "id": asset_id,
+                    "project_id": project_id,
+                    "key": key,
+                    "kind": definition["kind"],
+                    "subtype": definition["subtype"],
+                    "title": definition["title"],
+                    "schema_ref": None,
+                    "tags": ["project-spec"],
+                    "metadata": metadata,
+                    "content_status": "approved",
+                    "generation_status": "idle",
+                    "publication_status": "ready",
+                    "current_revision_id": revision_id,
+                    "latest_candidate_revision_id": None,
+                    "superseded_revision_ids": [],
+                    "created_at": created_at,
+                    "updated_at": created_at,
+                }
+                published: dict[str, bytes] = {}
+                if definition["subtype"] == "style_bible":
+                    profile = {
+                        "format_version": 1,
+                        "key": "style.primary",
+                        "status": "approved",
+                        "sha256": source_hash,
+                        "revision_id": revision_id,
+                    }
+                    published["production/style-bible.json"] = json_bytes(profile)
+                self.commit_project_spec_change(
+                    descriptor=descriptor,
+                    history_records=[revision],
+                    reviews=[review],
+                    published_files=published,
+                )
+                continue
+
+            updated = dict(existing)
+            revisions = revisions_by_asset.get(str(existing.get("id", "")), [])
+            revisions = sorted(revisions, key=lambda item: int(item.get("sequence", 0)))
+            approved_revision = next(
+                (item for item in revisions if item.get("id") == existing.get("current_revision_id")),
+                None,
+            )
+            approved_hash = metadata.get("source_sha256")
+            if not approved_hash and isinstance(approved_revision, dict):
+                snapshot = approved_revision.get("provider_snapshot")
+                if isinstance(snapshot, dict):
+                    approved_hash = snapshot.get("source_sha256")
+                approved_hash = approved_hash or approved_revision.get("input_hash")
+                if approved_hash:
+                    metadata["source_sha256"] = str(approved_hash)
+
+            metadata.update(
+                {
+                    "source_missing": False,
+                    "source_observed_sha256": source_hash,
+                    "source_error": None,
+                }
+            )
+            if approved_hash and str(approved_hash) == source_hash:
+                # The external file can be unchanged while a page edit is
+                # waiting for human approval. Keep that candidate visible
+                # instead of silently reverting the source badge to sync.
+                pending_candidate = next(
+                    (
+                        revision
+                        for revision in revisions
+                        if revision.get("id") == existing.get("latest_candidate_revision_id")
+                        and revision.get("review_status") == "pending"
+                    ),
+                    None,
+                )
+                metadata["source_drift_status"] = "candidate" if pending_candidate else "in_sync"
+            else:
+                matching = [
+                    revision
+                    for revision in revisions
+                    if str(revision.get("input_hash", "")) == source_hash
+                ]
+                matching.sort(key=lambda item: int(item.get("sequence", 0)), reverse=True)
+                if matching:
+                    matching_revision = matching[0]
+                    status = str(matching_revision.get("review_status", "pending"))
+                    metadata["source_drift_status"] = {
+                        "pending": "candidate",
+                        "rejected": "rejected",
+                        "superseded": "superseded",
+                    }.get(status, "historical")
+                    if status == "pending":
+                        updated["latest_candidate_revision_id"] = matching_revision.get("id")
+                else:
+                    revision_id = stable_id("revision", str(existing["id"]), source_hash)
+                    sequence = max((int(item.get("sequence", 0)) for item in revisions), default=0) + 1
+                    created_at = now_iso()
+                    candidate = {
+                        "id": revision_id,
+                        "asset_id": existing["id"],
+                        "sequence": sequence,
+                        "format": definition["format"],
+                        "content": content,
+                        "content_hash": sha256_bytes(canonical_json(content)),
+                        "parent_revision_id": existing.get("current_revision_id"),
+                        "input_hash": source_hash,
+                        "style_revision": None,
+                        "prompt_recipe": None,
+                        "provider_snapshot": {},
+                        "review_status": "pending",
+                        "created_at": created_at,
+                    }
+                    pending_ids = [
+                        str(item.get("id"))
+                        for item in revisions
+                        if item.get("review_status") == "pending" and item.get("id")
+                    ]
+                    updated["latest_candidate_revision_id"] = revision_id
+                    updated["superseded_revision_ids"] = sorted(
+                        set(str(item) for item in existing.get("superseded_revision_ids", []) if item)
+                        | set(pending_ids)
+                    )
+                    metadata["source_drift_status"] = "candidate"
+                    updated["metadata"] = metadata
+                    updated["updated_at"] = created_at
+                    self.commit_project_spec_change(
+                        descriptor=updated,
+                        history_records=[candidate],
+                    )
+                    continue
+
+            updated["metadata"] = metadata
+            if changed(existing, updated):
+                updated["updated_at"] = now_iso()
+                self.commit_project_spec_change(descriptor=updated)
+
+        return errors
 
     def history_object_path(self, record: dict[str, Any]) -> Path:
         object_hash = sha256_bytes(canonical_json(record))

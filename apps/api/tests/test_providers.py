@@ -1,9 +1,20 @@
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from game_assets_api.domain import ErrorCategory
-from game_assets_api.providers import ProviderError, classify_http_error, validate_base_url
+from game_assets_api.providers import (
+    CredentialVault,
+    ProviderError,
+    ProviderRuntimeConfig,
+    _extract_model_items,
+    build_provider,
+    classify_http_error,
+    guard_resolved_host,
+    validate_base_url,
+)
 
 
 @pytest.mark.parametrize(
@@ -78,3 +89,62 @@ def test_provider_url_policy() -> None:
         validate_base_url("http://example.com/v1", allow_private_network=False)
     with pytest.raises(ValueError):
         validate_base_url("https://user:secret@example.com/v1", allow_private_network=False)
+
+
+def test_resolved_private_or_reserved_address_reports_address_and_requires_opt_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import game_assets_api.providers as providers_module
+
+    monkeypatch.setattr(
+        providers_module.socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (providers_module.socket.AF_INET, providers_module.socket.SOCK_STREAM, 6, "", ("198.18.0.64", 443)),
+        ],
+    )
+
+    with pytest.raises(ProviderError) as raised:
+        guard_resolved_host("https://api.example.com/v1", allow_private_network=False)
+
+    error = raised.value
+    assert error.category == ErrorCategory.VALIDATION
+    assert "198.18.0.64" in str(error)
+    assert error.hint is not None
+    assert "允许访问局域网或私有地址" in error.hint
+
+    # The opt-in is explicit and bypasses the DNS classification only after
+    # the user has enabled it for this provider.
+    guard_resolved_host("https://api.example.com/v1", allow_private_network=True)
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ([{"id": "alpha"}, {"name": "beta"}], ["alpha", "beta"]),
+        ({"data": [{"model": "gamma"}]}, ["gamma"]),
+        ({"models": [{"model_id": "delta"}]}, ["delta"]),
+        ({"items": ["epsilon"]}, ["epsilon"]),
+    ],
+)
+def test_model_catalog_accepts_common_response_shapes(payload: Any, expected: list[str]) -> None:
+    assert [item["id"] for item in _extract_model_items(payload)] == expected
+
+
+def test_optional_and_none_credentials_build_without_an_api_key() -> None:
+    vault = CredentialVault()
+    for mode in ("optional", "none"):
+        provider = build_provider(
+            ProviderRuntimeConfig(
+                id=f"local-{mode}",
+                kind="openai_compatible",
+                base_url="http://127.0.0.1:11434/v1",
+                text_model="local-text",
+                image_model="local-image",
+                quality="high",
+                allow_private_network=False,
+                credential_mode=mode,
+            ),
+            vault,
+        )
+        assert provider.requires_credentials is False

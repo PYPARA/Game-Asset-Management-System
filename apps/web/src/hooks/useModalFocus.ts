@@ -40,6 +40,12 @@ export function useModalFocus({
     }, 0);
 
     const onKeyDown = (event: KeyboardEvent) => {
+      // A nested dialog owns the keyboard while it is open. Without this
+      // guard both the parent drawer and the picker react to the same Escape
+      // or Tab event, which can close two layers or move focus behind the
+      // visible dialog.
+      const nestedDialog = document.querySelector<HTMLElement>('[data-nested-modal="true"]');
+      if (nestedDialog && nestedDialog !== dialogRef.current) return;
       if (event.key === "Escape") {
         event.preventDefault();
         onCloseRef.current();

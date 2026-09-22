@@ -8,11 +8,13 @@ import {
   ImagesSquare,
   PencilSimple,
   Star,
+  TreeStructure,
   WarningCircle,
   X,
 } from "@phosphor-icons/react";
 import { assetSubtypeTitle, domainLabel, fieldLabel } from "../lib/labels";
 import type { GameAsset } from "../types";
+import { MarkdownPreview } from "./MarkdownPreview";
 
 type InspectorTab = "details" | "relations" | "prompt" | "qa" | "history";
 
@@ -22,7 +24,11 @@ interface InspectorProps {
   onClose: () => void;
   onEdit: (asset: GameAsset) => void;
   onNavigate: (assetId: string) => void;
+  onOpenNarrative?: (sceneAssetId: string) => void;
   onReview: (decision: "approve" | "reject" | "regenerate", ids?: string[]) => void;
+  /** Follow state lives in the workbench (and is persisted per project). */
+  followed?: boolean;
+  onToggleFollow?: (asset: GameAsset) => void;
 }
 
 const relationLabels: Record<string, string> = {
@@ -35,20 +41,6 @@ const relationLabels: Record<string, string> = {
   illustrates: "表现",
   depends_on: "依赖",
 };
-
-function MarkdownPreview({ content }: { content: string }) {
-  return (
-    <article className="markdown-document">
-      {content.split("\n").map((line, index) => {
-        if (line.startsWith("### ")) return <h4 key={index}>{line.slice(4)}</h4>;
-        if (line.startsWith("## ")) return <h3 key={index}>{line.slice(3)}</h3>;
-        if (line.startsWith("# ")) return <h2 key={index}>{line.slice(2)}</h2>;
-        if (line.startsWith("- ")) return <p className="markdown-list-item" key={index}>{line.slice(2)}</p>;
-        return line ? <p key={index}>{line}</p> : <span className="markdown-gap" key={index} />;
-      })}
-    </article>
-  );
-}
 
 function StructuredValue({
   name,
@@ -170,11 +162,11 @@ function MediaComparison({ asset }: { asset: GameAsset }) {
   );
 }
 
-export function Inspector({ asset, allAssets, onClose, onEdit, onNavigate, onReview }: InspectorProps) {
-  const structured = Boolean(asset && asset.kind !== "media" && asset.kind !== "production");
+export function Inspector({ asset, allAssets, onClose, onEdit, onNavigate, onOpenNarrative, onReview, followed = false, onToggleFollow }: InspectorProps) {
+  const structured = Boolean(asset && asset.revisionFormat !== "media");
   const [tab, setTab] = useState<InspectorTab>(structured ? "details" : "prompt");
   const tabRefs = useRef<Record<string, HTMLButtonElement | null>>({});
-  useEffect(() => setTab(asset && asset.kind !== "media" && asset.kind !== "production" ? "details" : "prompt"), [asset?.id]);
+  useEffect(() => setTab(asset && asset.revisionFormat !== "media" ? "details" : "prompt"), [asset?.id, asset?.revisionFormat]);
 
   if (!asset) return <aside className="inspector inspector-empty"><ArrowsLeftRight size={30} /><strong>选择资产查看详情</strong><p>这里会按资产类型展示文档、关联媒体、版本和审核信息。</p></aside>;
 
@@ -197,10 +189,16 @@ export function Inspector({ asset, allAssets, onClose, onEdit, onNavigate, onRev
     <aside className="inspector" aria-label="资产检查器">
       <header className="inspector-header">
         <div className="inspector-identity"><strong title={asset.key}>{asset.key}</strong><span>{asset.name}</span></div>
-        <div className="inspector-header-actions"><span className="asset-type-chip" title={assetSubtypeTitle(asset.kind, asset.subtype)}>{asset.subtypeLabel}</span><button type="button" className="icon-button" aria-label="关注资产"><Star size={18} /></button><button type="button" className="icon-button" onClick={onClose} aria-label="关闭检查器"><X size={19} /></button></div>
+        <div className="inspector-header-actions"><span className="asset-type-chip" title={assetSubtypeTitle(asset.kind, asset.subtype)}>{asset.subtypeLabel}</span><button type="button" className={`icon-button follow-asset-button ${followed ? "active" : ""}`} aria-label={followed ? "取消关注资产" : "关注资产"} aria-pressed={followed} title={followed ? "取消关注" : "关注资产"} onClick={() => onToggleFollow?.(asset)}><Star size={18} weight={followed ? "fill" : "regular"} /></button><button type="button" className="icon-button" onClick={onClose} aria-label="关闭检查器"><X size={19} /></button></div>
       </header>
 
       <div className="inspector-scroll">
+        {asset.sourcePath && (
+          <div className={`project-spec-source ${asset.sourceMissing || asset.sourceDriftStatus === "invalid" ? "warning" : asset.sourceDriftStatus && asset.sourceDriftStatus !== "in_sync" ? "drift" : "synced"}`}>
+            {asset.sourceMissing || asset.sourceDriftStatus === "invalid" ? <WarningCircle size={17} weight="fill" /> : <CheckCircle size={17} weight="fill" />}
+            <span><strong>{asset.sourceMissing ? "规范来源缺失" : asset.sourceDriftStatus === "in_sync" ? "规范来源已同步" : "规范来源存在外部变更"}</strong><small>{asset.sourcePath}</small></span>
+          </div>
+        )}
         {structured ? (
           <section className="structured-preview-section">
             {asset.kind === "entity" && ["character", "item"].includes(asset.subtype)
@@ -222,6 +220,7 @@ export function Inspector({ asset, allAssets, onClose, onEdit, onNavigate, onRev
 
       <footer className="inspector-review-actions">
         <button className="button secondary" type="button" disabled={Boolean(reviewBlockReason)} onClick={() => onReview("reject", [asset.id])}>驳回</button>
+        {asset.kind === "content" && ["scene", "event", "story_event", "dialogue_scene"].includes(asset.subtype) && onOpenNarrative && <button className="button secondary open-narrative-button" type="button" onClick={() => onOpenNarrative(asset.id)}><TreeStructure size={15} /> 在叙事地图中打开</button>}
         {structured && <button className="button secondary edit-asset-button" type="button" disabled={!asset.detailsLoaded} onClick={() => onEdit(asset)}><PencilSimple size={15} /> 编辑内容</button>}
         <button className="button primary" type="button" disabled={Boolean(reviewBlockReason)} onClick={() => onReview("approve", [asset.id])}>批准候选</button>
       </footer>

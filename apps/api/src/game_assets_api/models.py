@@ -158,11 +158,17 @@ class ProviderProfile(Base):
     max_retries: Mapped[int] = mapped_column(Integer, default=2)
     allow_private_network: Mapped[bool] = mapped_column(Boolean, default=False)
     pricing: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    credential_mode: Mapped[str] = mapped_column(String(20), default="required", server_default="required")
+    model_discovery_mode: Mapped[str] = mapped_column(String(20), default="auto", server_default="auto")
+    models_path: Mapped[str | None] = mapped_column(Text, nullable=True, default="models", server_default="models")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     models_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
     models_refreshed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    models_sync_state: Mapped[str] = mapped_column(String(24), default="never", server_default="never")
+    models_sync_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    models_sync_diagnostic: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
@@ -179,6 +185,16 @@ class ProviderRoutingDefaults(Base):
         ForeignKey("provider_profiles.id", ondelete="SET NULL"), nullable=True
     )
     image_model: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    video_provider_profile_id: Mapped[str | None] = mapped_column(
+        ForeignKey("provider_profiles.id", ondelete="SET NULL"), nullable=True
+    )
+    video_model: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    audio_provider_profile_id: Mapped[str | None] = mapped_column(
+        ForeignKey("provider_profiles.id", ondelete="SET NULL"), nullable=True
+    )
+    audio_model: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    max_concurrency: Mapped[int] = mapped_column(Integer, default=3, server_default="3")
+    max_transport_retries: Mapped[int] = mapped_column(Integer, default=2, server_default="2")
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
@@ -371,7 +387,7 @@ class RemediationAction(Base):
 
 
 class AgentSession(Base):
-    """Durable audit record for one isolated Codex diagnosis.
+    """Durable audit record for an isolated Codex diagnosis or planning chat.
 
     Agent sessions are deliberately separate from the production state machine.  A
     session may propose an action, but only the Controller can accept and execute
@@ -397,22 +413,30 @@ class AgentSession(Base):
     thread_id: Mapped[str | None] = mapped_column(String(240), nullable=True, index=True)
     adapter: Mapped[str] = mapped_column(String(120), default="unavailable")
     adapter_version: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    agent_model: Mapped[str | None] = mapped_column(String(160), nullable=True, index=True)
     schema_version: Mapped[int] = mapped_column(Integer, default=1)
+    purpose: Mapped[str] = mapped_column(String(40), default="diagnosis", index=True)
+    title: Mapped[str | None] = mapped_column(String(200), nullable=True)
     status: Mapped[str] = mapped_column(String(40), default="created", index=True)
     context_hash: Mapped[str] = mapped_column(String(64))
     context_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     context_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    draft_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    draft_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    draft_version: Mapped[int] = mapped_column(Integer, default=0)
     sandbox_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     allowed_actions_json: Mapped[list[str]] = mapped_column(JSON, default=list)
     writable_allowlist_json: Mapped[list[str]] = mapped_column(JSON, default=list)
     budget_limit: Mapped[int] = mapped_column(Integer, default=1)
     budget_used: Mapped[int] = mapped_column(Integer, default=0)
+    turn_count: Mapped[int] = mapped_column(Integer, default=0)
     diagnostic_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     result_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     stop_reason: Mapped[str | None] = mapped_column(String(160), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
 
 
 class AgentEvent(Base):
@@ -442,6 +466,30 @@ class AgentEvent(Base):
     turn_id: Mapped[str | None] = mapped_column(String(240), nullable=True)
     data_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AgentInputRequest(Base):
+    """Durable projection of a planning turn's pending question request."""
+
+    __tablename__ = "agent_input_requests"
+
+    id: Mapped[str] = mapped_column(String(48), primary_key=True, default=new_id)
+    session_id: Mapped[str] = mapped_column(ForeignKey("agent_sessions.id", ondelete="CASCADE"), index=True)
+    turn_id: Mapped[str] = mapped_column(String(240), index=True)
+    remote_thread_id: Mapped[str | None] = mapped_column(String(240), nullable=True)
+    remote_turn_id: Mapped[str | None] = mapped_column(String(240), nullable=True)
+    item_id: Mapped[str] = mapped_column(String(240))
+    transport_request_id: Mapped[str | None] = mapped_column(String(240), nullable=True)
+    response_mode: Mapped[str] = mapped_column(String(20), default="new_turn")
+    questions_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    answers_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    auto_resolution_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    fallback_reason: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    client_response_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    response_turn_id: Mapped[str | None] = mapped_column(String(240), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class ChangeSet(Base):

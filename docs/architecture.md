@@ -1,6 +1,6 @@
 # 架构说明
 
-> 阅读约定：未特别标注的内容描述截至 2026-07-31 的当前实现；“目标”内容描述 M7 及之后尚未实现的方向。两者不能混用。
+> 阅读约定：未特别标注的内容描述截至 2026-08-05 的当前实现；“目标”内容描述 M8 及之后尚未实现的方向。两者不能混用。
 
 ## 单一 Project 契约
 
@@ -61,7 +61,17 @@ flowchart LR
 | Codex 监督 Agent | M4 已实现 | 通过隔离 stdio 适配器读取脱敏证据，执行结构化语义/视觉诊断、选择受控修复策略或提出 ChangeSet；只能返回结构化动作。 |
 | 游戏仓库 | M3 已实现 | 消费确定性内容模块、资产 Manifest、运行媒体和 `gams-lock.json`；只通过显式导出改变。 |
 
-Web 制作台是 Controller 的客户端，不另建业务事实源。Codex 目标集成使用官方 Python SDK 控制本机 App Server，但 SDK/协议由适配层隔离；其 beta/实验性生命周期不能传播为 Project 契约。
+Web 制作台是 Controller 的客户端，不另建业务事实源。Codex 规划集成通过固定版本 CLI 的 App Server JSON-RPC 控制本机运行时，并由适配层隔离协议；其 beta/实验性生命周期不能传播为 Project 契约。高层 Python SDK 仅保留为兼容实现。
+
+### Agent 生成任务工作台
+
+`AgentSession(purpose=generation_planning)` 保存多回合可见消息、只读工具事件、脱敏项目快照和经 Pydantic 校验的 `GenerationPlanningDraft`。`AgentInputRequest` 持久化 App Server 的 `request_user_input` 问题和脱敏回答；`awaiting_input` 代表同一 Codex turn 暂停等待用户。API 重启不尝试恢复旧传输连接，而把请求降级为回答后开启新 turn。规划回合只能读取 Catalog、关系、固定 Revision/Rendition、项目规范与路由元数据；隐藏推理、凭据、绝对路径、SQLite 和 Git 信息不会进入会话上下文或事件流。用户编辑使用草案哈希做乐观并发控制，项目快照哈希用于拒绝规划期间发生的资产、参考图或路径漂移。
+
+确认前不会创建 Asset、GenerationPlan 或调用 Provider。`confirm` 在同一事务边界内登记 `new` Catalog Asset、把临时资产引用替换为真实 ID、调用现有计划校验和确认服务，并将会话链接到 Plan；文件写入失败或数据库事务失败时恢复 Catalog 快照。确认完成后仍由既有 Controller、Runner、QA 和人工审核状态机执行，不存在第二套生成引擎。
+
+### M7 叙事地图
+
+叙事地图是现有 Project 事实的场景化投影，不是新存储层。API 从内容 Asset、当前候选/批准 Revision、类型化 Relation 与媒体 Rendition 聚合章节树、场景关系图和覆盖率。场景编辑写入普通不可变候选 Revision；缺失需求物化为普通 Catalog Asset 后进入既有 GenerationPlan/Job/Artifact/QA/Review 链路。Project `format_version`、Release Manifest 与 Delivery 收据格式均未改变。
 
 ### 当前生产边界
 

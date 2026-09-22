@@ -12,6 +12,7 @@ import {
 } from "../lib/api";
 import { useModalFocus } from "../hooks/useModalFocus";
 import type { DeliveryRecord, ExportPreview, ReleaseSummary } from "../types";
+import { SelectMenu } from "./SelectMenu";
 
 interface DeliveryDrawerProps {
   open: boolean;
@@ -129,7 +130,16 @@ export function DeliveryDrawer({ open, projectId, onClose, onMessage }: Delivery
           </section>
           <section className="delivery-section">
             <div className="delivery-section-heading"><div><span className="section-kicker">快照</span><h3>选择 Release Manifest v2</h3></div><button className="button ghost" type="button" onClick={() => void run("preview")} disabled={busy || !v2Releases.length}><ArrowClockwise size={14} />刷新预览</button></div>
-            <label className="delivery-field"><span>Release</span><select value={selectedReleaseId} onChange={(event) => { setSelectedReleaseId(event.target.value); setPreview(null); }}><option value="">未选择</option>{v2Releases.map((release) => <option key={release.id} value={release.id}>{release.name} · {release.id.slice(0, 8)} · {release.asset_count} 项</option>)}</select></label>
+            <label className="delivery-field"><span>Release</span><SelectMenu
+              ariaLabel="选择 Release"
+              value={selectedReleaseId}
+              options={[{ value: "", label: "未选择" }, ...v2Releases.map((release) => ({
+                value: release.id,
+                label: `${release.name} · ${release.id.slice(0, 8)} · ${release.asset_count} 项`,
+              }))]}
+              onChange={(value) => { setSelectedReleaseId(value); setPreview(null); }}
+              disabled={busy}
+            /></label>
             {releases.length > 0 && v2Releases.length === 0 && <div className="delivery-message warning"><WarningCircle size={15} />当前只有 Release v1；请用 M3 CLI/API 创建 Manifest v2。</div>}
           </section>
           {preview && <section className="delivery-section delivery-preview" aria-label="导出预览"><div className="delivery-section-heading"><div><span className="section-kicker">只读预检</span><h3>{preview.no_op ? "目标已经同步" : `${preview.changes.filter((change) => change.action !== "keep").length} 项文件将变化`}</h3></div><span className={`delivery-status ${preview.blocking ? "blocked" : "ready"}`}>{preview.blocking ? "阻止应用" : "可应用"}</span></div><div className="delivery-change-list">{preview.changes.map((change) => <div key={String(change.path)}><code>{String(change.path)}</code><span className={`change-${String(change.action)}`}>{String(change.action)}</span></div>)}</div>{preview.issues.length > 0 && <div className="delivery-message error"><WarningCircle size={15} />{preview.issues.join("；")}</div>}</section>}

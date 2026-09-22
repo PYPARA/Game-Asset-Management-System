@@ -52,6 +52,12 @@ class Database:
                 ("is_active", "BOOLEAN NOT NULL DEFAULT 1"),
                 ("models_json", "JSON NOT NULL DEFAULT '[]'"),
                 ("models_refreshed_at", "DATETIME"),
+                ("credential_mode", "VARCHAR(20) NOT NULL DEFAULT 'required'"),
+                ("model_discovery_mode", "VARCHAR(20) NOT NULL DEFAULT 'auto'"),
+                ("models_path", "TEXT DEFAULT 'models'"),
+                ("models_sync_state", "VARCHAR(24) NOT NULL DEFAULT 'never'"),
+                ("models_sync_checked_at", "DATETIME"),
+                ("models_sync_diagnostic", "JSON NOT NULL DEFAULT '{}'"),
             ),
             "generation_plans": (
                 ("name", "VARCHAR(200) NOT NULL DEFAULT '未命名生成计划'"),
@@ -90,11 +96,29 @@ class Database:
             "agent_events": (
                 ("asset_id", "VARCHAR(36)"),
             ),
+            "agent_sessions": (
+                ("purpose", "VARCHAR(40) NOT NULL DEFAULT 'diagnosis'"),
+                ("title", "VARCHAR(200)"),
+                ("agent_model", "VARCHAR(160)"),
+                ("archived_at", "DATETIME"),
+                ("draft_json", "JSON NOT NULL DEFAULT '{}'"),
+                ("draft_hash", "VARCHAR(128)"),
+                ("draft_version", "INTEGER NOT NULL DEFAULT 0"),
+                ("turn_count", "INTEGER NOT NULL DEFAULT 0"),
+            ),
             "releases": (
                 ("manifest_version", "INTEGER NOT NULL DEFAULT 1"),
                 ("snapshot_hash", "VARCHAR(80)"),
             ),
             "deliveries": (),
+            "provider_routing_defaults": (
+                ("video_provider_profile_id", "VARCHAR(36)"),
+                ("video_model", "VARCHAR(160)"),
+                ("audio_provider_profile_id", "VARCHAR(36)"),
+                ("audio_model", "VARCHAR(160)"),
+                ("max_concurrency", "INTEGER NOT NULL DEFAULT 3"),
+                ("max_transport_retries", "INTEGER NOT NULL DEFAULT 2"),
+            ),
         }
         with self.engine.begin() as connection:
             for table, additions in columns.items():
@@ -128,6 +152,9 @@ class Database:
                     "idempotency_key",
                 ),
                 ("agent_events", "ix_agent_events_asset_id", "asset_id"),
+                ("agent_sessions", "ix_agent_sessions_purpose", "purpose"),
+                ("agent_sessions", "ix_agent_sessions_agent_model", "agent_model"),
+                ("agent_sessions", "ix_agent_sessions_archived_at", "archived_at"),
                 ("deliveries", "ix_deliveries_project_id", "project_id"),
                 ("deliveries", "ix_deliveries_release_id", "release_id"),
                 ("deliveries", "ix_deliveries_status", "status"),
@@ -144,20 +171,13 @@ class Database:
                 "SELECT id FROM provider_routing_defaults WHERE id = 'global'"
             ).first()
             if defaults is None:
-                first = connection.exec_driver_sql(
-                    "SELECT id, text_model, image_model FROM provider_profiles "
-                    "WHERE is_active = 1 ORDER BY created_at, id LIMIT 1"
-                ).mappings().first()
                 connection.exec_driver_sql(
                     "INSERT INTO provider_routing_defaults "
-                    "(id, text_provider_profile_id, text_model, image_provider_profile_id, image_model, updated_at) "
-                    "VALUES ('global', ?, ?, ?, ?, CURRENT_TIMESTAMP)",
-                    (
-                        first["id"] if first else None,
-                        first["text_model"] if first else None,
-                        first["id"] if first else None,
-                        first["image_model"] if first else None,
-                    ),
+                    "(id, text_provider_profile_id, text_model, image_provider_profile_id, image_model, "
+                    "video_provider_profile_id, video_model, audio_provider_profile_id, audio_model, "
+                    "max_concurrency, max_transport_retries, updated_at) "
+                    "VALUES ('global', ?, ?, ?, ?, ?, ?, ?, ?, 3, 2, CURRENT_TIMESTAMP)",
+                    (None, None, None, None, None, None, None, None),
                 )
 
     def session(self) -> Generator[Session, None, None]:

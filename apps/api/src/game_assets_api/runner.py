@@ -54,6 +54,7 @@ from .providers import (
     build_provider,
     provider_runtime_config,
 )
+from .provider_catalog import provider_credentials_ready
 from .qa import normalize_image
 from .services import ServiceError, asset_descriptor, create_revision, run_qa
 from .settings import Settings
@@ -211,8 +212,9 @@ class JobRunner:
                 profile
                 and (
                     not requires_provider
-                    or profile.kind == "fake"
-                    or self.vault.is_unlocked(profile.id)
+                    or provider_credentials_ready(
+                        profile, unlocked=self.vault.is_unlocked(profile.id)
+                    )
                 )
             )
             message = (
@@ -490,15 +492,27 @@ class JobRunner:
                     job.error_category = ErrorCategory.VALIDATION.value
                     job.error_message = "job references a missing provider, plan, or asset"
                     continue
-                try:
-                    provider_limit = max(
-                        1,
-                        int((job.provider_snapshot_json or {}).get("concurrency", profile.concurrency)),
-                    )
-                except (TypeError, ValueError):
-                    provider_limit = max(1, profile.concurrency)
                 plan_limit = max(1, plan.max_concurrency)
-                if provider_counts.get(profile.id, 0) >= provider_limit:
+                snapshot = job.provider_snapshot_json or {}
+                try:
+                    runtime_policy_version = int(snapshot.get("runtime_policy_version", 1))
+                except (TypeError, ValueError):
+                    runtime_policy_version = 1
+                if runtime_policy_version >= 2:
+                    # New jobs are governed only by their frozen plan limit.
+                    provider_limit = None
+                else:
+                    try:
+                        provider_limit = max(
+                            1,
+                            int(snapshot.get("concurrency", profile.concurrency)),
+                        )
+                    except (TypeError, ValueError):
+                        provider_limit = max(1, profile.concurrency)
+                if (
+                    provider_limit is not None
+                    and provider_counts.get(profile.id, 0) >= provider_limit
+                ):
                     continue
                 if plan_counts.get(plan.id, 0) >= plan_limit:
                     continue

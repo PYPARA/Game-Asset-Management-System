@@ -5,6 +5,13 @@ import type {
   GenerationJobRun,
   GenerationPlanInput,
   GenerationPlanRun,
+  GenerationConversation,
+  GenerationAgentCapabilities,
+  GenerationConversationConfirmResult,
+  GenerationConversationEvent,
+  GenerationConversationMessageResult,
+  GenerationConversationSummary,
+  GenerationPlanningDraft,
   GenerationProviderProfile,
   DeliveryRecord,
   ExportConfig,
@@ -13,16 +20,23 @@ import type {
   ProjectSummary,
   ReleaseSummary,
   ProviderDefaults,
+  ProviderCredentialMode,
+  ProviderModelDiscoveryMode,
+  ProviderModelModality,
   ProviderModelRecord,
+  ProviderModelsSync,
   QACheck,
   RemediationRun,
   ReviewStatus,
   RunEventItem,
   RunInspection,
   WorkbenchPayload,
+  NarrativeMap,
+  NarrativeMaterializeResult,
 } from "../types";
 import type { ProviderProfile } from "../types";
 import { assetSubtypeLabel, domainLabel } from "./labels";
+import { normalizeModelCapability } from "./providerModels";
 
 const API_ROOT =
   (import.meta.env.VITE_API_BASE as string | undefined)?.replace(/\/$/, "") ?? "/api";
@@ -52,6 +66,43 @@ export const emptyWorkbenchPayload: WorkbenchPayload = {
   assets: [],
   job: emptyJob,
 };
+
+export async function fetchNarrativeMap(projectId: string): Promise<NarrativeMap> {
+  return request<NarrativeMap>(
+    `/projects/${encodeURIComponent(projectId)}/narrative-map`,
+    { timeoutMs: 15_000 },
+  );
+}
+
+export async function saveNarrativeScene(
+  sceneAssetId: string,
+  content: Record<string, unknown>,
+  parentRevisionId: string | null,
+): Promise<{ id: string }> {
+  return request<{ id: string }>("/revisions", {
+    method: "POST",
+    body: JSON.stringify({
+      asset_id: sceneAssetId,
+      format: "json",
+      content,
+      parent_revision_id: parentRevisionId,
+    }),
+  });
+}
+
+export async function materializeNarrativeRequirements(
+  projectId: string,
+  sceneAssetId: string,
+  requirementIds: string[],
+): Promise<NarrativeMaterializeResult> {
+  return request<NarrativeMaterializeResult>(
+    `/projects/${encodeURIComponent(projectId)}/narrative-map/scenes/${encodeURIComponent(sceneAssetId)}/requirements`,
+    {
+      method: "POST",
+      body: JSON.stringify({ requirement_ids: requirementIds }),
+    },
+  );
+}
 
 export async function fetchReleases(projectId: string): Promise<ReleaseSummary[]> {
   return request<ReleaseSummary[]>(`/releases?project_id=${encodeURIComponent(projectId)}`);
@@ -123,13 +174,27 @@ export class ApiError extends Error {
   readonly status: number;
   readonly category?: string;
   readonly retryAfter?: string;
+  readonly endpoint?: string;
+  readonly requestId?: string;
+  readonly hint?: string;
 
-  constructor(message: string, status: number, category?: string, retryAfter?: string) {
+  constructor(
+    message: string,
+    status: number,
+    category?: string,
+    retryAfter?: string,
+    endpoint?: string,
+    requestId?: string,
+    hint?: string,
+  ) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.category = category;
     this.retryAfter = retryAfter;
+    this.endpoint = endpoint;
+    this.requestId = requestId;
+    this.hint = hint;
   }
 }
 
@@ -165,6 +230,9 @@ async function request<T>(path: string, init: RequestOptions = {}): Promise<T> {
     if (!response.ok) {
       let message = `${response.status} ${response.statusText}`;
       let category: string | undefined;
+      let endpoint: string | undefined;
+      let requestId: string | undefined;
+      let hint: string | undefined;
       try {
         const payload = (await response.json()) as unknown;
         if (isRecord(payload)) {
@@ -173,12 +241,23 @@ async function request<T>(path: string, init: RequestOptions = {}): Promise<T> {
           if (isRecord(detail)) {
             if (typeof detail.message === "string") message = detail.message;
             if (typeof detail.category === "string") category = detail.category;
+            if (typeof detail.endpoint === "string") endpoint = detail.endpoint;
+            if (typeof detail.request_id === "string") requestId = detail.request_id;
+            if (typeof detail.hint === "string") hint = detail.hint;
           }
         }
       } catch {
         // Some OpenAI-compatible gateways return an empty or non-JSON error body.
       }
-      throw new ApiError(message, response.status, category, response.headers.get("Retry-After") ?? undefined);
+      throw new ApiError(
+        message,
+        response.status,
+        category,
+        response.headers.get("Retry-After") ?? undefined,
+        endpoint,
+        requestId ?? response.headers.get("x-request-id") ?? response.headers.get("request-id") ?? undefined,
+        hint,
+      );
     }
 
     if (response.status === 204) {
@@ -245,8 +324,23 @@ function normalizeAsset(value: unknown): GameAsset {
     ? (rawKind as GameAsset["kind"])
     : "media";
   const subtype = String(value.subtype ?? "未分类");
-  const metadata = isRecord(value.asset_metadata) ? value.asset_metadata : {};
+  // The API contract calls this field `metadata`; older fixtures used
+  // `asset_metadata`, so accept both while keeping the normalized shape
+  // stable for the workbench.
+  const metadata = isRecord(value.metadata)
+    ? value.metadata
+    : isRecord(value.asset_metadata)
+      ? value.asset_metadata
+      : {};
   const subtypeKey = subtype.toLocaleLowerCase();
+  const keyLower = key.toLocaleLowerCase();
+  const isVisualAnchor = kind === "production" && subtypeKey === "visual_anchor";
+  const revisionFormat: GameAsset["revisionFormat"] =
+    kind === "media" || isVisualAnchor
+      ? "media"
+      : subtypeKey === "style_bible"
+        ? "markdown"
+        : "json";
   const category =
     kind === "content"
       ? "content"
@@ -262,9 +356,19 @@ function normalizeAsset(value: unknown): GameAsset {
               : subtypeKey.includes("location") || subtype.includes("地点") || subtype.includes("场景")
                 ? "locations"
                 : "items"
-            : subtypeKey.includes("audio") || subtype.includes("音频")
+          : subtypeKey.includes("audio") || subtype.includes("音频")
               ? "audio"
-              : "2d-media";
+              : keyLower.startsWith("portrait.") || subtypeKey.includes("portrait") || subtype.includes("立绘")
+                ? "portraits"
+                : keyLower.startsWith("background.") || subtypeKey.includes("background") || subtype.includes("背景")
+                  ? "backgrounds"
+                  : keyLower.startsWith("cg.") || subtypeKey === "cg" || subtype.includes("CG")
+                    ? "cgs"
+                    : keyLower.startsWith("icon.") || subtypeKey.includes("icon") || subtype.includes("图标")
+                      ? "icons"
+                      : keyLower.startsWith("ending.") || subtypeKey.includes("ending") || subtype.includes("结局")
+                        ? "ending-illustrations"
+                        : "media-other";
   const approvedRevisionId =
     typeof value.current_revision_id === "string" ? value.current_revision_id : undefined;
   const candidateRevisionId =
@@ -278,6 +382,20 @@ function normalizeAsset(value: unknown): GameAsset {
   const productionStage = String(
     metadata.production_stage ?? (reviewStatus === "approved" ? "approved" : "imported"),
   );
+  // Publication is a separate lifecycle from candidate review. Keep the
+  // backend value available to workspace filters (notably “已发布”) instead
+  // of inferring it from reviewStatus, which would incorrectly include
+  // approved-but-never-released assets.
+  const publicationStatus = String(
+    value.publication_status ?? metadata.publication_status ?? "unpublished",
+  );
+  // Older/local projects do not have a first-class author column. Accept the
+  // metadata variants when present, but leave this undefined rather than
+  // pretending every indexed asset was created by the current user.
+  const createdByValue = value.created_by ?? metadata.created_by ?? metadata.author;
+  const createdBy = typeof createdByValue === "string" && createdByValue.trim()
+    ? createdByValue.trim()
+    : undefined;
   const summary = String(metadata.preview_summary ?? "");
   const domain = typeof metadata.domain === "string" ? metadata.domain : "";
   const preview =
@@ -288,9 +406,17 @@ function normalizeAsset(value: unknown): GameAsset {
           meta: domain ? domainLabel(domain) : "结构化内容",
           summary: summary || "暂无摘要",
         }
+      : kind === "production"
+        ? {
+            kind: "placeholder" as const,
+            label: subtypeKey === "prompt_recipe" ? "Prompt 配方" : subtypeKey === "visual_anchor" ? "视觉锚点" : "项目规范",
+            detail: "结构化文档，不是媒体文件",
+          }
       : {
           kind: "placeholder" as const,
-          label: kind === "entity" ? (subtype === "character" ? "角色实体" : subtype === "achievement" ? "成就实体" : "物品实体") : "媒体资产",
+          label: kind === "entity"
+            ? (subtype === "character" ? "角色实体" : subtype === "location" ? "地点实体" : subtype === "achievement" ? "成就实体" : "物品实体")
+            : "媒体资产",
           detail: kind === "entity" ? "等待关联媒体预览" : "暂无可用预览",
         };
 
@@ -310,6 +436,8 @@ function normalizeAsset(value: unknown): GameAsset {
     subtypeLabel: assetSubtypeLabel(kind, subtype),
     tags: Array.isArray(value.tags) ? value.tags.map(String) : [],
     reviewStatus,
+    publicationStatus,
+    createdBy,
     productionStage,
     timeAccuracy,
     preview,
@@ -319,7 +447,7 @@ function normalizeAsset(value: unknown): GameAsset {
     thumbnails: [],
     linkedMedia: [],
     relatedAssets: [],
-    revisionFormat: kind === "media" || kind === "production" ? "media" : subtype === "style_bible" ? "markdown" : "json",
+    revisionFormat,
     revisionContent: null,
     revisions: [],
     prompt: "",
@@ -330,6 +458,12 @@ function normalizeAsset(value: unknown): GameAsset {
     qaPassed: 0,
     qaTotal: 0,
     qa: [],
+    sourcePath: typeof metadata.source_path === "string" ? metadata.source_path : undefined,
+    sourceMissing: metadata.source_missing === true,
+    sourceDriftStatus: typeof metadata.source_drift_status === "string"
+      ? metadata.source_drift_status as GameAsset["sourceDriftStatus"]
+      : undefined,
+    recipeId: typeof metadata.recipe_id === "string" ? metadata.recipe_id : undefined,
   };
 }
 
@@ -528,7 +662,7 @@ export async function fetchAssetDetails(asset: GameAsset): Promise<GameAsset> {
     )
   ).flat();
   const checks = normalizeChecks(qaRuns);
-  const isMedia = asset.kind === "media";
+  const isMedia = asset.revisionFormat === "media";
   const qaReady =
     !isMedia ||
     (candidateRenditions.length > 0 &&
@@ -627,14 +761,8 @@ export async function fetchWorkbench(): Promise<WorkbenchPayload> {
     return emptyWorkbenchPayload;
   }
   const project = normalizeProject(projects[0]);
-  const scan = await request<{ errors: string[] }>(
-    `/projects/${encodeURIComponent(project.id)}/scan`,
-    { method: "POST", timeoutMs: 120_000 },
-  );
-  if (scan.errors.length > 0) {
-    throw new ApiError(`Project 扫描失败：${scan.errors[0]}`, 409, "scan_failed");
-  }
-
+  // The API indexes discovered Projects during startup. Reading the workbench
+  // must not launch another full iCloud scan on every mount or query refetch.
   const [assetResult, jobResult, relations] = await Promise.all([
     request<GameAsset[] | ApiList<GameAsset>>(`/assets?project_id=${encodeURIComponent(project.id)}`),
     request<JobSummary[] | ApiList<JobSummary>>(`/jobs?project_id=${encodeURIComponent(project.id)}`),
@@ -650,7 +778,11 @@ export async function fetchWorkbench(): Promise<WorkbenchPayload> {
         reviewBlockReason: "当前资产还没有候选或已批准修订。",
       };
     }
-    return asset.kind === "media" || asset.kind === "production"
+    return asset.revisionFormat === "media" || (
+      asset.kind === "design" ||
+      asset.subtype === "style_bible" ||
+      asset.subtype === "prompt_recipe"
+    )
       ? fetchAssetDetails(asset)
       : asset;
   });
@@ -776,17 +908,25 @@ interface ProviderApiRecord {
   concurrency: number;
   max_retries: number;
   allow_private_network: boolean;
-  pricing?: Record<string, unknown> | null;
+  credential_mode?: ProviderCredentialMode;
+  model_discovery_mode?: ProviderModelDiscoveryMode;
+  models_path?: string | null;
   is_active?: boolean;
   models?: ProviderModelRecord[];
   models_refreshed_at?: string | null;
+  models_sync?: Partial<ProviderModelsSync>;
+  model_catalog_api_version?: number;
   is_unlocked?: boolean;
 }
 
-interface ProviderModelsResponse {
+export interface ProviderModelsResponse {
   provider_profile_id: string;
   models: ProviderModelRecord[];
   refreshed_at: string | null;
+  new_model_ids?: string[];
+  cleared_default_routes: ProviderModelModality[];
+  model_catalog_api_version: number;
+  models_sync?: ProviderModelsSync;
 }
 
 function providerPayload(profile: ProviderProfile) {
@@ -794,17 +934,75 @@ function providerPayload(profile: ProviderProfile) {
     name: profile.name,
     kind: "openai_compatible",
     base_url: profile.baseUrl,
-    text_model: profile.textModel,
-    image_model: profile.imageModel,
-    quality: profile.quality,
-    concurrency: profile.concurrency,
-    max_retries: profile.retries,
     allow_private_network: profile.allowPrivateNetwork,
+    credential_mode: profile.credentialMode,
+    model_discovery_mode: profile.modelDiscoveryMode,
+    models_path: profile.modelsPath.trim() || null,
+  };
+}
+
+function normalizeModelsSync(value: unknown): ProviderModelsSync {
+  const record = isRecord(value) ? value : {};
+  const rawState = String(record.state ?? "never");
+  const state: ProviderModelsSync["state"] = ["never", "synced", "empty", "manual_required", "error"].includes(rawState)
+    ? (rawState as ProviderModelsSync["state"])
+    : "never";
+  return {
+    state,
+    checked_at: typeof record.checked_at === "string" ? record.checked_at : null,
+    endpoint: typeof record.endpoint === "string" ? record.endpoint : null,
+    status_code: typeof record.status_code === "number" ? record.status_code : null,
+    message: typeof record.message === "string" ? record.message : null,
+    hint: typeof record.hint === "string" ? record.hint : null,
+    request_id: typeof record.request_id === "string" ? record.request_id : null,
+  };
+}
+
+function normalizeProviderModels(value: unknown): ProviderModelRecord[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((model) => {
+    if (!isRecord(model) || !model.id) return [];
+    const id = String(model.id);
+    return [{
+      id,
+      modalities: [normalizeModelCapability(id, Array.isArray(model.modalities) ? model.modalities : [])],
+      classification: model.classification === "provider" || model.classification === "heuristic" || model.classification === "manual"
+        ? model.classification
+        : "unknown",
+      available: model.available !== false,
+      enabled: model.enabled !== false,
+    }];
+  });
+}
+
+function normalizeProviderModelsResponse(
+  value: unknown,
+  fallbackProviderId: string,
+): ProviderModelsResponse {
+  const record = isRecord(value) ? value : {};
+  const clearedDefaultRoutes = Array.isArray(record.cleared_default_routes)
+    ? record.cleared_default_routes.filter(
+        (item): item is ProviderModelModality =>
+          item === "text" || item === "image" || item === "video" || item === "audio",
+      )
+    : [];
+  const rawVersion = Number(record.model_catalog_api_version ?? 1);
+  return {
+    provider_profile_id: String(record.provider_profile_id ?? fallbackProviderId),
+    models: normalizeProviderModels(record.models),
+    refreshed_at: typeof record.refreshed_at === "string" ? record.refreshed_at : null,
+    new_model_ids: Array.isArray(record.new_model_ids)
+      ? record.new_model_ids.map(String)
+      : [],
+    cleared_default_routes: clearedDefaultRoutes,
+    model_catalog_api_version: Number.isFinite(rawVersion) ? rawVersion : 1,
+    models_sync: normalizeModelsSync(record.models_sync),
   };
 }
 
 function normalizeGenerationProvider(profile: Record<string, unknown>): GenerationProviderProfile {
   const quality = String(profile.quality ?? "high");
+  const rawCatalogVersion = Number(profile.model_catalog_api_version ?? 1);
   return {
     id: String(profile.id ?? ""),
     name: String(profile.name ?? "未命名供应商"),
@@ -816,30 +1014,16 @@ function normalizeGenerationProvider(profile: Record<string, unknown>): Generati
     concurrency: Number(profile.concurrency ?? 1),
     max_retries: Number(profile.max_retries ?? 0),
     allow_private_network: profile.allow_private_network === true,
-    pricing: isRecord(profile.pricing)
-      ? Object.fromEntries(
-          Object.entries(profile.pricing).flatMap(([key, value]) => {
-            const parsed = Number(value);
-            return Number.isFinite(parsed) ? [[key, parsed]] : [];
-          }),
-        )
-      : null,
+    credential_mode: profile.credential_mode === "optional" || profile.credential_mode === "none"
+      ? profile.credential_mode
+      : "required",
+    model_discovery_mode: profile.model_discovery_mode === "manual" ? "manual" : "auto",
+    models_path: typeof profile.models_path === "string" ? profile.models_path : null,
     is_active: profile.is_active !== false,
-    models: Array.isArray(profile.models)
-      ? profile.models.flatMap((model) => isRecord(model) && model.id
-        ? [{
-            id: String(model.id),
-            modalities: Array.isArray(model.modalities)
-              ? model.modalities.filter((value): value is "text" | "image" => value === "text" || value === "image")
-              : [],
-            classification: model.classification === "provider" || model.classification === "heuristic" || model.classification === "manual"
-              ? model.classification
-              : "unknown",
-            available: model.available !== false,
-          }]
-        : [])
-      : [],
+    models: normalizeProviderModels(profile.models),
     models_refreshed_at: typeof profile.models_refreshed_at === "string" ? profile.models_refreshed_at : null,
+    models_sync: normalizeModelsSync(profile.models_sync),
+    model_catalog_api_version: Number.isFinite(rawCatalogVersion) ? rawCatalogVersion : 1,
     is_unlocked: profile.is_unlocked === true,
   };
 }
@@ -850,12 +1034,10 @@ export async function ensureProviderProfile(profile: ProviderProfile): Promise<P
     (item) =>
       (item.id === profile.id || item.name === profile.name) &&
       item.base_url === profile.baseUrl &&
-      item.text_model === profile.textModel &&
-      item.image_model === profile.imageModel &&
-      item.quality === profile.quality &&
-      item.concurrency === profile.concurrency &&
-      item.max_retries === profile.retries &&
-      item.allow_private_network === profile.allowPrivateNetwork,
+      item.allow_private_network === profile.allowPrivateNetwork &&
+      item.credential_mode === profile.credentialMode &&
+      item.model_discovery_mode === profile.modelDiscoveryMode &&
+      (item.models_path ?? "models") === (profile.modelsPath.trim() || "models"),
   );
   if (existing) return existing;
 
@@ -901,35 +1083,312 @@ export async function restoreProvider(profileId: string): Promise<GenerationProv
 }
 
 export async function fetchProviderDefaults(): Promise<ProviderDefaults> {
-  return request<ProviderDefaults>("/provider-defaults");
+  const value = await request<Partial<ProviderDefaults>>("/provider-defaults");
+  return {
+    text: value.text ?? null,
+    image: value.image ?? null,
+    video: value.video ?? null,
+    audio: value.audio ?? null,
+    max_concurrency: Number(value.max_concurrency ?? 3),
+    max_transport_retries: Number(value.max_transport_retries ?? 2),
+    updated_at: value.updated_at ?? null,
+  };
 }
 
 export async function updateProviderDefaults(defaults: ProviderDefaults): Promise<ProviderDefaults> {
-  return request<ProviderDefaults>("/provider-defaults", {
+  const value = await request<Partial<ProviderDefaults>>("/provider-defaults", {
     method: "PUT",
-    body: JSON.stringify({ text: defaults.text, image: defaults.image }),
+    body: JSON.stringify({
+      text: defaults.text,
+      image: defaults.image,
+      video: defaults.video,
+      audio: defaults.audio,
+      max_concurrency: defaults.max_concurrency,
+      max_transport_retries: defaults.max_transport_retries,
+    }),
   });
+  return {
+    text: value.text ?? null,
+    image: value.image ?? null,
+    video: value.video ?? null,
+    audio: value.audio ?? null,
+    max_concurrency: Number(value.max_concurrency ?? defaults.max_concurrency),
+    max_transport_retries: Number(value.max_transport_retries ?? defaults.max_transport_retries),
+    updated_at: value.updated_at ?? null,
+  };
+}
+
+export interface DirectProviderProfile {
+  baseUrl: string;
+  modelsPath?: string | null;
+  credentialMode?: ProviderCredentialMode;
+}
+
+export interface DirectProviderModels {
+  endpoint: string;
+  statusCode: number;
+  requestId: string | null;
+  models: Array<Record<string, unknown>>;
+}
+
+export class ProviderDirectError extends Error {
+  readonly status: number | null;
+  readonly category: string;
+  readonly endpoint: string;
+  readonly requestId?: string;
+  readonly hint?: string;
+
+  constructor(
+    message: string,
+    endpoint: string,
+    category: string,
+    status: number | null = null,
+    requestId?: string,
+    hint?: string,
+  ) {
+    super(message);
+    this.name = "ProviderDirectError";
+    this.status = status;
+    this.category = category;
+    this.endpoint = endpoint;
+    this.requestId = requestId;
+    this.hint = hint;
+  }
+}
+
+function directModelsEndpoint(profile: DirectProviderProfile): string {
+  const base = new URL(profile.baseUrl);
+  const path = (profile.modelsPath?.trim() || "models").replace(/^\/+/, "");
+  if (!path || path.includes("\\") || path.includes("?") || path.includes("#") || path.includes("://")) {
+    throw new ProviderDirectError(
+      "模型列表路径无效。",
+      profile.baseUrl,
+      "validation",
+      422,
+      undefined,
+      "请输入不带协议、查询参数或片段的相对路径，例如 models。",
+    );
+  }
+  const segments = path.split("/");
+  if (segments.some((segment) => segment === "." || segment === "..")) {
+    throw new ProviderDirectError(
+      "模型列表路径无效。",
+      profile.baseUrl,
+      "validation",
+      422,
+      undefined,
+      "请输入不带协议、查询参数或片段的相对路径，例如 models。",
+    );
+  }
+  base.search = "";
+  base.hash = "";
+  return `${base.toString().replace(/\/$/, "")}/${path}`;
+}
+
+function redactProviderMessage(value: string, apiKey: string): string {
+  return value
+    .replaceAll(apiKey, "[redacted]")
+    .replace(/Bearer\s+[^\s,;]+/gi, "Bearer [redacted]")
+    .slice(0, 320)
+    .trim();
+}
+
+function directResponseMessage(payload: unknown, apiKey: string): string | undefined {
+  if (!isRecord(payload)) return undefined;
+  const error = payload.error;
+  const candidates: unknown[] = [];
+  if (isRecord(error)) {
+    candidates.push(error.message, error.detail, error.code);
+  } else if (typeof error === "string") {
+    candidates.push(error);
+  }
+  candidates.push(payload.message, payload.detail);
+  const message = candidates.find(
+    (value): value is string => typeof value === "string" && value.trim().length > 0,
+  );
+  return message ? redactProviderMessage(message, apiKey) : undefined;
+}
+
+function directProviderHint(status: number): string {
+  if (status === 401 || status === 403) return "检查 API Key 和供应商权限。";
+  if (status === 404 || status === 405) return "连接仍可使用；请在模型选择器中手动登记模型 ID。";
+  if (status === 429) return "稍后重试，或检查供应商的额度和限流策略。";
+  if (status >= 500) return "检查供应商状态页，稍后重试。";
+  return "检查 Base URL、模型列表路径和供应商接口文档。";
+}
+
+function directModelItems(payload: unknown, endpoint: string): Array<Record<string, unknown>> {
+  let rawItems: unknown[] | undefined;
+  if (Array.isArray(payload)) rawItems = payload;
+  else if (isRecord(payload)) {
+    for (const key of ["data", "models", "items"]) {
+      if (Array.isArray(payload[key])) {
+        rawItems = payload[key] as unknown[];
+        break;
+      }
+    }
+  }
+  if (!rawItems) {
+    throw new ProviderDirectError(
+      "供应商返回的模型列表格式无法识别。",
+      endpoint,
+      "invalid_response",
+      200,
+      undefined,
+      "供应商应返回数组，或包含 data、models、items 数组的 JSON。",
+    );
+  }
+
+  const items: Array<Record<string, unknown>> = [];
+  for (const raw of rawItems) {
+    if (typeof raw === "string" && raw.trim()) {
+      items.push({ id: raw.trim() });
+      continue;
+    }
+    if (!isRecord(raw)) continue;
+    const modelId = ["id", "name", "model", "model_id"].find(
+      (key) => typeof raw[key] === "string" && String(raw[key]).trim(),
+    );
+    if (!modelId) continue;
+    const item: Record<string, unknown> = { id: String(raw[modelId]).trim() };
+    for (const key of ["modalities", "capabilities", "input_modalities", "output_modalities"]) {
+      const value = raw[key];
+      if (typeof value === "string" || Array.isArray(value) || isRecord(value)) item[key] = value;
+    }
+    items.push(item);
+  }
+  if (rawItems.length > 0 && items.length === 0) {
+    throw new ProviderDirectError(
+      "供应商返回的模型列表中没有可识别的模型 ID。",
+      endpoint,
+      "invalid_response",
+      200,
+      undefined,
+      "请确认模型项包含 id、name、model 或 model_id 字段。",
+    );
+  }
+  return items;
+}
+
+export async function fetchProviderModelsDirect(
+  profile: DirectProviderProfile,
+  apiKey = "",
+): Promise<DirectProviderModels> {
+  const endpoint = directModelsEndpoint(profile);
+  const secret = apiKey.trim();
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 120_000);
+  try {
+    let response: Response;
+    try {
+      response = await fetch(endpoint, {
+        method: "GET",
+        signal: controller.signal,
+        headers: {
+          Accept: "application/json",
+          ...(secret ? { Authorization: `Bearer ${secret}` } : {}),
+        },
+      });
+    } catch (error) {
+      const aborted = error instanceof DOMException && error.name === "AbortError";
+      throw new ProviderDirectError(
+        aborted ? "供应商模型列表请求超时。" : "无法直接连接供应商模型列表接口。",
+        endpoint,
+        "network",
+        null,
+        undefined,
+        aborted
+          ? "检查 Base URL 和供应商响应时间。"
+          : "检查供应商是否允许浏览器跨域访问（CORS）、Base URL 和本机网络。",
+      );
+    }
+
+    const requestId = response.headers.get("x-request-id")
+      ?? response.headers.get("request-id")
+      ?? response.headers.get("cf-ray");
+    if (!response.ok) {
+      let payload: unknown = null;
+      try {
+        payload = await response.json();
+      } catch {
+        // Keep arbitrary gateway bodies out of the UI and error logs.
+      }
+      const responseMessage = directResponseMessage(payload, secret);
+      const message = responseMessage || `供应商返回 HTTP ${response.status}`;
+      throw new ProviderDirectError(
+        message,
+        endpoint,
+        response.status === 401 || response.status === 403 ? "auth" : response.status >= 500 ? "server" : response.status === 404 || response.status === 405 ? "validation" : "unknown",
+        response.status,
+        requestId ?? undefined,
+        directProviderHint(response.status),
+      );
+    }
+
+    let payload: unknown;
+    try {
+      payload = await response.json();
+    } catch {
+      throw new ProviderDirectError(
+        "供应商返回了无效的模型列表 JSON。",
+        endpoint,
+        "invalid_response",
+        response.status,
+        requestId ?? undefined,
+        "确认模型列表接口返回 JSON，而不是 HTML 或空响应。",
+      );
+    }
+    return {
+      endpoint,
+      statusCode: response.status,
+      requestId,
+      models: directModelItems(payload, endpoint),
+    };
+  } finally {
+    window.clearTimeout(timeout);
+  }
 }
 
 export async function fetchProviderModels(profileId: string): Promise<ProviderModelsResponse> {
-  return request<ProviderModelsResponse>(`/providers/${encodeURIComponent(profileId)}/models`);
-}
-
-export async function refreshProviderModels(profileId: string): Promise<ProviderModelsResponse> {
-  return request<ProviderModelsResponse>(
-    `/providers/${encodeURIComponent(profileId)}/models/refresh`,
-    { method: "POST", timeoutMs: 120_000 },
+  const value = await request<Record<string, unknown>>(
+    `/providers/${encodeURIComponent(profileId)}/models`,
   );
+  return normalizeProviderModelsResponse(value, profileId);
 }
 
 export async function updateProviderModelOverrides(
   profileId: string,
-  models: Array<Pick<ProviderModelRecord, "id" | "modalities">>,
+  models: Array<Pick<ProviderModelRecord, "id" | "modalities" | "classification" | "available"> & { enabled?: boolean }>,
+  options: {
+    catalogRefreshed?: boolean;
+    requestId?: string | null;
+    removedModelIds?: string[];
+    catalogApiVersion?: number;
+  } = {},
 ): Promise<ProviderModelsResponse> {
-  return request<ProviderModelsResponse>(`/providers/${encodeURIComponent(profileId)}/models`, {
+  const removedModelIds = options.removedModelIds ?? [];
+  if (removedModelIds.length > 0 && (options.catalogApiVersion ?? 1) < 2) {
+    throw new Error("本机后端未加载模型删除接口的新版本，请重启本机 API 后再试。");
+  }
+  const value = await request<Record<string, unknown>>(`/providers/${encodeURIComponent(profileId)}/models`, {
     method: "PATCH",
-    body: JSON.stringify({ models }),
+    body: JSON.stringify({
+      models,
+      removed_model_ids: removedModelIds,
+      catalog_refreshed: options.catalogRefreshed === true,
+      request_id: options.requestId ?? null,
+    }),
   });
+  const result = normalizeProviderModelsResponse(value, profileId);
+  if (
+    removedModelIds.length > 0 &&
+    (result.model_catalog_api_version < 2 || removedModelIds.some(
+      (modelId) => result.models.some((model) => model.id === modelId),
+    ))
+  ) {
+    throw new Error("本机后端未加载模型删除接口的新版本，请重启本机 API 后再试。");
+  }
+  return result;
 }
 
 export async function testProvider(profileId: string) {
@@ -1003,6 +1462,276 @@ export async function createAndConfirmGenerationPlan(
     { method: "POST" },
   );
   return { plan, jobs };
+}
+
+function generationConversationPath(sessionId: string, suffix = ""): string {
+  return `/generation-conversations/${encodeURIComponent(sessionId)}${suffix}`;
+}
+
+export async function createGenerationConversation(
+  projectId: string,
+  seedAssetIds: string[] = [],
+  title?: string,
+  agentModel?: string | null,
+): Promise<GenerationConversation> {
+  return request<GenerationConversation>("/generation-conversations", {
+    method: "POST",
+    body: JSON.stringify({
+      project_id: projectId,
+      seed_asset_ids: seedAssetIds,
+      ...(title ? { title } : {}),
+      ...(agentModel ? { agent_model: agentModel } : {}),
+    }),
+    timeoutMs: 20_000,
+  });
+}
+
+export async function fetchGenerationConversations(
+  projectId?: string,
+  includeArchived = false,
+): Promise<GenerationConversationSummary[]> {
+  const params = new URLSearchParams();
+  if (projectId) params.set("project_id", projectId);
+  if (includeArchived) params.set("include_archived", "true");
+  const query = params.toString() ? `?${params.toString()}` : "";
+  return request<GenerationConversationSummary[]>(`/generation-conversations${query}`, {
+    timeoutMs: 15_000,
+  });
+}
+
+export async function steerGenerationConversationTurn(
+  sessionId: string,
+  content: string,
+): Promise<GenerationConversationMessageResult> {
+  return request<GenerationConversationMessageResult>(generationConversationPath(sessionId, "/steer"), {
+    method: "POST",
+    body: JSON.stringify({ content }),
+    timeoutMs: 20_000,
+  });
+}
+
+export async function answerGenerationInput(
+  sessionId: string,
+  requestId: string,
+  clientResponseId: string,
+  answers: Record<string, { answers: string[] }>,
+): Promise<{ request_id: string; turn_id: string; status: string; next_sequence: number }> {
+  return request(generationConversationPath(sessionId, `/input-requests/${encodeURIComponent(requestId)}/answer`), {
+    method: "POST",
+    body: JSON.stringify({ client_response_id: clientResponseId, answers }),
+    timeoutMs: 20_000,
+  });
+}
+
+export async function fetchGenerationAgentCapabilities(): Promise<GenerationAgentCapabilities> {
+  return request<GenerationAgentCapabilities>("/generation-agent/capabilities", { timeoutMs: 20_000 });
+}
+
+export async function fetchGenerationConversation(
+  sessionId: string,
+): Promise<GenerationConversation> {
+  return request<GenerationConversation>(generationConversationPath(sessionId), {
+    timeoutMs: 15_000,
+  });
+}
+
+export async function sendGenerationConversationMessage(
+  sessionId: string,
+  content: string,
+  contextAssetIds: string[] = [],
+  clientMessageId?: string,
+): Promise<GenerationConversationMessageResult> {
+  return request<GenerationConversationMessageResult>(generationConversationPath(sessionId, "/messages"), {
+    method: "POST",
+    body: JSON.stringify({
+      content,
+      context_asset_ids: contextAssetIds,
+      ...(clientMessageId ? { client_message_id: clientMessageId } : {}),
+    }),
+    timeoutMs: 20_000,
+  });
+}
+
+export async function fetchGenerationConversationEvents(
+  sessionId: string,
+  after = 0,
+): Promise<GenerationConversationEvent[]> {
+  return request<GenerationConversationEvent[]>(
+    `${generationConversationPath(sessionId, "/events")}?after=${Math.max(0, after)}`,
+    { timeoutMs: 15_000 },
+  );
+}
+
+export async function updateGenerationConversationDraft(
+  sessionId: string,
+  baseHash: string,
+  draft: GenerationPlanningDraft,
+): Promise<GenerationConversation> {
+  return request<GenerationConversation>(generationConversationPath(sessionId, "/draft"), {
+    method: "PATCH",
+    body: JSON.stringify({ base_hash: baseHash, draft }),
+    timeoutMs: 20_000,
+  });
+}
+
+export async function updateGenerationConversationSettings(
+  sessionId: string,
+  agentModel: string | null,
+): Promise<GenerationConversation> {
+  return request<GenerationConversation>(generationConversationPath(sessionId, "/settings"), {
+    method: "PATCH",
+    body: JSON.stringify({ agent_model: agentModel }),
+    timeoutMs: 15_000,
+  });
+}
+
+export async function updateGenerationConversationContext(
+  sessionId: string,
+  seedAssetIds: string[],
+): Promise<GenerationConversation> {
+  return request<GenerationConversation>(generationConversationPath(sessionId, "/context"), {
+    method: "PATCH",
+    body: JSON.stringify({ seed_asset_ids: seedAssetIds }),
+    timeoutMs: 15_000,
+  });
+}
+
+export async function archiveGenerationConversation(sessionId: string): Promise<GenerationConversation> {
+  return request<GenerationConversation>(generationConversationPath(sessionId, "/archive"), { method: "POST", timeoutMs: 15_000 });
+}
+
+export async function unarchiveGenerationConversation(sessionId: string): Promise<GenerationConversation> {
+  return request<GenerationConversation>(generationConversationPath(sessionId, "/unarchive"), { method: "POST", timeoutMs: 15_000 });
+}
+
+export async function deleteGenerationConversation(sessionId: string): Promise<void> {
+  await request<void>(generationConversationPath(sessionId), { method: "DELETE", timeoutMs: 20_000 });
+}
+
+export async function confirmGenerationConversation(
+  sessionId: string,
+  draftHash: string,
+  acceptedWarningCodes: string[] = [],
+  contextHash?: string | null,
+): Promise<GenerationConversationConfirmResult> {
+  return request<GenerationConversationConfirmResult>(generationConversationPath(sessionId, "/confirm"), {
+    method: "POST",
+    body: JSON.stringify({ draft_hash: draftHash, ...(contextHash ? { context_hash: contextHash } : {}), accepted_warning_codes: acceptedWarningCodes }),
+    timeoutMs: 30_000,
+  });
+}
+
+export async function cancelGenerationConversationTurn(
+  sessionId: string,
+): Promise<GenerationConversation> {
+  return request<GenerationConversation>(generationConversationPath(sessionId, "/cancel-turn"), {
+    method: "POST",
+    timeoutMs: 15_000,
+  });
+}
+
+export function subscribeToGenerationConversationEvents(
+  sessionId: string,
+  onEvent: (event: GenerationConversationEvent) => void,
+  onConnectionChange?: (connected: boolean) => void,
+  after = 0,
+): () => void {
+  const controller = new AbortController();
+  let cursor = Math.max(0, after);
+  let stopped = false;
+  let retryCount = 0;
+  const waitForReconnect = (delayMs: number) => new Promise<void>((resolve) => {
+    const timer = window.setTimeout(resolve, delayMs);
+    controller.signal.addEventListener("abort", () => {
+      window.clearTimeout(timer);
+      resolve();
+    }, { once: true });
+  });
+  const parseEventStream = async () => {
+    while (!stopped) {
+      try {
+        const url = `${API_ROOT}${generationConversationPath(sessionId, "/events/stream")}?after=${cursor}`;
+        const response = await fetch(url, {
+          headers: { Accept: "text/event-stream", ...(cursor ? { "Last-Event-ID": String(cursor) } : {}) },
+          signal: controller.signal,
+        });
+        if (response.status === 404) {
+          onConnectionChange?.(false);
+          return;
+        }
+        if (!response.ok || !response.body) {
+          throw new ApiError(`事件流连接失败（HTTP ${response.status}）`, response.status);
+        }
+        retryCount = 0;
+        onConnectionChange?.(true);
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let eventId = "";
+        let eventName = "message";
+        let dataLines: string[] = [];
+        const flush = () => {
+          if (!dataLines.length) return;
+          try {
+            const parsed = JSON.parse(dataLines.join("\n")) as GenerationConversationEvent;
+            if (typeof parsed.sequence === "number") cursor = Math.max(cursor, parsed.sequence);
+            if (!parsed.event_type && eventName !== "message") parsed.event_type = eventName;
+            if (eventId && !parsed.sequence) parsed.sequence = Number(eventId);
+            onEvent(parsed);
+          } catch {
+            // Ignore keepalives and malformed non-public frames; the durable GET
+            // endpoint remains the recovery path after a reconnect.
+          }
+          eventId = "";
+          eventName = "message";
+          dataLines = [];
+        };
+        while (!stopped) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split(/\r?\n/);
+          buffer = lines.pop() ?? "";
+          for (const line of lines) {
+            if (!line) {
+              flush();
+              continue;
+            }
+            if (line.startsWith(":")) continue;
+            const separator = line.indexOf(":");
+            const field = separator >= 0 ? line.slice(0, separator) : line;
+            const valueText = separator >= 0 ? line.slice(separator + 1).trimStart() : "";
+            if (field === "id") eventId = valueText;
+            else if (field === "event") eventName = valueText;
+            else if (field === "data") dataLines.push(valueText);
+          }
+        }
+        if (buffer.trim()) {
+          // A server may close immediately after a final frame without the
+          // blank line; parse it on the way out before reconnecting.
+          const finalLines = buffer.split(/\r?\n/);
+          for (const line of finalLines) {
+            if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart());
+          }
+        }
+        flush();
+        if (!stopped) onConnectionChange?.(false);
+      } catch (error) {
+        if (stopped || (error instanceof DOMException && error.name === "AbortError")) break;
+        onConnectionChange?.(false);
+      }
+      if (!stopped) {
+        retryCount += 1;
+        await waitForReconnect(Math.min(2_000, 250 * 2 ** Math.min(retryCount - 1, 3)));
+      }
+    }
+  };
+  void parseEventStream();
+  return () => {
+    stopped = true;
+    controller.abort();
+    onConnectionChange?.(false);
+  };
 }
 
 export async function fetchRunInspection(planId: string): Promise<RunInspection> {

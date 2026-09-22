@@ -35,6 +35,10 @@ class Settings(BaseSettings):
         "http://localhost:5173",
         "http://127.0.0.1:4173",
         "http://localhost:4173",
+        # Vite preview commonly selects the next free port when 4173 is busy.
+        # Keep the local browser workbench usable in that case as well.
+        "http://127.0.0.1:4174",
+        "http://localhost:4174",
         "http://127.0.0.1:8787",
         "http://localhost:8787",
     ]
@@ -42,12 +46,14 @@ class Settings(BaseSettings):
     job_lease_seconds: float = 30.0
     job_heartbeat_interval: float = 5.0
     log_level: str = "info"
-    # Optional, isolated Codex/App Server command.  When unset the Agent remains
-    # available for audit and manual fallback but never attempts a best-effort
-    # network or PATH lookup.
+    # Legacy JSON adapter override. When empty, the pinned official Codex SDK
+    # starts and manages its bundled App Server runtime. ``codex_bin`` is only
+    # an explicit runtime override; normal installs reuse the local Codex login.
     codex_command: str | None = None
+    codex_bin: str | None = None
     codex_timeout_seconds: float = Field(default=45.0, ge=1.0, le=600.0)
     agent_budget: int = Field(default=1, ge=1, le=20)
+    planning_agent_budget: int = Field(default=8, ge=1, le=20)
 
     @field_validator("job_lease_seconds")
     @classmethod

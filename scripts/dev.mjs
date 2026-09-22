@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import process from "node:process";
 
 const children = [
-  spawn("uv", ["run", "--project", "apps/api", "game-assets-api"], {
+  spawn("uv", ["run", "--project", "apps/api", "game-assets-api", "serve", "--reload"], {
     cwd: process.cwd(),
     stdio: "inherit",
   }),

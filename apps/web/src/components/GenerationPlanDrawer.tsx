@@ -17,6 +17,7 @@ import {
   fetchProviderDefaults,
 } from "../lib/api";
 import { useModalFocus } from "../hooks/useModalFocus";
+import { SelectMenu } from "./SelectMenu";
 import type {
   GameAsset,
   GenerationPlanInput,
@@ -24,7 +25,6 @@ import type {
   GenerationTaskInput,
   GenerationTaskKind,
   ProviderDefaults,
-  ProviderModelModality,
   ProjectSummary,
 } from "../types";
 
@@ -73,19 +73,9 @@ interface RouteNotice {
   message: string;
 }
 
-interface CostEstimate {
-  total: number | null;
-  knownSubtotal: number;
-  unknownTasks: number;
-  byProvider: Array<{
-    providerId: string;
-    providerName: string;
-    taskCount: number;
-    total: number | null;
-  }>;
-}
+type RoutableModality = "text" | "image";
 
-function taskModality(kind: GenerationTaskKind): ProviderModelModality {
+function taskModality(kind: GenerationTaskKind): RoutableModality {
   return kind === "text" ? "text" : "image";
 }
 
@@ -108,7 +98,7 @@ function providerRoute(
   if (!provider) return { providerId: "", model: "" };
   return {
     providerId: provider.id,
-    model: taskModality(kind) === "text" ? provider.text_model : provider.image_model,
+    model: "",
   };
 }
 
@@ -220,62 +210,34 @@ function routeNotice(task: TaskDraft, providers: GenerationProviderProfile[]): R
   if (!modelId) return { tone: "error", message: "尚未选择或输入模型 ID。" };
   const modality = taskModality(task.kind);
   const model = provider.models.find((item) => item.id === modelId);
-  if (model && model.classification !== "unknown" && !model.modalities.includes(modality)) {
+  if (!model) {
+    return {
+      tone: "error",
+      message: "该模型尚未登记；请先在供应商渠道的模型选择器中添加它。",
+    };
+  }
+  if (model.enabled === false) {
+    return {
+      tone: "error",
+      message: "该模型已停用；请在供应商渠道中重新启用后再创建新任务。",
+    };
+  }
+  if (!model.modalities.includes(modality)) {
     return {
       tone: "error",
       message: `${modelId} 已分类为不支持${modality === "text" ? "文字" : "图片"}任务。`,
     };
   }
-  if (!model || model.classification === "unknown") {
-    return { tone: "warning", message: "手填或未分类模型；确认前请核对供应商能力。" };
+  if (model?.classification === "manual") {
+    return {
+      tone: "warning",
+      message: "手动登记模型，未验证；不会参与自动换模型或自动回退。",
+    };
   }
   if (!model.available) {
     return { tone: "warning", message: "该模型未出现在最近一次供应商模型列表中。" };
   }
   return null;
-}
-
-function taskPrice(task: TaskDraft, provider: GenerationProviderProfile | undefined): number | null {
-  if (!provider?.pricing) return null;
-  const key = task.kind === "text"
-    ? "text_call"
-    : task.kind === "image_edit" && provider.pricing.image_edit_call !== undefined
-      ? "image_edit_call"
-      : "image_call";
-  const price = provider.pricing[key];
-  return price === undefined ? null : price;
-}
-
-function estimateCost(tasks: TaskDraft[], providers: GenerationProviderProfile[]): CostEstimate {
-  const groups = new Map<string, CostEstimate["byProvider"][number]>();
-  let knownSubtotal = 0;
-  let unknownTasks = 0;
-  for (const task of tasks) {
-    const provider = providers.find((item) => item.id === task.providerId);
-    const providerId = provider?.id ?? (task.providerId || "unassigned");
-    const group = groups.get(providerId) ?? {
-      providerId,
-      providerName: provider?.name ?? "未分配供应商",
-      taskCount: 0,
-      total: 0,
-    };
-    group.taskCount += 1;
-    const price = taskPrice(task, provider);
-    if (price === null) {
-      unknownTasks += 1;
-      group.total = null;
-    } else {
-      knownSubtotal += price;
-      if (group.total !== null) group.total += price;
-    }
-    groups.set(providerId, group);
-  }
-  return {
-    total: unknownTasks > 0 ? null : knownSubtotal,
-    knownSubtotal,
-    unknownTasks,
-    byProvider: [...groups.values()],
-  };
 }
 
 function taskKindLabel(kind: GenerationTaskKind): string {
@@ -320,7 +282,6 @@ export function GenerationPlanDrawer({
   const providers = providersQuery.data ?? [];
   const activeProviders = providers.filter((item) => item.is_active);
   const suggestedExtraCalls = Math.max(2, Math.ceil(tasks.length * 0.2));
-  const estimatedCost = estimateCost(tasks, providers);
 
   useModalFocus({ open, dialogRef, initialFocusRef: closeRef, onClose });
 
@@ -346,6 +307,8 @@ export function GenerationPlanDrawer({
   useEffect(() => {
     if (!open || routingSeededRef.current || providersQuery.isLoading || defaultsQuery.isLoading) return;
     routingSeededRef.current = true;
+    setMaxConcurrency(defaultsQuery.data?.max_concurrency ?? 3);
+    setTransportRetries(defaultsQuery.data?.max_transport_retries ?? 2);
     setTasks((current) => current.map((task) => {
       if (task.providerId || task.model) return task;
       return { ...task, ...globalRoute(task.kind, defaultsQuery.data, providers) };
@@ -502,13 +465,13 @@ export function GenerationPlanDrawer({
               </label>
               <div className="plan-default-routes" aria-label="全局默认路由快照源">
                 <div className="plan-default-routes-heading"><span>新任务路由</span><small>建立任务时继承</small></div>
-                {(["text", "image"] as ProviderModelModality[]).map((modality) => {
+                {(["text", "image"] as RoutableModality[]).map((modality) => {
                   const route = defaultsQuery.data?.[modality];
                   const routeProvider = activeProviders.find((item) => item.id === route?.provider_profile_id);
                   return (
                     <div key={modality} className={`plan-default-route ${modality}`}>
                       <b>{modality === "text" ? "T" : "I"}</b>
-                      <span><strong>{routeProvider?.name ?? "未配置"}</strong><small>{route?.model || "前往供应商设置补齐"}</small></span>
+                      <span><strong>{routeProvider?.name ?? "未配置"}</strong><small>{route?.model || "前往系统设置配置"}</small></span>
                     </div>
                   );
                 })}
@@ -522,16 +485,18 @@ export function GenerationPlanDrawer({
                 <h3><Calculator size={16} /> 调用账本</h3>
                 <label><span>额外调用预算</span><input type="number" min={0} value={extraBudget} onChange={(event) => setExtraBudget(Number(event.target.value))} /></label>
                 <small>系统建议 {suggestedExtraCalls} 次；付费返工入队前预留。</small>
-                <label><span>计划总并发</span><input type="number" min={1} max={32} value={maxConcurrency} onChange={(event) => setMaxConcurrency(Number(event.target.value))} /></label>
-                <small>控制整个计划；每个供应商还会分别应用自己的并发上限。</small>
                 <label><span>单资产付费轮次</span><input type="number" min={0} max={20} value={maxPaidRounds} onChange={(event) => setMaxPaidRounds(Number(event.target.value))} /></label>
-                <label><span>同请求网络重试</span><input type="number" min={0} max={8} value={transportRetries} onChange={(event) => setTransportRetries(Number(event.target.value))} /></label>
               </div>
-              <div className="plan-cost-readout">
-                <span>基础调用</span><strong>{tasks.length}</strong>
-                <span>预计基础成本</span><strong>{estimatedCost.total === null ? "含未知价格" : estimatedCost.total.toFixed(2)}</strong>
-                {estimatedCost.unknownTasks > 0 ? <><span>已知价格小计</span><strong>{estimatedCost.knownSubtotal.toFixed(2)}</strong></> : null}
-              </div>
+              <details className="plan-runtime-advanced">
+                <summary>计划高级设置</summary>
+                <div>
+                  <label><span>计划总并发</span><input type="number" min={1} max={32} value={maxConcurrency} onChange={(event) => setMaxConcurrency(Number(event.target.value))} /></label>
+                  <small>继承系统默认值，可为本次计划覆盖。</small>
+                  <label><span>同请求网络重试</span><input type="number" min={0} max={8} value={transportRetries} onChange={(event) => setTransportRetries(Number(event.target.value))} /></label>
+                  <small>只重试明确的网络、限流和服务端错误。</small>
+                </div>
+              </details>
+              <div className="plan-call-readout"><span>基础调用</span><strong>{tasks.length}</strong></div>
             </section>
 
             <section className="task-composer" aria-label="任务 DAG">
@@ -541,9 +506,13 @@ export function GenerationPlanDrawer({
                   <h3>任务因果链</h3>
                 </div>
                 <div className="add-task-control">
-                  <select aria-label="选择要添加的资产" value={assetToAdd} onChange={(event) => setAssetToAdd(event.target.value)}>
-                    {assets.map((asset) => <option key={asset.id} value={asset.id}>{asset.name} · {asset.key}</option>)}
-                  </select>
+                  <SelectMenu
+                    ariaLabel="选择要添加的资产"
+                    value={assetToAdd}
+                    options={assets.map((asset) => ({ value: asset.id, label: `${asset.name} · ${asset.key}` }))}
+                    onChange={setAssetToAdd}
+                    className="plan-asset-select"
+                  />
                   <button className="button secondary" type="button" onClick={addTask} disabled={!assetToAdd}><Plus size={15} /> 添加任务</button>
                 </div>
               </div>
@@ -561,7 +530,8 @@ export function GenerationPlanDrawer({
                     const taskProvider = providers.find((item) => item.id === task.providerId);
                     const modality = taskModality(task.kind);
                     const modelOptions = (taskProvider?.models ?? []).filter((model) =>
-                      model.classification === "unknown" || model.modalities.includes(modality),
+                      model.enabled !== false &&
+                      model.modalities.includes(modality),
                     );
                     const notice = routeNotice(task, providers);
                     return (
@@ -574,13 +544,13 @@ export function GenerationPlanDrawer({
                           </div>
                           <div className="production-form-grid three">
                             <label className="production-field"><span>任务 ID</span><input value={task.taskId} onChange={(event) => renameTask(task.localId, event.target.value)} /></label>
-                            <label className="production-field"><span>目标资产</span><select value={task.assetId} onChange={(event) => updateTask(task.localId, { assetId: event.target.value })}>{assets.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
-                            <label className="production-field"><span>任务类型</span><select value={task.kind} onChange={(event) => changeTaskKind(task.localId, event.target.value as GenerationTaskKind)}><option value="text">结构化文本</option><option value="image">图像生成</option><option value="image_edit">参考图编辑</option></select></label>
+                            <div className="production-field"><span>目标资产</span><SelectMenu ariaLabel="目标资产" value={task.assetId} options={assets.map((item) => ({ value: item.id, label: item.name }))} onChange={(value) => updateTask(task.localId, { assetId: value })} className="production-select-menu" /></div>
+                            <div className="production-field"><span>任务类型</span><SelectMenu ariaLabel="任务类型" value={task.kind} options={[{ value: "text", label: "结构化文本" }, { value: "image", label: "图像生成" }, { value: "image_edit", label: "参考图编辑" }]} onChange={(value) => changeTaskKind(task.localId, value as GenerationTaskKind)} className="production-select-menu" /></div>
                           </div>
                           <div className="task-route-grid">
-                            <label className="production-field"><span>任务供应商</span><select value={task.providerId} aria-invalid={notice?.tone === "error"} onChange={(event) => changeTaskProvider(task.localId, task.kind, event.target.value)}><option value="">未选择</option>{taskProvider && !taskProvider.is_active ? <option value={taskProvider.id}>{taskProvider.name} · 已归档</option> : null}{activeProviders.map((item) => <option key={item.id} value={item.id}>{item.name}{item.kind !== "fake" && !item.is_unlocked ? " · 凭据锁定" : ""}</option>)}</select></label>
+                            <div className="production-field"><span>任务供应商</span><SelectMenu ariaLabel="任务供应商" value={task.providerId} options={[{ value: "", label: "未选择" }, ...(taskProvider && !taskProvider.is_active ? [{ value: taskProvider.id, label: `${taskProvider.name} · 已归档` }] : []), ...activeProviders.map((item) => ({ value: item.id, label: `${item.name}${item.kind !== "fake" && (item.credential_mode ?? "required") === "required" && !item.is_unlocked ? " · 凭据锁定" : (item.credential_mode ?? "required") === "none" ? " · 无凭据" : (item.credential_mode ?? "required") === "optional" ? " · API Key 可选" : ""}` }))]} onChange={(value) => changeTaskProvider(task.localId, task.kind, value)} className={`production-select-menu ${notice?.tone === "error" ? "invalid" : ""}`} /></div>
                             <label className="production-field"><span>{modality === "text" ? "文字模型" : "图片模型"}</span><input list={`task-models-${index}`} value={task.model} aria-invalid={notice?.tone === "error"} onChange={(event) => updateTask(task.localId, { model: event.target.value })} placeholder="搜索或直接输入模型 ID" spellCheck={false} /><datalist id={`task-models-${index}`}>{modelOptions.map((model) => <option key={model.id} value={model.id} label={model.available ? model.classification : `${model.classification} · 已下线`} />)}</datalist></label>
-                            <div className={`task-route-state ${notice?.tone ?? "ready"}`}><span>{taskProvider?.is_unlocked || taskProvider?.kind === "fake" ? "READY" : "LOCKED"}</span><strong>{notice?.message ?? "路由与任务类型兼容"}</strong></div>
+                            <div className={`task-route-state ${notice?.tone ?? "ready"}`}><span>{taskProvider?.kind === "fake" || (taskProvider?.credential_mode ?? "required") !== "required" || taskProvider?.is_unlocked ? "READY" : "LOCKED"}</span><strong>{notice?.message ?? "路由与任务类型兼容"}</strong></div>
                           </div>
                           <label className="production-field"><span>Prompt</span><textarea rows={3} value={task.prompt} onChange={(event) => updateTask(task.localId, { prompt: event.target.value })} /></label>
                           {task.kind === "text" ? (
@@ -606,7 +576,7 @@ export function GenerationPlanDrawer({
                             ))}
                           </fieldset>
                           {task.kind === "image_edit" ? (
-                            <label className="production-field"><span>参考图任务</span><select value={task.referenceTaskId} onChange={(event) => updateTask(task.localId, { referenceTaskId: event.target.value })}><option value="">请选择已勾选上游</option>{task.dependsOn.map((dependency) => <option key={dependency} value={dependency}>{dependency}</option>)}</select></label>
+                            <div className="production-field"><span>参考图任务</span><SelectMenu ariaLabel="参考图任务" value={task.referenceTaskId} options={[{ value: "", label: "请选择已勾选上游" }, ...task.dependsOn.map((dependency) => ({ value: dependency, label: dependency }))]} onChange={(value) => updateTask(task.localId, { referenceTaskId: value })} className="production-select-menu" /></div>
                           ) : null}
                         </div>
                       </li>
@@ -624,15 +594,10 @@ export function GenerationPlanDrawer({
             </section>
             <section className="frozen-ledger">
               <div><span>基础调用</span><strong>{tasks.length}</strong><small>计划冻结</small></div>
-              <div><span>预计基础成本</span><strong>{estimatedCost.total === null ? "未知" : estimatedCost.total.toFixed(2)}</strong><small>{estimatedCost.unknownTasks > 0 ? `${estimatedCost.unknownTasks} 项价格未知 · 已知 ${estimatedCost.knownSubtotal.toFixed(2)}` : `${estimatedCost.byProvider.length} 个供应商汇总`}</small></div>
               <div><span>额外调用额度</span><strong>{extraBudget}</strong><small>建议 {suggestedExtraCalls}</small></div>
-              <div><span>计划总并发</span><strong>{maxConcurrency}</strong><small>供应商并发分别限制</small></div>
+              <div><span>计划总并发</span><strong>{maxConcurrency}</strong><small>按计划冻结</small></div>
               <div><span>单资产付费轮次</span><strong>{maxPaidRounds}</strong><small>达到即等待人工</small></div>
               <div><span>同请求网络重试</span><strong>{transportRetries}</strong><small>每次 Attempt 留痕</small></div>
-            </section>
-            <section className="review-route-ledger">
-              <h3>供应商成本路由</h3>
-              <div>{estimatedCost.byProvider.map((item) => <article key={item.providerId}><span><strong>{item.providerName}</strong><small>{item.taskCount} 个任务</small></span><b>{item.total === null ? "价格未知" : item.total.toFixed(2)}</b></article>)}</div>
             </section>
             <section className="review-dag">
               <h3>冻结任务与真实依赖</h3>
@@ -642,7 +607,7 @@ export function GenerationPlanDrawer({
                 return <li key={task.localId}><span>{String(index + 1).padStart(2, "0")}</span><div><strong>{task.taskId}</strong><small>{taskKindLabel(task.kind)} · {assetsById.get(task.assetId)?.name}</small><em className={notice?.tone}>{taskProvider?.name ?? "未分配供应商"} / {task.model || "未选择模型"}{notice?.tone === "warning" ? " · 需人工核对" : ""}</em></div><p>{task.dependsOn.length ? `注入：${task.dependsOn.join("、")}` : "根任务"}</p></li>;
               })}</ol>
             </section>
-            <label className="explicit-confirmation"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /><span><strong>我确认本次基础调用与额外预算</strong><small>供应商返回只进入输出阶段；硬 QA、证据和人工审核仍会独立执行。</small></span></label>
+            <label className="explicit-confirmation"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /><span><strong>我确认本次调用额度与运行约束</strong><small>供应商返回只进入输出阶段；硬 QA、证据和人工审核仍会独立执行。</small></span></label>
           </div>
         )}
 

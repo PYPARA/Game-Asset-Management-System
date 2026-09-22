@@ -1,9 +1,13 @@
 node_modules/
 .npm-cache/
+.uv-cache
+.codex
+.playwright-cli
 .pnpm-store/
 dist/
 coverage/
 node_cache
+output
 
 __pycache__/
 *.py[cod]

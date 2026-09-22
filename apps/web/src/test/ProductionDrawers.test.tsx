@@ -22,6 +22,20 @@ function queryClient() {
   });
 }
 
+async function chooseMenuOption(
+  user: ReturnType<typeof userEvent.setup>,
+  trigger: HTMLElement,
+  optionName: string,
+) {
+  if (trigger.getAttribute("aria-expanded") !== "true") {
+    await user.click(trigger);
+  }
+  if (trigger.getAttribute("aria-expanded") !== "true") {
+    await user.click(trigger);
+  }
+  await user.click(await screen.findByRole("option", { name: optionName }));
+}
+
 const mediaAsset: GameAsset = {
   id: "asset-portrait",
   detailsLoaded: true,
@@ -278,6 +292,10 @@ describe("M2 生产抽屉", () => {
             concurrency: 4,
             pricing: { image_call: 0.8 },
             is_unlocked: true,
+            models: [
+              { id: "fake-text", modalities: ["text"], classification: "heuristic", available: true, enabled: true },
+              { id: "fake-image", modalities: ["image"], classification: "heuristic", available: true, enabled: true },
+            ],
           },
         ]);
       }
@@ -285,6 +303,8 @@ describe("M2 生产抽屉", () => {
         return json({
           text: { provider_profile_id: "provider-1", model: "fake-text" },
           image: { provider_profile_id: "provider-1", model: "fake-image" },
+          max_concurrency: 5,
+          max_transport_retries: 4,
           updated_at: null,
         });
       }
@@ -294,7 +314,8 @@ describe("M2 生产抽屉", () => {
           project_id: "project-1",
           extra_call_budget: 2,
           max_paid_remediation_rounds: 2,
-          max_transport_retries: 2,
+          max_transport_retries: 4,
+          max_concurrency: 5,
           tasks: [
             {
               kind: "image",
@@ -338,7 +359,7 @@ describe("M2 生产抽屉", () => {
     const confirmButton = screen.getByRole("button", { name: "确认并启动计划" });
     expect(confirmButton).toBeDisabled();
     expect(screen.getByText(/未知交付不会自动重试/)).toBeInTheDocument();
-    await user.click(screen.getByRole("checkbox", { name: /我确认本次基础调用与额外预算/ }));
+    await user.click(screen.getByRole("checkbox", { name: /我确认本次调用额度与运行约束/ }));
     expect(confirmButton).toBeEnabled();
     await user.click(confirmButton);
 
@@ -364,6 +385,10 @@ describe("M2 生产抽屉", () => {
           concurrency: 4,
           pricing: { image_call: 0.8 },
           is_unlocked: true,
+          models: [
+            { id: "fake-text", modalities: ["text"], classification: "heuristic", available: true, enabled: true },
+            { id: "fake-image", modalities: ["image"], classification: "heuristic", available: true, enabled: true },
+          ],
         }]);
       }
       if (url === "/api/provider-defaults") {
@@ -404,7 +429,7 @@ describe("M2 生产抽屉", () => {
     await user.type(taskIds[0], "root-renamed");
     expect(within(dialog).getByRole("checkbox", { name: "root-renamed" })).toBeChecked();
     await user.click(within(dialog).getByRole("button", { name: "校验并查看预算" }));
-    await user.click(screen.getByRole("checkbox", { name: /我确认本次基础调用与额外预算/ }));
+    await user.click(screen.getByRole("checkbox", { name: /我确认本次调用额度与运行约束/ }));
     await user.click(screen.getByRole("button", { name: "确认并启动计划" }));
 
     await waitFor(() => expect(submitted).not.toBeNull());
@@ -416,7 +441,7 @@ describe("M2 生产抽屉", () => {
     });
   });
 
-  it("按任务类型继承全局路由，并在切换供应商或类型时使用对应默认模型", async () => {
+  it("按任务类型继承全局路由，并在切换供应商时要求重新选择模型", async () => {
     const user = userEvent.setup();
     mockRoutingApi();
     render(
@@ -433,19 +458,18 @@ describe("M2 生产抽屉", () => {
     );
 
     const providerSelect = await screen.findByLabelText("任务供应商");
-    const kindSelect = screen.getByLabelText("任务类型");
     await waitFor(() => expect(providerSelect).toHaveValue("provider-image"));
     expect(screen.getByLabelText("图片模型")).toHaveValue("image-default");
 
-    await user.selectOptions(providerSelect, "provider-text");
-    expect(screen.getByLabelText("图片模型")).toHaveValue("text-provider-image");
+    await chooseMenuOption(user, providerSelect, "文字供应商");
+    expect(screen.getByLabelText("图片模型")).toHaveValue("");
 
-    await user.selectOptions(kindSelect, "text");
-    expect(providerSelect).toHaveValue("provider-text");
+    await chooseMenuOption(user, screen.getByLabelText("任务类型"), "结构化文本");
+    expect(screen.getByLabelText("任务供应商")).toHaveValue("provider-text");
     expect(screen.getByLabelText("文字模型")).toHaveValue("text-default");
 
-    await user.selectOptions(kindSelect, "image_edit");
-    expect(providerSelect).toHaveValue("provider-image");
+    await chooseMenuOption(user, screen.getByLabelText("任务类型"), "参考图编辑");
+    expect(screen.getByLabelText("任务供应商")).toHaveValue("provider-image");
     expect(screen.getByLabelText("图片模型")).toHaveValue("image-default");
   });
 
@@ -482,7 +506,7 @@ describe("M2 生产抽屉", () => {
     expect(screen.getByLabelText("图片模型")).toHaveValue("image-default");
   });
 
-  it("混合任务分别继承文字与图片路由，并按供应商汇总预算", async () => {
+  it("混合任务分别继承文字与图片路由，且不再展示渠道价格或成本路由", async () => {
     const user = userEvent.setup();
     mockRoutingApi();
     render(
@@ -507,15 +531,13 @@ describe("M2 生产抽屉", () => {
     expect(screen.getByLabelText("图片模型")).toHaveValue("image-default");
 
     await user.click(screen.getByRole("button", { name: "校验并查看预算" }));
-    const routeLedger = screen.getByText("供应商成本路由").closest("section");
-    expect(routeLedger).not.toBeNull();
-    expect(within(routeLedger as HTMLElement).getByText("文字供应商")).toBeInTheDocument();
-    expect(within(routeLedger as HTMLElement).getByText("图片供应商")).toBeInTheDocument();
-    expect(within(routeLedger as HTMLElement).getByText("0.25")).toBeInTheDocument();
-    expect(within(routeLedger as HTMLElement).getByText("0.80")).toBeInTheDocument();
+    expect(screen.queryByText("供应商成本路由")).not.toBeInTheDocument();
+    expect(screen.queryByText("预计基础成本")).not.toBeInTheDocument();
+    expect(screen.getByText(/文字供应商 \/ text-default/)).toBeInTheDocument();
+    expect(screen.getByText(/图片供应商 \/ image-default/)).toBeInTheDocument();
   });
 
-  it("允许手填或未分类模型并警告，但阻止已明确分类为不兼容的模型", async () => {
+  it("要求模型先登记，并阻止已停用或明确分类不兼容的模型", async () => {
     const user = userEvent.setup();
     mockRoutingApi();
     render(
@@ -535,11 +557,10 @@ describe("M2 生产抽屉", () => {
     await waitFor(() => expect(modelInput).toHaveValue("image-default"));
     await user.clear(modelInput);
     await user.type(modelInput, "manual-image-custom");
-    expect(screen.getByText("手填或未分类模型；确认前请核对供应商能力。")).toBeInTheDocument();
+    expect(screen.getByText("该模型尚未登记；请先在供应商渠道的模型选择器中添加它。")).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "校验并查看预算" }));
-    expect(screen.getByText(/图片供应商 \/ manual-image-custom · 需人工核对/)).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "返回修改" }));
+    expect(screen.getByRole("alert")).toHaveTextContent("该模型尚未登记");
 
     const incompatibleModel = screen.getByLabelText("图片模型");
     await user.clear(incompatibleModel);

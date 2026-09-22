@@ -66,6 +66,7 @@ from .storage import (
     StorageError,
     atomic_write_json,
     canonical_json,
+    json_bytes,
     relative_to_root,
     safe_join,
     sha256_bytes,
@@ -203,6 +204,19 @@ def asset_descriptor(asset: Asset) -> dict[str, Any]:
     }
 
 
+def is_project_spec_asset(asset: Asset) -> bool:
+    """Return whether an asset is one of the user-facing project specs.
+
+    Keep this check in one place so revision creation and review publication
+    apply the same source-sync semantics to both registered specifications.
+    """
+
+    return bool(asset.metadata_json.get("project_spec")) or asset.subtype in {
+        "style_bible",
+        "prompt_recipe",
+    }
+
+
 def create_asset(session: Session, payload: AssetCreate) -> Asset:
     project = require(session, Project, payload.project_id, "project")
     store = ProjectStore(project.root_path)
@@ -318,6 +332,8 @@ def create_revision(session: Session, payload: RevisionCreate) -> AssetRevision:
         revision.file_path = store.write_revision(
             kind=asset.kind, key=asset.key, revision=_revision_file(revision)
         )
+        # Keep the normal catalog pointer/superseded list update for every
+        # asset. Project specs receive one additional metadata write below.
         store.update_asset_candidate(
             kind=asset.kind,
             key=asset.key,
@@ -325,6 +341,14 @@ def create_revision(session: Session, payload: RevisionCreate) -> AssetRevision:
             superseded_revision_ids=superseded_revision_ids,
             updated_at=asset.updated_at.isoformat(),
         )
+        if is_project_spec_asset(asset):
+            # A page edit is a candidate even when the external source file
+            # itself has not drifted. Persist that state beside the catalog
+            # pointer so the inspector never reports a stale "in sync" badge.
+            metadata = dict(asset.metadata_json)
+            metadata["source_drift_status"] = "candidate"
+            asset.metadata_json = metadata
+            store.commit_project_spec_change(descriptor=asset_descriptor(asset))
         session.commit()
     except (StorageError, IntegrityError) as exc:
         session.rollback()
@@ -557,6 +581,17 @@ def scan_project(session: Session, project: Project) -> ScanReport:
 def _scan_project(session: Session, project: Project) -> ScanReport:
     store = ProjectStore(project.root_path)
     scanned = store.scan_full()
+    # Project specifications live as human-editable files outside Catalog.  Sync
+    # them before indexing so the same scan response includes newly imported
+    # baselines or a source-drift candidate.  A second read is intentional: it
+    # also exercises the normal immutable history/review validation path.
+    try:
+        spec_errors = store.sync_project_specs(scanned)
+    except (StorageError, OSError, ValueError) as exc:
+        spec_errors = [f"project specifications: {exc}"]
+    scanned = store.scan_full()
+    if spec_errors:
+        scanned.errors.extend(spec_errors)
     assets = scanned.assets
     revisions = scanned.revisions
     renditions = scanned.renditions
@@ -583,6 +618,7 @@ def _scan_project(session: Session, project: Project) -> ScanReport:
     known_delivery_ids: set[str] = set()
     known_agent_session_ids: set[str] = set()
     known_agent_event_ids: set[str] = set()
+    orphan_agent_event_dirs: set[Path] = set()
     known_changeset_ids: set[str] = set()
     for data in assets:
         try:
@@ -946,15 +982,21 @@ def _scan_project(session: Session, project: Project) -> ScanReport:
             row.adapter = str(data.get("adapter", "unknown"))
             row.adapter_version = data.get("adapter_version")
             row.schema_version = int(data.get("schema_version", 1))
+            row.purpose = str(data.get("purpose", "diagnosis"))
+            row.title = data.get("title")
             row.status = str(data.get("status", "awaiting_user"))
             row.context_hash = str(data.get("context_hash", ""))
             row.context_path = data.get("context_path")
             row.context_json = dict(data.get("context", {}))
+            row.draft_json = dict(data.get("draft", data.get("draft_json", {})))
+            row.draft_hash = data.get("draft_hash")
+            row.draft_version = int(data.get("draft_version", 0))
             row.sandbox_json = dict(data.get("sandbox", {}))
             row.allowed_actions_json = list(data.get("allowed_actions", []))
             row.writable_allowlist_json = list(data.get("writable_allowlist", []))
             row.budget_limit = int(data.get("budget_limit", 1))
             row.budget_used = int(data.get("budget_used", 0))
+            row.turn_count = int(data.get("turn_count", 0))
             row.diagnostic_reason = data.get("diagnostic_reason")
             row.result_json = dict(data.get("result", {}))
             row.stop_reason = data.get("stop_reason")
@@ -968,8 +1010,20 @@ def _scan_project(session: Session, project: Project) -> ScanReport:
         try:
             identifier = str(data["id"])
             known_agent_event_ids.add(identifier)
-            if session.get(AgentSession, str(data["session_id"])) is None:
-                raise ValueError("agent event references an unknown session")
+            event_session_id = str(data["session_id"])
+            if session.get(AgentSession, event_session_id) is None:
+                # A permanently deleted planning session used to leave its
+                # history/agent/events/<session> directory behind. Treat those
+                # files as stale audit data and remove them during the next
+                # project scan so the workbench can recover without a manual
+                # database repair.
+                try:
+                    orphan_agent_event_dirs.add(
+                        safe_join(Path(project.root_path), f"history/agent/events/{event_session_id}")
+                    )
+                except StorageError:
+                    pass
+                continue
             row = session.scalar(select(AgentEvent).where(AgentEvent.id == identifier))
             if row is None:
                 row = AgentEvent(
@@ -994,6 +1048,9 @@ def _scan_project(session: Session, project: Project) -> ScanReport:
             row.created_at = _parse_datetime(data.get("created_at"))
         except (KeyError, TypeError, ValueError) as exc:
             errors.append(f"agent event {data.get('id', '<unknown>')}: {exc}")
+    for orphan_dir in orphan_agent_event_dirs:
+        if orphan_dir.is_dir():
+            shutil.rmtree(orphan_dir)
     session.flush()
     for data in changesets:
         try:
@@ -1182,10 +1239,10 @@ def validate_plan(session: Session, payload: GenerationPlanCreate) -> list[dict[
             raise ServiceError(422, f"task {task.id} references an archived provider")
         if task.model:
             model = task.model.strip()
-        elif task.provider_profile_id or payload.provider_profile_id:
-            model = profile.text_model if task.kind == TaskKind.TEXT else profile.image_model
-        else:
+        elif default_provider_id == profile.id:
             model = (default_model or "").strip()
+        else:
+            model = ""
         if not model:
             raise ServiceError(422, f"task {task.id} requires a provider model")
         modality = required_modality(task.kind)
@@ -1217,36 +1274,13 @@ def validate_plan(session: Session, payload: GenerationPlanCreate) -> list[dict[
     return resolved
 
 
-def _task_price(profile: ProviderProfile, task_kind: str) -> float | None:
-    if not profile.pricing:
-        return None
-    key = "text_call" if task_kind == TaskKind.TEXT.value else "image_call"
-    if task_kind == TaskKind.IMAGE_EDIT.value and "image_edit_call" in profile.pricing:
-        key = "image_edit_call"
-    value = profile.pricing.get(key)
-    try:
-        return float(value) if value is not None else None
-    except (TypeError, ValueError):
-        return None
-
-
-def create_plan(session: Session, payload: GenerationPlanCreate) -> GenerationPlan:
+def create_plan(
+    session: Session,
+    payload: GenerationPlanCreate,
+    *,
+    commit: bool = True,
+) -> GenerationPlan:
     tasks = validate_plan(session, payload)
-    total = 0.0
-    known = True
-    for task in tasks:
-        profile = require(
-            session,
-            ProviderProfile,
-            str(task["provider_profile_id"]),
-            "task provider profile",
-        )
-        price = _task_price(profile, str(task["kind"]))
-        if price is None:
-            known = False
-        else:
-            total += price
-    estimated_cost: float | None = total if known else None
     suggested_extra_calls = max(2, math.ceil(len(tasks) * 0.2))
     extra_call_budget = (
         suggested_extra_calls
@@ -1261,7 +1295,9 @@ def create_plan(session: Session, payload: GenerationPlanCreate) -> GenerationPl
         status="draft",
         tasks_json=tasks,
         estimated_calls=len(tasks),
-        estimated_cost=estimated_cost,
+        # Channel prices remain readable for historical snapshots, but new
+        # plans do not estimate cost until pricing is model-specific.
+        estimated_cost=None,
         suggested_extra_calls=suggested_extra_calls,
         extra_call_budget=extra_call_budget,
         max_paid_remediation_rounds=payload.max_paid_remediation_rounds,
@@ -1269,7 +1305,8 @@ def create_plan(session: Session, payload: GenerationPlanCreate) -> GenerationPl
         max_concurrency=payload.max_concurrency,
     )
     session.add(plan)
-    session.commit()
+    if commit:
+        session.commit()
     return plan
 
 
@@ -1278,6 +1315,7 @@ def confirm_plan(
     plan: GenerationPlan,
     *,
     available_provider_ids: set[str],
+    commit: bool = True,
 ) -> list[GenerationJob]:
     if plan.status != "draft":
         return session.scalars(select(GenerationJob).where(GenerationJob.plan_id == plan.id)).all()
@@ -1292,10 +1330,9 @@ def confirm_plan(
             if profile.kind == "fake" or profile.id in available_provider_ids
             else GenerationStatus.CREDENTIALS_LOCKED.value
         )
-        model = str(
-            task.get("model")
-            or (profile.text_model if task.get("kind") == TaskKind.TEXT.value else profile.image_model)
-        )
+        model = str(task.get("model") or "").strip()
+        if not model:
+            raise ServiceError(422, f"task {task.get('id')} requires a provider model")
         task["provider_profile_id"] = profile.id
         task["model"] = model
         job = GenerationJob(
@@ -1363,7 +1400,8 @@ def confirm_plan(
                 "model": job.request_json.get("model"),
             },
         )
-    session.commit()
+    if commit:
+        session.commit()
     return jobs
 
 
@@ -1822,42 +1860,109 @@ def create_review(session: Session, payload: ReviewCreate) -> ReviewDecision:
     )
     asset.updated_at = utcnow()
     store = ProjectStore(project.root_path)
-    store.write_review(
-        kind=asset.kind,
-        key=asset.key,
-        review={
-            "id": decision.id,
-            "asset_id": asset.id,
-            "revision_id": decision.revision_id,
-            "verdict": decision.verdict,
-            "notes": decision.notes,
-            "dependency_hash": decision.dependency_hash,
-            "artifacts": [],
-            "created_at": decision.created_at.isoformat(),
-        },
-    )
-    store.update_asset_approval(
-        kind=asset.kind,
-        key=asset.key,
-        title=asset.title,
-        content_status=asset.content_status,
-        publication_status=asset.publication_status,
-        current_revision_id=asset.current_revision_id,
-        latest_candidate_revision_id=asset.latest_candidate_revision_id,
-        updated_at=asset.updated_at.isoformat(),
-    )
-    if (
-        payload.verdict == ReviewVerdict.APPROVE
-        and asset.kind == "design"
-        and asset.subtype == "style_bible"
-        and isinstance(revision.content_json, str)
-    ):
-        store.publish_style_bible(
-            markdown=revision.content_json,
-            revision_id=revision.id,
-            markdown_path=str(asset.metadata_json.get("style_markdown_path", "production/style-bible.md")),
-            profile_path=str(asset.metadata_json.get("style_profile_path", "production/style-bible.json")),
-        )
+    review_record = {
+        "id": decision.id,
+        "asset_id": asset.id,
+        "revision_id": decision.revision_id,
+        "verdict": decision.verdict,
+        "notes": decision.notes,
+        "dependency_hash": decision.dependency_hash,
+        "artifacts": [],
+        "created_at": decision.created_at.isoformat(),
+    }
+    is_project_spec = is_project_spec_asset(asset)
+    published_files: dict[str, bytes] = {}
+    if is_project_spec:
+        metadata = dict(asset.metadata_json)
+        if payload.verdict == ReviewVerdict.APPROVE:
+            if asset.subtype == "style_bible":
+                if not isinstance(revision.content_json, str):
+                    session.rollback()
+                    raise ServiceError(422, "风格圣经修订必须是 Markdown 文本")
+                markdown_bytes = revision.content_json.encode("utf-8")
+                markdown_path = str(metadata.get("style_markdown_path", "production/style-bible.md"))
+                profile_path = str(metadata.get("style_profile_path", "production/style-bible.json"))
+                published_files[markdown_path] = markdown_bytes
+                published_files[profile_path] = json_bytes(
+                    {
+                        "format_version": 1,
+                        "key": "style.primary",
+                        "status": "approved",
+                        "sha256": sha256_bytes(markdown_bytes),
+                        "revision_id": revision.id,
+                    }
+                )
+                metadata.update(
+                    {
+                        "source_sha256": sha256_bytes(markdown_bytes),
+                        "source_observed_sha256": sha256_bytes(markdown_bytes),
+                        "source_missing": False,
+                        "source_drift_status": "in_sync",
+                        "source_error": None,
+                    }
+                )
+            elif asset.subtype == "prompt_recipe":
+                if not isinstance(revision.content_json, dict):
+                    session.rollback()
+                    raise ServiceError(422, "Prompt 配方修订必须是 JSON 对象")
+                recipe_bytes = json_bytes(revision.content_json)
+                recipe_path = str(
+                    metadata.get(
+                        "recipe_path",
+                        "production/prompt-recipes/emperor-primary.json",
+                    )
+                )
+                published_files[recipe_path] = recipe_bytes
+                metadata.update(
+                    {
+                        "source_sha256": sha256_bytes(recipe_bytes),
+                        "source_observed_sha256": sha256_bytes(recipe_bytes),
+                        "source_missing": False,
+                        "source_drift_status": "in_sync",
+                        "source_error": None,
+                    }
+                )
+                if isinstance(revision.content_json.get("id"), str):
+                    metadata["recipe_id"] = revision.content_json["id"]
+        elif metadata.get("source_missing"):
+            # A rejected candidate must never make a missing source look
+            # synchronized. Keep the source-health signal authoritative while
+            # preserving the rejected revision in immutable history.
+            metadata["source_drift_status"] = "missing"
+        else:
+            # Both scan-created (source-hash) candidates and page-edited
+            # candidates are immutable proposals. Rejection changes only the
+            # review state; it must not write the source file, and the
+            # inspector should immediately communicate that outcome rather
+            # than leaving a stale “candidate” badge behind.
+            metadata["source_drift_status"] = "rejected"
+        asset.metadata_json = metadata
+        descriptor = asset_descriptor(asset)
+        try:
+            store.commit_project_spec_change(
+                descriptor=descriptor,
+                reviews=[review_record],
+                published_files=published_files,
+            )
+        except (StorageError, IntegrityError) as exc:
+            session.rollback()
+            raise ServiceError(409, str(exc)) from exc
+    else:
+        try:
+            store.write_review(kind=asset.kind, key=asset.key, review=review_record)
+            store.update_asset_approval(
+                kind=asset.kind,
+                key=asset.key,
+                title=asset.title,
+                content_status=asset.content_status,
+                publication_status=asset.publication_status,
+                current_revision_id=asset.current_revision_id,
+                latest_candidate_revision_id=asset.latest_candidate_revision_id,
+                updated_at=asset.updated_at.isoformat(),
+            )
+        except (StorageError, IntegrityError) as exc:
+            session.rollback()
+            raise ServiceError(409, str(exc)) from exc
     session.commit()
     return decision
 

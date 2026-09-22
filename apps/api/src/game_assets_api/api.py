@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, object_session
 
 from .database import Database
 from .domain import (
@@ -16,6 +17,21 @@ from .domain import (
     AgentEventRead,
     AgentSessionCreate,
     AgentSessionRead,
+    GenerationAgentCapabilitiesRead,
+    GenerationConversationConfirm,
+    GenerationConversationConfirmRead,
+    GenerationConversationContextUpdate,
+    GenerationConversationCreate,
+    GenerationConversationDraftUpdate,
+    GenerationConversationEventRead,
+    GenerationConversationMessageCreate,
+    GenerationConversationMessageRead,
+    GenerationConversationRead,
+    GenerationConversationSettingsUpdate,
+    GenerationConversationSteerCreate,
+    GenerationInputAnswerCreate,
+    GenerationInputAnswerRead,
+    GenerationConversationSummary,
     AssetCreate,
     AssetRead,
     ArtifactRead,
@@ -33,6 +49,7 @@ from .domain import (
     GenerationStatus,
     LegacyMediaMigrationCreate,
     LegacyMediaMigrationResult,
+    NarrativeRequirementMaterialize,
     FindingRead,
     Message,
     PlanBudgetUpdate,
@@ -45,7 +62,9 @@ from .domain import (
     ProviderDefaultsRead,
     ProviderDefaultsUpdate,
     ProviderKind,
+    ProviderModelRead,
     ProviderModelsRead,
+    ProviderModelsSyncRead,
     ProviderModelsUpdate,
     ProviderRead,
     ProviderUnlock,
@@ -103,13 +122,17 @@ from .providers import (
     ProviderError,
     build_provider,
     validate_base_url,
+    validate_models_path,
 )
 from .provider_catalog import (
     apply_model_overrides,
-    ensure_profile_default_models,
     ensure_routing_defaults,
     merge_discovered_models,
     model_is_compatible,
+    normalize_model_catalog,
+    provider_credentials_ready,
+    provider_models_sync,
+    update_models_sync,
 )
 from .production import (
     attempt_output_is_valid,
@@ -126,6 +149,27 @@ from .agent import (
     diagnose_job,
     list_agent_events,
     record_agent_event,
+)
+from .generation_planning import (
+    GenerationPlanningRunner,
+    append_generation_message,
+    build_planning_context,
+    confirm_generation_conversation,
+    create_generation_conversation,
+    draft_hash,
+    ensure_generation_context_v2,
+    get_generation_events,
+    find_generation_message,
+    list_generation_conversations,
+    archive_generation_conversation,
+    remove_generation_conversation_artifacts,
+    replace_generation_conversation_context,
+    stream_generation_events,
+    unarchive_generation_conversation,
+    update_generation_draft,
+    update_generation_conversation_settings,
+    pending_input_request,
+    public_input_request,
 )
 from .delivery import (
     DeliveryError,
@@ -153,6 +197,7 @@ from .services import (
     update_project,
 )
 from .storage import ProjectStore, StorageError, sha256_file
+from .narrative import build_narrative_map, materialize_scene_requirements
 
 
 router = APIRouter(prefix="/api")
@@ -170,7 +215,17 @@ def vault(request: Request) -> CredentialVault:
 def provider_view(profile: ProviderProfile, credentials: CredentialVault) -> ProviderRead:
     view = ProviderRead.model_validate(profile)
     return view.model_copy(
-        update={"is_unlocked": profile.kind == ProviderKind.FAKE.value or credentials.is_unlocked(profile.id)}
+        update={
+            "models": [
+                ProviderModelRead.model_validate(model)
+                for model in normalize_model_catalog(profile.models_json or [])
+            ],
+            "models_path": profile.models_path or "models",
+            "is_unlocked": provider_credentials_ready(
+                profile, unlocked=credentials.is_unlocked(profile.id)
+            ),
+            "models_sync": ProviderModelsSyncRead.model_validate(provider_models_sync(profile)),
+        }
     )
 
 
@@ -180,15 +235,23 @@ def available_provider_ids(
     return {
         profile.id
         for profile in session.scalars(select(ProviderProfile)).all()
-        if profile.kind == ProviderKind.FAKE.value or credentials.is_unlocked(profile.id)
+        if provider_credentials_ready(profile, unlocked=credentials.is_unlocked(profile.id))
     }
 
 
-def provider_models_view(profile: ProviderProfile) -> ProviderModelsRead:
+def provider_models_view(
+    profile: ProviderProfile,
+    *,
+    new_model_ids: list[str] | None = None,
+    cleared_default_routes: list[str] | None = None,
+) -> ProviderModelsRead:
     return ProviderModelsRead(
         provider_profile_id=profile.id,
-        models=profile.models_json or [],
+        models=normalize_model_catalog(profile.models_json or []),
         refreshed_at=profile.models_refreshed_at,
+        new_model_ids=new_model_ids or [],
+        cleared_default_routes=cleared_default_routes or [],
+        models_sync=ProviderModelsSyncRead.model_validate(provider_models_sync(profile)),
     )
 
 
@@ -210,11 +273,34 @@ def provider_defaults_view(defaults: ProviderRoutingDefaults) -> ProviderDefault
             if defaults.image_provider_profile_id and defaults.image_model
             else None
         ),
+        video=(
+            ProviderDefaultRoute(
+                provider_profile_id=defaults.video_provider_profile_id,
+                model=defaults.video_model,
+            )
+            if defaults.video_provider_profile_id and defaults.video_model
+            else None
+        ),
+        audio=(
+            ProviderDefaultRoute(
+                provider_profile_id=defaults.audio_provider_profile_id,
+                model=defaults.audio_model,
+            )
+            if defaults.audio_provider_profile_id and defaults.audio_model
+            else None
+        ),
+        max_concurrency=defaults.max_concurrency,
+        max_transport_retries=defaults.max_transport_retries,
         updated_at=defaults.updated_at,
     )
 
 
-def provider_http_error(exc: ProviderError) -> HTTPException:
+def provider_http_error(
+    exc: ProviderError,
+    *,
+    fallback_endpoint: str | None = None,
+    fallback_hint: str | None = None,
+) -> HTTPException:
     mapping = {
         "auth": 401,
         "billing": 402,
@@ -225,7 +311,17 @@ def provider_http_error(exc: ProviderError) -> HTTPException:
         "network": 502,
         "server": 502,
     }
-    return HTTPException(mapping.get(exc.category.value, 502), detail={"category": exc.category.value, "message": str(exc)})
+    return HTTPException(
+        mapping.get(exc.category.value, 502),
+        detail={
+            "category": exc.category.value,
+            "message": str(exc),
+            "status_code": exc.status_code,
+            "endpoint": exc.endpoint or fallback_endpoint,
+            "request_id": exc.request_id,
+            "hint": exc.hint or fallback_hint,
+        },
+    )
 
 
 @router.get("/health")
@@ -432,6 +528,35 @@ def add_relation(payload: RelationCreate, session: Session = Depends(db)) -> Ass
     return create_relation(session, payload)
 
 
+@router.get("/projects/{project_id}/narrative-map")
+def narrative_map(project_id: str, session: Session = Depends(db)) -> dict[str, Any]:
+    """Return the chapter tree, scene graph and requirement coverage from Project facts."""
+
+    return build_narrative_map(session, project_id)
+
+
+@router.post("/projects/{project_id}/narrative-map/scenes/{scene_asset_id}/requirements")
+def materialize_narrative_requirements(
+    project_id: str,
+    scene_asset_id: str,
+    payload: NarrativeRequirementMaterialize,
+    session: Session = Depends(db),
+) -> dict[str, Any]:
+    """Create missing Catalog descriptors before handing them to the M2 plan editor.
+
+    This operation deliberately does not create a second planning or identity model:
+    returned IDs are ordinary Asset IDs and subsequent generation uses the existing
+    GenerationPlan/Job/Artifact/Review pipeline.
+    """
+
+    return materialize_scene_requirements(
+        session,
+        project_id=project_id,
+        scene_asset_id=scene_asset_id,
+        requirement_ids=payload.requirement_ids,
+    )
+
+
 @router.get("/providers", response_model=list[ProviderRead])
 def list_providers(
     include_archived: bool = True,
@@ -458,6 +583,10 @@ def add_provider(
             )
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
+    try:
+        models_path = validate_models_path(payload.models_path)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
     profile = ProviderProfile(
         id=new_id(),
         name=payload.name,
@@ -470,10 +599,12 @@ def add_provider(
         max_retries=payload.max_retries,
         allow_private_network=payload.allow_private_network,
         pricing=payload.pricing,
+        credential_mode=payload.credential_mode.value,
+        model_discovery_mode=payload.model_discovery_mode.value,
+        models_path=models_path,
         is_active=True,
         models_json=[],
     )
-    ensure_profile_default_models(profile)
     session.add(profile)
     session.flush()
     ensure_routing_defaults(session)
@@ -502,9 +633,16 @@ def edit_provider(
                 )
             except ValueError as exc:
                 raise HTTPException(422, str(exc)) from exc
+    if "models_path" in changes:
+        try:
+            changes["models_path"] = validate_models_path(changes["models_path"])
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+    for field in ("text_model", "image_model"):
+        if field in changes and changes[field] is None:
+            changes[field] = ""
     for field, value in changes.items():
         setattr(profile, field, value)
-    ensure_profile_default_models(profile)
     profile.updated_at = utcnow()
     session.commit()
     return provider_view(profile, credentials)
@@ -520,12 +658,10 @@ def archive_provider(
     profile.is_active = False
     profile.updated_at = utcnow()
     defaults = ensure_routing_defaults(session)
-    if defaults.text_provider_profile_id == profile.id:
-        defaults.text_provider_profile_id = None
-        defaults.text_model = None
-    if defaults.image_provider_profile_id == profile.id:
-        defaults.image_provider_profile_id = None
-        defaults.image_model = None
+    for modality in ("text", "image", "video", "audio"):
+        if getattr(defaults, f"{modality}_provider_profile_id") == profile.id:
+            setattr(defaults, f"{modality}_provider_profile_id", None)
+            setattr(defaults, f"{modality}_model", None)
     defaults.updated_at = utcnow()
     session.commit()
     return provider_view(profile, credentials)
@@ -557,7 +693,7 @@ def set_provider_defaults(
     session: Session = Depends(db),
 ) -> ProviderDefaultsRead:
     defaults = ensure_routing_defaults(session)
-    for modality in ("text", "image"):
+    for modality in ("text", "image", "video", "audio"):
         route = getattr(payload, modality)
         if route is None:
             setattr(defaults, f"{modality}_provider_profile_id", None)
@@ -575,10 +711,12 @@ def set_provider_defaults(
         if not model_is_compatible(profile, model, modality):
             raise HTTPException(
                 422,
-                f"default {modality} model {model} is not classified for {modality}",
+                f"default {modality} model {model} is not enabled and classified for {modality}",
             )
         setattr(defaults, f"{modality}_provider_profile_id", profile.id)
         setattr(defaults, f"{modality}_model", model)
+    defaults.max_concurrency = payload.max_concurrency
+    defaults.max_transport_retries = payload.max_transport_retries
     defaults.updated_at = utcnow()
     session.commit()
     return provider_defaults_view(defaults)
@@ -607,14 +745,89 @@ def update_provider_models(
     session: Session = Depends(db),
 ) -> ProviderModelsRead:
     profile = require(session, ProviderProfile, provider_id, "provider profile")
+    defaults = ensure_routing_defaults(session)
+    removed_model_ids = {
+        model_id.strip()
+        for model_id in payload.removed_model_ids
+        if model_id.strip()
+    }
+    if any(len(model_id) > 240 for model_id in removed_model_ids):
+        raise HTTPException(422, "removed model id exceeds 240 characters")
+    updated_model_ids = {item.id for item in payload.models}
+    overlap = removed_model_ids & updated_model_ids
+    if overlap:
+        raise HTTPException(
+            422,
+            f"model {sorted(overlap, key=str.lower)[0]} cannot be updated and removed together",
+        )
+    existing_ids = {
+        str(item.get("id"))
+        for item in profile.models_json or []
+        if item.get("id")
+    }
+    retained_models = [
+        item
+        for item in profile.models_json or []
+        if str(item.get("id", "")).strip() not in removed_model_ids
+    ]
     profile.models_json = apply_model_overrides(
-        profile.models_json or [],
-        [item.model_dump(mode="json") for item in payload.models],
+        retained_models,
+        [item.model_dump(mode="json", exclude_unset=True) for item in payload.models],
     )
-    ensure_profile_default_models(profile)
+    if profile.text_model in removed_model_ids:
+        profile.text_model = ""
+    if profile.image_model in removed_model_ids:
+        profile.image_model = ""
+    cleared_default_routes: list[str] = []
+    for modality in ("text", "image", "video", "audio"):
+        provider_field = f"{modality}_provider_profile_id"
+        model_field = f"{modality}_model"
+        if getattr(defaults, provider_field) != profile.id:
+            continue
+        model_id = str(getattr(defaults, model_field) or "").strip()
+        if model_id and model_is_compatible(profile, model_id, modality):
+            continue
+        setattr(defaults, provider_field, None)
+        setattr(defaults, model_field, None)
+        cleared_default_routes.append(modality)
+    if cleared_default_routes:
+        defaults.updated_at = utcnow()
+    if payload.catalog_refreshed:
+        endpoint_path = validate_models_path(profile.models_path)
+        endpoint = f"{profile.base_url.rstrip('/')}/{endpoint_path}"
+        available_count = sum(
+            1 for item in profile.models_json or [] if item.get("available") is True
+        )
+        profile.models_refreshed_at = utcnow()
+        update_models_sync(
+            profile,
+            state="synced" if available_count else "empty",
+            endpoint=endpoint,
+            status_code=200,
+            message=(
+                "模型目录已同步。"
+                if available_count
+                else "供应商返回了空模型列表。"
+            ),
+            hint=(
+                None
+                if available_count
+                else "请检查供应商模型权限，或手动登记模型 ID。"
+            ),
+            request_id=payload.request_id,
+        )
     profile.updated_at = utcnow()
     session.commit()
-    return provider_models_view(profile)
+    current_ids = {
+        str(item.get("id"))
+        for item in profile.models_json or []
+        if item.get("id")
+    }
+    return provider_models_view(
+        profile,
+        new_model_ids=sorted(current_ids - existing_ids, key=str.lower),
+        cleared_default_routes=cleared_default_routes,
+    )
 
 
 async def refresh_provider_model_catalog(
@@ -623,15 +836,99 @@ async def refresh_provider_model_catalog(
     credentials: CredentialVault,
 ) -> ProviderModelsRead:
     try:
+        endpoint_path = validate_models_path(profile.models_path)
+    except ValueError as exc:
+        endpoint = f"{profile.base_url.rstrip('/')}/models"
+        update_models_sync(
+            profile,
+            state="error",
+            endpoint=endpoint,
+            message="模型列表路径无效。",
+            hint="请输入不带协议、查询参数或片段的相对路径，例如 models。",
+        )
+        profile.updated_at = utcnow()
+        session.commit()
+        raise HTTPException(
+            422,
+            detail={
+                "category": "validation",
+                "message": str(exc),
+                "status_code": 422,
+                "endpoint": endpoint,
+                "hint": "请输入不带协议、查询参数或片段的相对路径，例如 models。",
+            },
+        ) from exc
+    endpoint = f"{profile.base_url.rstrip('/')}/{endpoint_path}"
+    if profile.model_discovery_mode == "manual":
+        update_models_sync(
+            profile,
+            state="manual_required",
+            endpoint=endpoint,
+            message="该供应商已设置为手动登记模型。",
+            hint="在模型目录中登记需要使用的模型 ID。",
+        )
+        profile.updated_at = utcnow()
+        session.commit()
+        return provider_models_view(profile)
+    try:
         discovered = await build_provider(profile, credentials).discover_models()
     except ProviderError as exc:
-        raise provider_http_error(exc) from exc
+        if exc.status_code in {404, 405}:
+            update_models_sync(
+                profile,
+                state="manual_required",
+                endpoint=exc.endpoint or endpoint,
+                status_code=exc.status_code,
+                message="供应商未提供可用的模型列表接口。",
+                hint="连接仍可使用；请在模型目录中手动登记模型 ID。",
+                request_id=exc.request_id,
+            )
+            profile.updated_at = utcnow()
+            session.commit()
+            return provider_models_view(profile)
+        fallback_hint = "检查 Base URL、模型列表路径和本机网络连通性，或根据错误分类修复供应商配置。"
+        update_models_sync(
+            profile,
+            state="error",
+            endpoint=exc.endpoint or endpoint,
+            status_code=exc.status_code,
+            message=str(exc),
+            hint=exc.hint or fallback_hint,
+            request_id=exc.request_id,
+        )
+        profile.updated_at = utcnow()
+        session.commit()
+        raise provider_http_error(
+            exc,
+            fallback_endpoint=endpoint,
+            fallback_hint=fallback_hint,
+        ) from exc
+    existing_ids = {
+        str(item.get("id"))
+        for item in profile.models_json or []
+        if item.get("id")
+    }
+    discovered_ids = {
+        str(item.get("id"))
+        for item in discovered
+        if item.get("id")
+    }
     profile.models_json = merge_discovered_models(profile.models_json or [], discovered)
-    ensure_profile_default_models(profile)
     profile.models_refreshed_at = utcnow()
+    update_models_sync(
+        profile,
+        state="synced" if discovered else "empty",
+        endpoint=endpoint,
+        status_code=200,
+        message=("模型目录已同步。" if discovered else "供应商返回了空模型列表。"),
+        hint=(None if discovered else "请检查供应商模型权限，或手动登记模型 ID。"),
+    )
     profile.updated_at = utcnow()
     session.commit()
-    return provider_models_view(profile)
+    return provider_models_view(
+        profile,
+        new_model_ids=sorted(discovered_ids - existing_ids, key=str.lower),
+    )
 
 
 @router.post("/providers/{provider_id}/models/refresh", response_model=ProviderModelsRead)
@@ -696,7 +993,9 @@ def provider_capabilities(
         models=[
             str(model.get("id"))
             for model in profile.models_json or []
-            if model.get("id") and model.get("available", True)
+            if model.get("id")
+            and model.get("available", True)
+            and model.get("enabled", True)
         ],
     )
 
@@ -742,6 +1041,482 @@ def get_plan(plan_id: str, session: Session = Depends(db)) -> GenerationPlan:
 def inspect_plan(plan_id: str, session: Session = Depends(db)) -> dict[str, Any]:
     plan = require(session, GenerationPlan, plan_id, "generation plan")
     return inspect_run(session, plan)
+
+
+def _planning_session(session: Session, session_id: str) -> AgentSession:
+    value = require(session, AgentSession, session_id, "generation conversation")
+    if value.purpose != "generation_planning":
+        raise ServiceError(409, "agent session is not a generation planning conversation")
+    return value
+
+
+def _generation_seed_ids(row: AgentSession, *, include_context_fallback: bool) -> list[str]:
+    values = (row.sandbox_json or {}).get("seed_asset_ids")
+    if not isinstance(values, list) and include_context_fallback:
+        values = (row.context_json or {}).get("seed_asset_ids")
+    return sorted({str(value) for value in values or [] if value})
+
+
+def _generation_conversation_summary(row: AgentSession) -> dict[str, Any]:
+    result = dict(row.result_json or {})
+    return {
+        "id": row.id,
+        "project_id": row.project_id,
+        "plan_id": row.plan_id,
+        "title": row.title,
+        "agent_model": row.agent_model,
+        "status": row.status,
+        "turn_count": int(row.turn_count or 0),
+        "budget_limit": int(row.budget_limit or 0),
+        "budget_used": int(row.budget_used or 0),
+        "seed_asset_ids": _generation_seed_ids(row, include_context_fallback=False),
+        "error_summary": result.get("last_error"),
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+        "completed_at": row.completed_at,
+        "archived_at": row.archived_at,
+    }
+
+
+def _generation_conversation_detail(row: AgentSession) -> dict[str, Any]:
+    result = dict(row.result_json or {})
+    seed_asset_ids = _generation_seed_ids(row, include_context_fallback=True)
+    raw_context = dict(row.context_json or {})
+    # Context v2 remains a server-side/read-only workspace artifact. The web
+    # view gets only the fields needed to explain and edit the current draft.
+    context = {
+        "context_version": int(raw_context.get("context_version", 2)),
+        "read_only": True,
+        "seed_asset_ids": seed_asset_ids,
+        "project": raw_context.get("project", {"id": row.project_id}),
+    }
+    attached = object_session(row)
+    pending = pending_input_request(attached, row.id) if attached is not None else None
+    return {
+        "id": row.id,
+        "project_id": row.project_id,
+        "plan_id": row.plan_id,
+        "thread_id": row.thread_id,
+        "purpose": row.purpose,
+        "title": row.title,
+        "agent_model": row.agent_model,
+        "status": row.status,
+        "context_hash": row.context_hash,
+        "seed_asset_ids": seed_asset_ids,
+        "context": context,
+        "draft": dict(row.draft_json or {}),
+        "draft_hash": row.draft_hash,
+        "draft_version": int(row.draft_version or 0),
+        "budget_limit": int(row.budget_limit or 0),
+        "budget_used": int(row.budget_used or 0),
+        "turn_count": int(row.turn_count or 0),
+        "diagnostic_reason": row.diagnostic_reason,
+        "stop_reason": row.stop_reason,
+        "usage": result.get("usage") if isinstance(result.get("usage"), dict) else {},
+        "last_error": result.get("last_error") if isinstance(result.get("last_error"), dict) else None,
+        "pending_input": public_input_request(pending) if pending else None,
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+        "completed_at": row.completed_at,
+        "archived_at": row.archived_at,
+    }
+
+
+@router.get("/generation-agent/capabilities", response_model=GenerationAgentCapabilitiesRead)
+async def generation_agent_capabilities(request: Request) -> dict[str, Any]:
+    """Return an actionable local Codex/App Server diagnostic."""
+
+    adapter = getattr(request.app.state, "codex_adapter", None)
+    if adapter is None:
+        from .codex_adapter import UnavailableCodexAdapter
+
+        adapter = UnavailableCodexAdapter()
+    capabilities = getattr(adapter, "capabilities", None)
+    if capabilities is None:
+        return {
+            "available": False,
+            "adapter": str(getattr(adapter, "name", "unknown")),
+            "version": str(getattr(adapter, "version", "unknown")),
+            "models": [],
+            "diagnostic": {
+                "code": "capabilities_unsupported",
+                "message": "当前规划适配器没有提供模型列表。",
+                "hint": "可以继续使用右侧人工编排。",
+            },
+        }
+    try:
+        value = await asyncio.wait_for(capabilities(), timeout=10.0)
+    except asyncio.TimeoutError:
+        return {
+            "available": False,
+            "adapter": str(getattr(adapter, "name", "unknown")),
+            "version": str(getattr(adapter, "version", "unknown")),
+            "models": [],
+            "diagnostic": {
+                "code": "capabilities_timeout",
+                "message": "Codex App Server 能力检测超时。",
+                "hint": "确认本机 Codex 已安装并登录；也可以继续右侧人工编排。",
+            },
+        }
+    except Exception as exc:
+        return {
+            "available": False,
+            "adapter": str(getattr(adapter, "name", "unknown")),
+            "version": str(getattr(adapter, "version", "unknown")),
+            "models": [],
+            "diagnostic": {
+                "code": "capabilities_failed",
+                "message": "无法连接本机 Codex App Server。",
+                "hint": f"{str(exc)[:400]}。检查 Codex 登录状态或继续人工编排。",
+            },
+        }
+    return {**value, "interactive_user_input": bool(value.get("available") and getattr(adapter, "interactive_user_input", False))}
+
+
+async def _best_effort_thread_action(
+    request: Request,
+    action: str,
+    thread_id: str | None,
+) -> None:
+    callback = getattr(getattr(request.app.state, "codex_adapter", None), action, None)
+    if callback is None:
+        return
+    try:
+        await asyncio.wait_for(callback(thread_id), timeout=8.0)
+    except Exception:
+        # Conversation lifecycle is local-first. A missing or unavailable
+        # App Server must not make archive/delete unusable.
+        return
+
+
+@router.post(
+    "/generation-conversations",
+    response_model=GenerationConversationRead,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_generation_conversation_route(
+    payload: GenerationConversationCreate,
+    request: Request,
+    session: Session = Depends(db),
+) -> dict[str, Any]:
+    adapter = getattr(request.app.state, "codex_adapter", None)
+    if adapter is None:
+        from .codex_adapter import UnavailableCodexAdapter
+
+        adapter = UnavailableCodexAdapter()
+    settings = getattr(request.app.state, "settings", None)
+    budget = int(getattr(settings, "planning_agent_budget", 8))
+    row = create_generation_conversation(
+        session,
+        payload,
+        adapter=adapter,
+        planning_budget=budget,
+    )
+    return _generation_conversation_detail(row)
+
+
+@router.get("/generation-conversations", response_model=list[GenerationConversationSummary])
+def list_generation_conversations_route(
+    project_id: str | None = None,
+    include_archived: bool = Query(default=False),
+    session: Session = Depends(db),
+) -> list[dict[str, Any]]:
+    rows = list_generation_conversations(session, project_id, include_archived=include_archived)
+    return [_generation_conversation_summary(row) for row in rows]
+
+
+@router.get("/generation-conversations/{session_id}", response_model=GenerationConversationRead)
+def get_generation_conversation_route(
+    session_id: str,
+    session: Session = Depends(db),
+) -> dict[str, Any]:
+    row = ensure_generation_context_v2(session, _planning_session(session, session_id))
+    return _generation_conversation_detail(row)
+
+
+@router.patch(
+    "/generation-conversations/{session_id}/settings",
+    response_model=GenerationConversationRead,
+)
+def patch_generation_conversation_settings(
+    session_id: str,
+    payload: GenerationConversationSettingsUpdate,
+    session: Session = Depends(db),
+) -> dict[str, Any]:
+    row = _planning_session(session, session_id)
+    row = update_generation_conversation_settings(session, row, agent_model=payload.agent_model)
+    return _generation_conversation_detail(row)
+
+
+@router.patch(
+    "/generation-conversations/{session_id}/context",
+    response_model=GenerationConversationRead,
+)
+def patch_generation_conversation_context(
+    session_id: str,
+    payload: GenerationConversationContextUpdate,
+    session: Session = Depends(db),
+) -> dict[str, Any]:
+    row = _planning_session(session, session_id)
+    row = replace_generation_conversation_context(session, row, seed_asset_ids=payload.seed_asset_ids)
+    return _generation_conversation_detail(row)
+
+
+@router.post(
+    "/generation-conversations/{session_id}/archive",
+    response_model=GenerationConversationRead,
+)
+async def archive_generation_conversation_route(
+    session_id: str,
+    request: Request,
+    session: Session = Depends(db),
+) -> dict[str, Any]:
+    row = _planning_session(session, session_id)
+    await _best_effort_thread_action(request, "archive_thread", row.thread_id)
+    row = archive_generation_conversation(session, row)
+    return _generation_conversation_detail(row)
+
+
+@router.post(
+    "/generation-conversations/{session_id}/unarchive",
+    response_model=GenerationConversationRead,
+)
+async def unarchive_generation_conversation_route(
+    session_id: str,
+    request: Request,
+    session: Session = Depends(db),
+) -> dict[str, Any]:
+    row = _planning_session(session, session_id)
+    await _best_effort_thread_action(request, "unarchive_thread", row.thread_id)
+    row = unarchive_generation_conversation(session, row)
+    return _generation_conversation_detail(row)
+
+
+@router.delete("/generation-conversations/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_generation_conversation_route(
+    session_id: str,
+    request: Request,
+    session: Session = Depends(db),
+) -> Response:
+    row = _planning_session(session, session_id)
+    if row.status in {"running", "awaiting_input"}:
+        raise ServiceError(409, "stop the active planning turn before permanently deleting the conversation")
+    project = require(session, Project, row.project_id, "project")
+    conversation_id = row.id
+    await _best_effort_thread_action(request, "delete_thread", row.thread_id)
+    # AgentSession.plan_id/job_id historically used CASCADE FKs. Null them and
+    # their audit references first so deleting chat history can never delete a
+    # confirmed Plan, Job, or asset.
+    events = list(session.scalars(select(AgentEvent).where(AgentEvent.session_id == row.id)).all())
+    for event in events:
+        event.plan_id = None
+        event.job_id = None
+        event.asset_id = None
+    row.plan_id = None
+    row.job_id = None
+    row.asset_id = None
+    session.delete(row)
+    session.commit()
+    remove_generation_conversation_artifacts(conversation_id, project)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post(
+    "/generation-conversations/{session_id}/messages",
+    response_model=GenerationConversationMessageRead,
+)
+async def post_generation_conversation_message(
+    session_id: str,
+    payload: GenerationConversationMessageCreate,
+    request: Request,
+    session: Session = Depends(db),
+) -> GenerationConversationMessageRead:
+    row = _planning_session(session, session_id)
+    runner = getattr(
+        request.app.state,
+        "generation_planning_runner",
+        getattr(request.app.state, "planning_runner", None),
+    )
+    if runner is None:
+        raise ServiceError(503, "generation planning runner is unavailable")
+    existing_message = find_generation_message(session, row, payload.client_message_id)
+    if existing_message is not None:
+        turn_id, sequence = existing_message
+        return GenerationConversationMessageRead(
+            turn_id=turn_id,
+            status=row.status,
+            next_sequence=sequence,
+        )
+    turn_id, next_sequence = append_generation_message(
+        session,
+        row,
+        payload.content,
+        context_asset_ids=payload.context_asset_ids,
+        client_message_id=payload.client_message_id,
+    )
+    try:
+        runner.submit(session_id, turn_id)
+    except Exception as exc:
+        # The message remains auditable, but the session must immediately offer
+        # the manual editor instead of looking permanently busy.
+        with request.app.state.database.sessions() as recovery:
+            failed = recovery.get(AgentSession, session_id)
+            if failed is not None:
+                failed.status = "awaiting_user"
+                failed.stop_reason = "runner.unavailable"
+                failed.updated_at = utcnow()
+                record_agent_event(recovery, failed, "turn.failed", data={"reason": "runner.unavailable"}, turn_id=turn_id)
+                recovery.commit()
+        raise ServiceError(503, f"generation planning runner is unavailable: {exc}") from exc
+    return GenerationConversationMessageRead(turn_id=turn_id, status="running", next_sequence=next_sequence)
+
+
+@router.post(
+    "/generation-conversations/{session_id}/steer",
+    response_model=GenerationConversationMessageRead,
+)
+async def steer_generation_conversation_turn(
+    session_id: str,
+    payload: GenerationConversationSteerCreate,
+    request: Request,
+    session: Session = Depends(db),
+) -> GenerationConversationMessageRead:
+    row = _planning_session(session, session_id)
+    if row.status != "running":
+        raise ServiceError(409, "this conversation has no active turn")
+    runner = getattr(
+        request.app.state,
+        "generation_planning_runner",
+        getattr(request.app.state, "planning_runner", None),
+    )
+    if runner is None:
+        raise ServiceError(503, "generation planning runner is unavailable")
+    turn_id, next_sequence = await runner.steer(session_id, payload.content)
+    return GenerationConversationMessageRead(
+        turn_id=turn_id,
+        status="running",
+        next_sequence=next_sequence,
+    )
+
+
+@router.post(
+    "/generation-conversations/{session_id}/input-requests/{input_id}/answer",
+    response_model=GenerationInputAnswerRead,
+)
+async def answer_generation_input(
+    session_id: str, input_id: str, payload: GenerationInputAnswerCreate,
+    request: Request, session: Session = Depends(db),
+) -> GenerationInputAnswerRead:
+    _planning_session(session, session_id)
+    runner = request.app.state.generation_planning_runner
+    turn_id, sequence = await runner.answer_input(
+        session_id, input_id, payload.client_response_id, payload.answers,
+    )
+    return GenerationInputAnswerRead(
+        request_id=input_id, turn_id=turn_id, status="running", next_sequence=sequence,
+    )
+
+
+@router.get(
+    "/generation-conversations/{session_id}/events",
+    response_model=list[GenerationConversationEventRead],
+)
+def get_generation_conversation_events(
+    session_id: str,
+    after: int = Query(default=0, ge=0),
+    limit: int = Query(default=500, ge=1, le=2_000),
+    session: Session = Depends(db),
+) -> list[AgentEvent]:
+    _planning_session(session, session_id)
+    return get_generation_events(session, session_id, after_sequence=after, limit=limit)
+
+
+@router.get("/generation-conversations/{session_id}/events/stream")
+async def stream_generation_conversation_events(
+    session_id: str,
+    request: Request,
+    after: int = Query(default=0, ge=0),
+    session: Session = Depends(db),
+) -> StreamingResponse:
+    _planning_session(session, session_id)
+    last_event_id = request.headers.get("last-event-id")
+    cursor = after
+    if last_event_id and last_event_id.isdigit():
+        cursor = max(cursor, int(last_event_id))
+    return StreamingResponse(
+        stream_generation_events(request.app.state.database, session_id, request, after_sequence=cursor),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.patch(
+    "/generation-conversations/{session_id}/draft",
+    response_model=GenerationConversationRead,
+)
+def patch_generation_conversation_draft(
+    session_id: str,
+    payload: GenerationConversationDraftUpdate,
+    session: Session = Depends(db),
+) -> dict[str, Any]:
+    row = _planning_session(session, session_id)
+    row = update_generation_draft(session, row, payload)
+    return _generation_conversation_detail(row)
+
+
+@router.post(
+    "/generation-conversations/{session_id}/confirm",
+    response_model=GenerationConversationConfirmRead,
+)
+def confirm_generation_conversation_route(
+    session_id: str,
+    payload: GenerationConversationConfirm,
+    request: Request,
+    session: Session = Depends(db),
+) -> dict[str, Any]:
+    row = _planning_session(session, session_id)
+    result = confirm_generation_conversation(
+        session,
+        row,
+        payload,
+        available_provider_ids=available_provider_ids(session, vault(request)),
+    )
+    result["conversation"] = _generation_conversation_detail(result["conversation"])
+    return result
+
+
+@router.post(
+    "/generation-conversations/{session_id}/cancel-turn",
+    response_model=GenerationConversationRead,
+)
+async def cancel_generation_conversation_turn(
+    session_id: str,
+    request: Request,
+    session: Session = Depends(db),
+) -> dict[str, Any]:
+    row = _planning_session(session, session_id)
+    runner = getattr(
+        request.app.state,
+        "generation_planning_runner",
+        getattr(request.app.state, "planning_runner", None),
+    )
+    if runner is not None:
+        await runner.cancel(session_id)
+    else:
+        row.status = "awaiting_user"
+        row.stop_reason = "user.cancelled"
+        row.result_json = {
+            **dict(row.result_json or {}),
+            "last_error": {
+                "error_code": "interrupted",
+                "reason": "user.cancelled",
+                "message": "本轮已由用户停止，已有消息和草案仍然保留。",
+                "retryable": True,
+            },
+        }
+        session.commit()
+    with request.app.state.database.sessions() as refreshed:
+        return _generation_conversation_detail(_planning_session(refreshed, session_id))
 
 
 @router.post("/jobs/{job_id}/agent/diagnose", response_model=AgentSessionRead)
@@ -1300,8 +2075,7 @@ def resume_job(
             )
     job.status = (
         GenerationStatus.QUEUED.value
-        if profile.kind == ProviderKind.FAKE.value
-        or credentials.is_unlocked(profile.id)
+        if provider_credentials_ready(profile, unlocked=credentials.is_unlocked(profile.id))
         or has_recoverable_output
         or has_recoverable_action
         else GenerationStatus.CREDENTIALS_LOCKED.value

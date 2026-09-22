@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import { ArrowsLeftRight, CheckCircle, FloppyDisk, WarningCircle, X } from "@phosphor-icons/react";
 import { fieldLabel } from "../lib/labels";
 import type { GameAsset } from "../types";
+import { MarkdownPreview } from "./MarkdownPreview";
+import { MultiSelectMenu } from "./MultiSelectMenu";
 
 interface AssetEditorDrawerProps {
   asset: GameAsset | null;
@@ -161,10 +163,16 @@ export function AssetEditorDrawer({ asset, allAssets, onClose, onSave }: AssetEd
         <div className="asset-editor-body">
           <div className="asset-editor-fields">
             {asset.revisionFormat === "markdown" ? (
-              <label className="editor-field editor-markdown-field">
-                <span>Markdown 正文</span>
-                <textarea value={typeof draft === "string" ? draft : ""} onChange={(event) => setDraft(event.target.value)} />
-              </label>
+              <div className="markdown-editor-grid">
+                <label className="editor-field editor-markdown-field">
+                  <span>Markdown 源码</span>
+                  <textarea value={typeof draft === "string" ? draft : ""} onChange={(event) => setDraft(event.target.value)} />
+                </label>
+                <section className="markdown-live-preview" aria-label="Markdown 实时预览">
+                  <span>实时预览</span>
+                  <MarkdownPreview content={typeof draft === "string" ? draft : ""} />
+                </section>
+              </div>
             ) : mode === "json" ? (
               <label className="editor-field editor-json-field">
                 <span>原始 JSON</span>
@@ -193,17 +201,18 @@ export function AssetEditorDrawer({ asset, allAssets, onClose, onSave }: AssetEd
                   if (["participants", "nodes", "references"].includes(name) && Array.isArray(value)) {
                     const options = relationOptions(name, allAssets);
                     return (
-                      <label className="editor-field editor-field-wide" key={name}>
+                      <div className="editor-field editor-field-wide" key={name}>
                         <span>{fieldLabel(name)}</span>
-                        <select
-                          multiple
-                          value={value.map(String)}
-                          onChange={(event) => updateObjectField(name, Array.from(event.currentTarget.selectedOptions, (option) => option.value))}
-                        >
-                          {options.map((option) => <option key={option.id} value={relationValue(option, name)}>{option.name} · {option.subtypeLabel}</option>)}
-                        </select>
-                        <small>按住 Command/Ctrl 可多选；保存时会同步资产关系。</small>
-                      </label>
+                        <MultiSelectMenu
+                          ariaLabel={fieldLabel(name)}
+                          values={value.map(String)}
+                          options={options.map((option) => ({ value: relationValue(option, name), label: `${option.name} · ${option.subtypeLabel}` }))}
+                          onChange={(next) => updateObjectField(name, next)}
+                          className="asset-relation-select"
+                          placeholder="未选择"
+                        />
+                        <small>点击选择或取消关系；保存时会同步资产关系。</small>
+                      </div>
                     );
                   }
                   if (typeof value === "string") {

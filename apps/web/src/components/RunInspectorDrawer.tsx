@@ -32,6 +32,7 @@ import type {
   RunEvidenceItem,
   RunInspection,
 } from "../types";
+import { SelectMenu } from "./SelectMenu";
 
 type InspectorTab = "pipeline" | "evidence" | "events";
 type RemediationChoice = "retry" | "tool_repair" | "regenerate" | "image_edit" | "await_user";
@@ -491,7 +492,7 @@ export function RunInspectorDrawer({
                     : ["tool_repair", "regenerate", "image_edit", "retry", "await_user"]
                   ).map((choice) => <button key={choice} type="button" className={action === choice ? "active" : ""} aria-pressed={action === choice} onClick={() => chooseAction(choice as RemediationChoice)}>{choice === "tool_repair" ? <Wrench size={15} /> : choice === "retry" ? <ArrowsClockwise size={15} /> : choice === "await_user" ? <WarningCircle size={15} /> : <ImagesSquare size={15} />}{actionLabel(choice as RemediationChoice)}</button>)}
                 </div>
-                {action === "tool_repair" ? <label className="production-field"><span>已注册 Worker</span><select value={strategy} onChange={(event) => setStrategy(event.target.value)}><option value="normalize">编码 / 尺寸归一化</option><option value="color_key">角点色键移除</option><option value="smart_matte">智能抠图适配</option><option value="edge_cleanup">边缘清理</option></select></label> : <label className="production-field"><span>策略记录</span><input value={strategy} onChange={(event) => setStrategy(event.target.value)} /></label>}
+                {action === "tool_repair" ? <label className="production-field"><span>已注册 Worker</span><SelectMenu ariaLabel="已注册 Worker" value={strategy} options={[{ value: "normalize", label: "编码 / 尺寸归一化" }, { value: "color_key", label: "角点色键移除" }, { value: "smart_matte", label: "智能抠图适配" }, { value: "edge_cleanup", label: "边缘清理" }]} onChange={setStrategy} /></label> : <label className="production-field"><span>策略记录</span><input value={strategy} onChange={(event) => setStrategy(event.target.value)} /></label>}
                 {(action === "regenerate" || action === "image_edit") ? <label className="production-field"><span>本轮必须改变的生成约束</span><textarea rows={3} value={promptAdjustment} onChange={(event) => setPromptAdjustment(event.target.value)} placeholder="例如：保持人物身份，改为正面半身构图，移除背景文字。" /></label> : null}
                 <label className="production-field"><span>判断依据</span><textarea rows={4} value={reason} onChange={(event) => setReason(event.target.value)} placeholder="引用证据并说明为什么选择该动作。" /></label>
                 <div className={`action-impact ${paidAction ? "paid" : "free"}`}><CurrencyDollar size={17} /><div><strong>{paidAction ? "预计增加 1 次供应商调用" : "不占付费返工额度"}</strong><small>{paidAction ? `剩余额度 ${Math.max(0, inspection.plan.extra_call_budget - inspection.plan.extra_calls_used)} 次` : freeActionDetail}</small></div></div>

@@ -49,7 +49,18 @@ def create_provider(
         },
     )
     assert response.status_code == 201, response.text
-    return response.json()
+    provider = response.json()
+    catalog = client.patch(
+        f"/api/providers/{provider['id']}/models",
+        json={
+            "models": [
+                {"id": text_model, "modalities": ["text"]},
+                {"id": image_model, "modalities": ["image"]},
+            ]
+        },
+    )
+    assert catalog.status_code == 200, catalog.text
+    return client.get(f"/api/providers/{provider['id']}").json()
 
 
 def text_task(
@@ -139,6 +150,7 @@ def test_provider_crud_defaults_and_model_cache_survive_refresh_failure(
         json={"name": "Beta updated", "concurrency": 5, "max_retries": 4},
     )
     assert updated.status_code == 200, updated.text
+    assert updated.json()["model_catalog_api_version"] == 2
     assert (updated.json()["name"], updated.json()["concurrency"]) == ("Beta updated", 5)
 
     defaults = client.put(
@@ -172,9 +184,10 @@ def test_provider_crud_defaults_and_model_cache_survive_refresh_failure(
     custom = next(model for model in classified.json()["models"] if model["id"] == "alpha-vision-custom")
     assert custom == {
         "id": "alpha-vision-custom",
-        "modalities": ["image", "text"],
+        "modalities": ["text"],
         "classification": "manual",
         "available": False,
+        "enabled": True,
     }
     cached_before = client.get(f"/api/providers/{alpha['id']}/models").json()
 
@@ -185,7 +198,11 @@ def test_provider_crud_defaults_and_model_cache_survive_refresh_failure(
     monkeypatch.setattr(api_module, "build_provider", lambda _profile, _vault: BrokenCatalog())
     failed = client.post(f"/api/providers/{alpha['id']}/models/refresh")
     assert failed.status_code == 502
-    assert client.get(f"/api/providers/{alpha['id']}/models").json() == cached_before
+    cached_after = client.get(f"/api/providers/{alpha['id']}/models").json()
+    assert cached_after["models"] == cached_before["models"]
+    assert cached_after["refreshed_at"] == cached_before["refreshed_at"]
+    assert cached_after["models_sync"]["state"] == "error"
+    assert cached_after["models_sync"]["endpoint"].endswith("/models")
 
     archived = client.post(f"/api/providers/{beta['id']}/archive")
     assert archived.json()["is_active"] is False
@@ -195,6 +212,401 @@ def test_provider_crud_defaults_and_model_cache_survive_refresh_failure(
         for provider in client.get("/api/providers", params={"include_archived": False}).json()
     )
     assert client.post(f"/api/providers/{beta['id']}/restore").json()["is_active"] is True
+
+
+def test_model_refresh_reports_new_models_and_preserves_user_disabled_state(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = create_provider(
+        client,
+        "Catalog provider",
+        text_model="catalog-text",
+        image_model="catalog-image",
+    )
+
+    class MutableCatalog:
+        items: list[dict[str, Any]] = [
+            {"id": "discovered-text", "modalities": ["text"]},
+            {"id": "discovered-image", "modalities": ["image"]},
+        ]
+
+        async def discover_models(self) -> list[dict[str, Any]]:
+            return list(self.items)
+
+    catalog = MutableCatalog()
+    monkeypatch.setattr(api_module, "build_provider", lambda _profile, _vault: catalog)
+
+    first = client.post(f"/api/providers/{provider['id']}/models/refresh")
+    assert first.status_code == 200, first.text
+    assert first.json()["new_model_ids"] == ["discovered-image", "discovered-text"]
+    assert all(model["enabled"] for model in first.json()["models"])
+
+    disabled = client.patch(
+        f"/api/providers/{provider['id']}/models",
+        json={
+            "models": [
+                {"id": "discovered-text", "modalities": ["text"], "enabled": False}
+            ]
+        },
+    )
+    assert disabled.status_code == 200, disabled.text
+    assert next(model for model in disabled.json()["models"] if model["id"] == "discovered-text")["enabled"] is False
+    changed_type = client.patch(
+        f"/api/providers/{provider['id']}/models",
+        json={"models": [{"id": "discovered-image", "modalities": ["video"]}]},
+    )
+    assert changed_type.status_code == 200, changed_type.text
+
+    catalog.items = [
+        {"id": "discovered-text", "modalities": ["text"]},
+        {"id": "discovered-image", "modalities": ["image"]},
+        {"id": "discovered-new", "modalities": ["text"]},
+    ]
+    second = client.post(f"/api/providers/{provider['id']}/models/refresh")
+    assert second.status_code == 200, second.text
+    assert second.json()["new_model_ids"] == ["discovered-new"]
+    assert next(model for model in second.json()["models"] if model["id"] == "discovered-text")["enabled"] is False
+    assert next(model for model in second.json()["models"] if model["id"] == "discovered-image")["modalities"] == ["video"]
+    assert next(model for model in second.json()["models"] if model["id"] == "discovered-new")["enabled"] is True
+
+    defaults = client.put(
+        "/api/provider-defaults",
+        json={"text": {"provider_profile_id": provider["id"], "model": "discovered-new"}},
+    )
+    assert defaults.status_code == 200, defaults.text
+    changed_default = client.patch(
+        f"/api/providers/{provider['id']}/models",
+        json={"models": [{"id": "discovered-new", "modalities": ["text"], "enabled": False}]},
+    )
+    assert changed_default.status_code == 200, changed_default.text
+    assert changed_default.json()["cleared_default_routes"] == ["text"]
+    assert client.get("/api/provider-defaults").json()["text"] is None
+
+
+def test_new_provider_has_no_implicit_models_or_default_routes(client: TestClient) -> None:
+    response = client.post(
+        "/api/providers",
+        json={
+            "name": "Empty channel",
+            "kind": "fake",
+            "base_url": "https://empty.invalid/v1",
+        },
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["text_model"] == ""
+    assert response.json()["image_model"] == ""
+    assert response.json()["models"] == []
+    defaults = client.get("/api/provider-defaults").json()
+    assert defaults["text"] is None
+    assert defaults["image"] is None
+    assert defaults["video"] is None
+    assert defaults["audio"] is None
+    assert defaults["max_concurrency"] == 3
+    assert defaults["max_transport_retries"] == 2
+
+
+def test_four_default_routes_runtime_defaults_and_archive_are_global(
+    client: TestClient,
+) -> None:
+    provider = create_provider(
+        client,
+        "Four routes",
+        text_model="route-text",
+        image_model="route-image",
+    )
+    catalog = client.patch(
+        f"/api/providers/{provider['id']}/models",
+        json={
+            "models": [
+                {"id": "route-video", "modalities": ["video"]},
+                {"id": "route-audio", "modalities": ["audio"]},
+            ]
+        },
+    )
+    assert catalog.status_code == 200, catalog.text
+    saved = client.put(
+        "/api/provider-defaults",
+        json={
+            "text": {"provider_profile_id": provider["id"], "model": "route-text"},
+            "image": {"provider_profile_id": provider["id"], "model": "route-image"},
+            "video": {"provider_profile_id": provider["id"], "model": "route-video"},
+            "audio": {"provider_profile_id": provider["id"], "model": "route-audio"},
+            "max_concurrency": 7,
+            "max_transport_retries": 4,
+        },
+    )
+    assert saved.status_code == 200, saved.text
+    assert {
+        modality: saved.json()[modality]["model"]
+        for modality in ("text", "image", "video", "audio")
+    } == {
+        "text": "route-text",
+        "image": "route-image",
+        "video": "route-video",
+        "audio": "route-audio",
+    }
+    assert saved.json()["max_concurrency"] == 7
+    assert saved.json()["max_transport_retries"] == 4
+
+    archived = client.post(f"/api/providers/{provider['id']}/archive")
+    assert archived.status_code == 200, archived.text
+    after_archive = client.get("/api/provider-defaults").json()
+    assert all(after_archive[modality] is None for modality in ("text", "image", "video", "audio"))
+    assert after_archive["max_concurrency"] == 7
+    assert after_archive["max_transport_retries"] == 4
+
+
+def test_model_types_are_single_guessed_overridable_and_deletable(client: TestClient) -> None:
+    response = client.post(
+        "/api/providers",
+        json={
+            "name": "Typed catalog",
+            "kind": "fake",
+            "base_url": "https://typed.invalid/v1",
+            "text_model": "gpt-5-mini",
+            "image_model": "gpt-image-2",
+        },
+    )
+    assert response.status_code == 201, response.text
+    provider_id = response.json()["id"]
+    updated = client.patch(
+        f"/api/providers/{provider_id}/models",
+        json={
+            "models": [
+                {"id": "seedance-image", "modalities": []},
+                {"id": "voice-image", "modalities": []},
+                {"id": "gpt-image-2", "modalities": []},
+                {"id": "grok-imagine-1.0", "modalities": []},
+                {"id": "qwen-plus", "modalities": []},
+                {"id": "sora-user-choice", "modalities": ["audio"]},
+                {"id": "gpt-5-mini", "modalities": ["text"]},
+            ]
+        },
+    )
+    assert updated.status_code == 200, updated.text
+    types = {model["id"]: model["modalities"] for model in updated.json()["models"]}
+    assert types == {
+        "gpt-5-mini": ["text"],
+        "gpt-image-2": ["image"],
+        "grok-imagine-1.0": ["image"],
+        "qwen-plus": ["text"],
+        "seedance-image": ["video"],
+        "sora-user-choice": ["audio"],
+        "voice-image": ["audio"],
+    }
+
+    removed = client.patch(
+        f"/api/providers/{provider_id}/models",
+        json={"removed_model_ids": ["gpt-5-mini"]},
+    )
+    assert removed.status_code == 200, removed.text
+    assert "gpt-5-mini" not in {model["id"] for model in removed.json()["models"]}
+    assert client.get(f"/api/providers/{provider_id}").json()["text_model"] == ""
+
+    defaults = client.put(
+        "/api/provider-defaults",
+        json={"text": {"provider_profile_id": provider_id, "model": "qwen-plus"}},
+    )
+    assert defaults.status_code == 200, defaults.text
+    default_delete = client.patch(
+        f"/api/providers/{provider_id}/models",
+        json={"removed_model_ids": ["qwen-plus"]},
+    )
+    assert default_delete.status_code == 200, default_delete.text
+    assert default_delete.json()["cleared_default_routes"] == ["text"]
+    assert "qwen-plus" not in {model["id"] for model in default_delete.json()["models"]}
+
+    restored = client.patch(
+        f"/api/providers/{provider_id}/models",
+        json={"models": [{"id": "qwen-plus", "modalities": ["text"]}]},
+    )
+    assert restored.status_code == 200, restored.text
+    reset_default = client.put(
+        "/api/provider-defaults",
+        json={"text": {"provider_profile_id": provider_id, "model": "qwen-plus"}},
+    )
+    assert reset_default.status_code == 200, reset_default.text
+    default_type = client.patch(
+        f"/api/providers/{provider_id}/models",
+        json={"models": [{"id": "qwen-plus", "modalities": ["video"]}]},
+    )
+    assert default_type.status_code == 200, default_type.text
+    assert default_type.json()["cleared_default_routes"] == ["text"]
+    assert client.get("/api/provider-defaults").json()["text"] is None
+
+
+def test_explicit_provider_without_model_does_not_use_legacy_profile_default(
+    client: TestClient,
+    project_root: Any,
+) -> None:
+    project = create_project(client, project_root)
+    asset = create_asset(client, project["id"], key="item.no-implicit-model")
+    provider = create_provider(
+        client,
+        "No implicit model",
+        text_model="legacy-text",
+        image_model="legacy-image",
+    )
+    response = client.post(
+        "/api/generation-plans",
+        json={
+            "project_id": project["id"],
+            "provider_profile_id": provider["id"],
+            "tasks": [text_task("no-model", asset["id"])],
+        },
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"] == "task no-model requires a provider model"
+
+
+def test_direct_browser_model_confirmation_persists_catalog_without_contacting_provider(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = create_provider(
+        client,
+        "Direct catalog",
+        text_model="direct-text",
+        image_model="direct-image",
+    )
+
+    def should_not_build_provider(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("direct browser catalog persistence must not call a provider adapter")
+
+    monkeypatch.setattr(api_module, "build_provider", should_not_build_provider)
+    synced = client.patch(
+        f"/api/providers/{provider['id']}/models",
+        json={
+            "models": [
+                {
+                    "id": "browser-text",
+                    "modalities": ["text"],
+                    "classification": "provider",
+                    "available": True,
+                    "enabled": True,
+                },
+                {
+                    "id": "browser-image",
+                    "modalities": ["image"],
+                    "classification": "heuristic",
+                    "available": True,
+                    "enabled": True,
+                },
+            ],
+            "catalog_refreshed": True,
+            "request_id": "browser-request-1",
+        },
+    )
+    assert synced.status_code == 200, synced.text
+    assert synced.json()["new_model_ids"] == ["browser-image", "browser-text"]
+    assert {model["id"] for model in synced.json()["models"]} >= {
+        "browser-text",
+        "browser-image",
+    }
+    assert synced.json()["models_sync"]["endpoint"].endswith("/models")
+    assert synced.json()["models_sync"]["request_id"] == "browser-request-1"
+    by_id = {model["id"]: model for model in synced.json()["models"]}
+    assert by_id["browser-text"]["classification"] == "provider"
+    assert by_id["browser-text"]["available"] is True
+
+
+def test_model_refresh_404_keeps_cache_and_real_errors_include_safe_diagnostics(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = create_provider(
+        client,
+        "Manual catalog",
+        text_model="manual-text",
+        image_model="manual-image",
+    )
+    before = client.get(f"/api/providers/{provider['id']}/models").json()
+
+    class BrokenCatalog:
+        error: ProviderError | None = ProviderError(
+            "catalog endpoint not supported",
+            ErrorCategory.VALIDATION,
+            status_code=404,
+            endpoint="https://provider.example/v1/models",
+            request_id="request-404",
+            hint="手动登记模型",
+        )
+
+        async def discover_models(self) -> list[dict[str, Any]]:
+            assert self.error is not None
+            raise self.error
+
+    catalog = BrokenCatalog()
+    monkeypatch.setattr(api_module, "build_provider", lambda _profile, _vault: catalog)
+    manual = client.post(f"/api/providers/{provider['id']}/models/refresh")
+    assert manual.status_code == 200, manual.text
+    assert manual.json()["models"] == before["models"]
+    assert manual.json()["refreshed_at"] == before["refreshed_at"]
+    assert manual.json()["models_sync"] == {
+        "state": "manual_required",
+        "checked_at": manual.json()["models_sync"]["checked_at"],
+        "endpoint": "https://provider.example/v1/models",
+        "status_code": 404,
+        "message": "供应商未提供可用的模型列表接口。",
+        "hint": "连接仍可使用；请在模型目录中手动登记模型 ID。",
+        "request_id": "request-404",
+    }
+
+    catalog.error = ProviderError(
+        "provider returned HTTP 401",
+        ErrorCategory.AUTH,
+        status_code=401,
+        endpoint="https://provider.example/v1/models",
+        request_id="request-401",
+        hint="检查 API Key",
+    )
+    failed = client.post(f"/api/providers/{provider['id']}/models/refresh")
+    assert failed.status_code == 401
+    detail = failed.json()["detail"]
+    assert detail == {
+        "category": "auth",
+        "message": "provider returned HTTP 401",
+        "status_code": 401,
+        "endpoint": "https://provider.example/v1/models",
+        "request_id": "request-401",
+        "hint": "检查 API Key",
+    }
+    assert "sk-" not in failed.text
+    after = client.get(f"/api/providers/{provider['id']}/models").json()
+    assert after["models"] == before["models"]
+    assert after["models_sync"]["state"] == "error"
+
+
+def test_legacy_model_cache_without_enabled_defaults_to_enabled(client: TestClient) -> None:
+    provider = create_provider(
+        client,
+        "Legacy catalog",
+        text_model="legacy-text",
+        image_model="legacy-image",
+    )
+    with client.app.state.database.sessions() as session:
+        from game_assets_api.models import ProviderProfile
+
+        profile = session.get(ProviderProfile, provider["id"])
+        assert profile is not None
+        profile.models_json = [{
+            "id": "legacy-text",
+            "modalities": ["text"],
+            "classification": "manual",
+            "available": True,
+        }]
+        session.commit()
+
+    models = client.get(f"/api/providers/{provider['id']}/models")
+    assert models.status_code == 200
+    assert models.json()["models"] == [{
+        "id": "legacy-text",
+        "modalities": ["text"],
+        "classification": "manual",
+        "available": True,
+        "enabled": True,
+    }]
 
 
 def test_task_routes_costs_and_provider_configuration_freeze_at_confirmation(
@@ -254,7 +666,7 @@ def test_task_routes_costs_and_provider_configuration_freeze_at_confirmation(
     )
     assert plan_response.status_code == 201, plan_response.text
     plan = plan_response.json()
-    assert plan["estimated_cost"] == pytest.approx(1.7)
+    assert plan["estimated_cost"] is None
     assert [
         (task["provider_profile_id"], task["model"])
         for task in plan["tasks"]
@@ -281,7 +693,8 @@ def test_task_routes_costs_and_provider_configuration_freeze_at_confirmation(
     ]
     alpha_snapshot = next(job["provider_snapshot"] for job in jobs if job["task_id"] == "write")
     assert alpha_snapshot["concurrency"] == 1
-    assert alpha_snapshot["pricing"]["text_call"] == 0.2
+    assert alpha_snapshot["runtime_policy_version"] == 2
+    assert alpha_snapshot["pricing"] is None
 
     client.patch(
         f"/api/providers/{alpha['id']}",
@@ -508,7 +921,7 @@ class SlowProvider:
         return await self.delegate.test_connection()
 
 
-def test_plan_and_each_provider_apply_independent_concurrency_limits(
+def test_new_plans_use_plan_concurrency_without_hidden_provider_limits(
     client: TestClient,
     project_root: Any,
     monkeypatch: pytest.MonkeyPatch,
@@ -564,4 +977,4 @@ def test_plan_and_each_provider_apply_independent_concurrency_limits(
 
     assert {job["status"] for job in finished} == {"candidate_ready"}
     assert tracker.max_active == 3
-    assert tracker.max_by_provider == {alpha["id"]: 1, beta["id"]: 2}
+    assert tracker.max_by_provider == {alpha["id"]: 3, beta["id"]: 3}

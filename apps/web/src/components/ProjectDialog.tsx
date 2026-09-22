@@ -2,6 +2,7 @@ import { type FormEvent, useEffect, useRef, useState } from "react";
 import { CheckCircle, FolderSimplePlus, Info, PencilSimple, Plus, X } from "@phosphor-icons/react";
 import { createProject, fetchSystemInfo, updateProject } from "../lib/api";
 import type { ProjectSummary } from "../types";
+import { SelectMenu } from "./SelectMenu";
 
 interface ProjectDialogProps {
   open: boolean;
@@ -162,12 +163,18 @@ export function ProjectDialog({ open, project = null, onClose, onSaved }: Projec
               {!editing && (
                 <label className="project-field">
                   <span>默认语言</span>
-                  <select value={defaultLanguage} onChange={(event) => setDefaultLanguage(event.target.value)} disabled={busy}>
-                    <option value="zh-CN">简体中文</option>
-                    <option value="zh-TW">繁体中文</option>
-                    <option value="en-US">English</option>
-                    <option value="ja-JP">日本語</option>
-                  </select>
+                  <SelectMenu
+                    ariaLabel="默认语言"
+                    value={defaultLanguage}
+                    onChange={setDefaultLanguage}
+                    disabled={busy}
+                    options={[
+                      { value: "zh-CN", label: "简体中文" },
+                      { value: "zh-TW", label: "繁体中文" },
+                      { value: "en-US", label: "English" },
+                      { value: "ja-JP", label: "日本語" },
+                    ]}
+                  />
                 </label>
               )}
             </div>

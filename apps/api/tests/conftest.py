@@ -76,4 +76,23 @@ def create_fake_provider(client: TestClient) -> dict:
         },
     )
     assert response.status_code == 201, response.text
-    return response.json()
+    provider = response.json()
+    catalog = client.patch(
+        f"/api/providers/{provider['id']}/models",
+        json={
+            "models": [
+                {"id": "fake-text", "modalities": ["text"]},
+                {"id": "fake-image", "modalities": ["image"]},
+            ]
+        },
+    )
+    assert catalog.status_code == 200, catalog.text
+    defaults = client.put(
+        "/api/provider-defaults",
+        json={
+            "text": {"provider_profile_id": provider["id"], "model": "fake-text"},
+            "image": {"provider_profile_id": provider["id"], "model": "fake-image"},
+        },
+    )
+    assert defaults.status_code == 200, defaults.text
+    return client.get(f"/api/providers/{provider['id']}").json()

@@ -12,6 +12,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from .api import router
 from .codex_adapter import build_codex_adapter
 from .database import Database
+from .generation_planning import GenerationPlanningRunner
 from .providers import CredentialVault
 from .runner import JobRunner
 from .services import ServiceError, discover_projects
@@ -25,7 +26,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     runner = JobRunner(database.sessions, vault, settings)
     codex_adapter = build_codex_adapter(
         settings.codex_command,
+        codex_bin=settings.codex_bin,
         timeout_seconds=settings.codex_timeout_seconds,
+    )
+    generation_planning_runner = GenerationPlanningRunner(
+        database.sessions,
+        codex_adapter,  # planning and diagnosis share the isolated adapter boundary
+        settings,
     )
 
     @asynccontextmanager
@@ -33,11 +40,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         database.create_schema()
         with database.sessions() as session:
             discover_projects(session, settings.projects_root, scan=True)
+        codex_start = getattr(codex_adapter, "start", None)
+        if codex_start is not None:
+            await codex_start()
+        await generation_planning_runner.start()
         await runner.start()
         try:
             yield
         finally:
             await runner.stop()
+            await generation_planning_runner.stop()
+            codex_close = getattr(codex_adapter, "close", None)
+            if codex_close is not None:
+                await codex_close()
             vault.clear()
 
     app = FastAPI(
@@ -52,6 +67,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.vault = vault
     app.state.runner = runner
     app.state.codex_adapter = codex_adapter
+    app.state.generation_planning_runner = generation_planning_runner
+    # Short alias retained for integrations/tests that refer to the feature as
+    # a planning runner rather than the full state attribute name.
+    app.state.planning_runner = generation_planning_runner
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
@@ -69,7 +88,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         response = await call_next(request)
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
-            "img-src 'self' data: blob:; connect-src 'self'; font-src 'self'; "
+            "img-src 'self' data: blob:; connect-src 'self' https: http:; font-src 'self'; "
             "object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
         )
         response.headers["X-Content-Type-Options"] = "nosniff"

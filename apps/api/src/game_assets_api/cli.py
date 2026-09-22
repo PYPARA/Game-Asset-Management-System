@@ -24,7 +24,12 @@ from .settings import Settings
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="gams", description="Game Asset Management System")
     subcommands = parser.add_subparsers(dest="command")
-    subcommands.add_parser("serve", help="start the local API and workbench")
+    serve = subcommands.add_parser("serve", help="start the local API and workbench")
+    serve.add_argument(
+        "--reload",
+        action="store_true",
+        help="restart the development API when Python files change",
+    )
     run = subcommands.add_parser("run", help="inspect or safely resume a production run")
     run_commands = run.add_subparsers(dest="run_command", required=True)
     inspect = run_commands.add_parser("inspect", help="show persisted run state and evidence")
@@ -146,7 +151,8 @@ def _resume(settings: Settings, plan_id: str, *, as_json: bool) -> int:
             profile.id
             for profile in session.scalars(
                 select(ProviderProfile).where(
-                    ProviderProfile.kind == ProviderKind.FAKE.value
+                    (ProviderProfile.kind == ProviderKind.FAKE.value)
+                    | ProviderProfile.credential_mode.in_(("optional", "none"))
                 )
             ).all()
         }
@@ -192,13 +198,13 @@ def _diagnose(settings: Settings, job_id: str, *, as_json: bool) -> int:
     return 0 if payload["status"] == "completed" else 2
 
 
-def _serve(settings: Settings) -> int:
+def _serve(settings: Settings, *, reload: bool = False) -> int:
     uvicorn.run(
         "game_assets_api.main:app",
         host=settings.host,
         port=settings.port,
         log_level=settings.log_level,
-        reload=False,
+        reload=reload,
         access_log=True,
     )
     return 0
@@ -357,7 +363,7 @@ def main(argv: list[str] | None = None) -> None:
     arguments = _parser().parse_args(argv)
     settings = Settings()
     if arguments.command in {None, "serve"}:
-        raise SystemExit(_serve(settings))
+        raise SystemExit(_serve(settings, reload=bool(getattr(arguments, "reload", False))))
     if arguments.command == "run" and arguments.run_command == "inspect":
         raise SystemExit(_inspect(settings, arguments.plan_id, as_json=arguments.as_json))
     if arguments.command == "run" and arguments.run_command == "resume":

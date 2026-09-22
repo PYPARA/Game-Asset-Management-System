@@ -77,11 +77,36 @@ def create_provider(
         },
     )
     assert response.status_code == 201, response.text
-    return response.json()
+    provider = response.json()
+    catalog = client.patch(
+        f"/api/providers/{provider['id']}/models",
+        json={
+            "models": [
+                {"id": "fake-text", "modalities": ["text"]},
+                {"id": "fake-image", "modalities": ["image"]},
+            ]
+        },
+    )
+    assert catalog.status_code == 200, catalog.text
+    defaults = client.put(
+        "/api/provider-defaults",
+        json={
+            "text": {"provider_profile_id": provider["id"], "model": "fake-text"},
+            "image": {"provider_profile_id": provider["id"], "model": "fake-image"},
+        },
+    )
+    assert defaults.status_code == 200, defaults.text
+    return client.get(f"/api/providers/{provider['id']}").json()
 
 
-def text_task(task_id: str, asset_id: str, *, prompt: str | None = None) -> dict[str, Any]:
-    return {
+def text_task(
+    task_id: str,
+    asset_id: str,
+    *,
+    prompt: str | None = None,
+    model: str | None = None,
+) -> dict[str, Any]:
+    task: dict[str, Any] = {
         "id": task_id,
         "kind": "text",
         "asset_id": asset_id,
@@ -93,6 +118,9 @@ def text_task(task_id: str, asset_id: str, *, prompt: str | None = None) -> dict
             "additionalProperties": False,
         },
     }
+    if model is not None:
+        task["model"] = model
+    return task
 
 
 class ConcurrencyTracker:
@@ -297,7 +325,7 @@ def test_dag_injects_real_upstream_output_and_run_apis_are_cursor_based(
     assert plan_response.status_code == 201, plan_response.text
     plan = plan_response.json()
     assert plan["estimated_calls"] == 2
-    assert plan["estimated_cost"] == 0.5
+    assert plan["estimated_cost"] is None
     assert plan["suggested_extra_calls"] == 2
     assert plan["extra_call_budget"] == 1
 
@@ -971,12 +999,18 @@ def test_locked_provider_job_resume_stays_fail_closed(
         },
     )
     assert provider_response.status_code == 201, provider_response.text
+    provider_id = provider_response.json()["id"]
+    catalog = client.patch(
+        f"/api/providers/{provider_id}/models",
+        json={"models": [{"id": "text-model", "modalities": ["text"]}]},
+    )
+    assert catalog.status_code == 200, catalog.text
     plan = client.post(
         "/api/generation-plans",
         json={
             "project_id": project["id"],
-            "provider_profile_id": provider_response.json()["id"],
-            "tasks": [text_task("locked", asset["id"])],
+            "provider_profile_id": provider_id,
+            "tasks": [text_task("locked", asset["id"], model="text-model")],
         },
     ).json()
     job = client.post(f"/api/generation-plans/{plan['id']}/confirm").json()[0]
@@ -1136,7 +1170,7 @@ def test_legacy_sqlite_schema_upgrades_without_reset(tmp_path: Path) -> None:
     assert {"run_events", "production_findings", "run_evidence", "remediation_actions"} <= tables
     assert "ix_generation_jobs_lease_expires_at" in indexes
     assert legacy == ("未命名生成计划", 2, 0)
-    assert defaults == ("provider-legacy", "legacy-text", "provider-legacy", "legacy-image")
+    assert defaults == (None, None, None, None)
 
 
 def test_gams_cli_inspects_and_safely_resumes_run(

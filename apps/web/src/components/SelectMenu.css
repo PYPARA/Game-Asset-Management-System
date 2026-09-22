@@ -1,0 +1,174 @@
+.select-menu {
+  position: relative;
+  display: inline-flex;
+  min-width: 0;
+  max-width: 100%;
+  vertical-align: middle;
+}
+
+.select-menu-trigger {
+  display: inline-flex;
+  min-width: 0;
+  width: 100%;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 6px;
+  min-height: 32px;
+  padding: 0 7px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-soft, #c2bdb4);
+  font-size: 11px;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.select-menu-trigger:hover:not(:disabled) {
+  background: rgb(255 255 255 / 4%);
+  color: var(--text, #e6e1d8);
+}
+
+.select-menu-trigger:focus-visible {
+  outline: 2px solid var(--focus, #d9a29d);
+  outline-offset: -2px;
+}
+
+.select-menu-trigger:disabled {
+  cursor: not-allowed;
+  opacity: .55;
+}
+
+.select-menu-leading {
+  display: inline-flex;
+  flex: 0 0 auto;
+  color: var(--muted, #928e86);
+}
+
+.select-menu-value {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.select-menu-chevron {
+  flex: 0 0 auto;
+  margin-left: auto;
+  color: var(--muted, #928e86);
+  transition: transform 140ms ease;
+}
+
+.select-menu-trigger[aria-expanded="true"] .select-menu-chevron {
+  transform: rotate(180deg);
+  color: var(--text-soft, #c2bdb4);
+}
+
+.select-menu-list {
+  position: absolute;
+  z-index: 80;
+  top: calc(100% + 5px);
+  left: 0;
+  min-width: max(100%, 144px);
+  max-height: min(320px, 46vh);
+  overflow: auto;
+  padding: 4px;
+  border: 1px solid #4a443d;
+  border-radius: 6px;
+  background: #1d1c19;
+  box-shadow: 0 14px 32px rgb(0 0 0 / 42%);
+}
+
+.select-menu-option {
+  display: flex;
+  min-height: 30px;
+  align-items: center;
+  padding: 0 9px;
+  border-radius: 4px;
+  color: var(--text-soft, #c2bdb4);
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1.3;
+  white-space: nowrap;
+}
+
+.select-menu-option:hover,
+.select-menu-option.highlighted {
+  background: #39201d;
+  color: #f1d7d2;
+}
+
+.select-menu-option[aria-selected="true"] {
+  color: #e39a90;
+  font-weight: 650;
+}
+
+.select-menu-option.disabled {
+  cursor: not-allowed;
+  opacity: .45;
+}
+
+.multi-select-trigger .select-menu-value.placeholder {
+  color: var(--muted, #928e86);
+}
+
+.multi-select-option {
+  gap: 7px;
+}
+
+.multi-select-check {
+  display: inline-flex;
+  width: 15px;
+  flex: 0 0 15px;
+  align-items: center;
+  justify-content: center;
+  color: #e39a90;
+}
+
+.multi-select-option[aria-selected="true"] {
+  color: #e39a90;
+  font-weight: 650;
+}
+
+/* Toolbar sizing keeps the compact workbench density from changing. */
+.select-control .select-menu { flex: 1 1 auto; min-width: 0; }
+.select-control .select-menu-trigger { min-height: 32px; }
+.asset-type-filter .select-menu { max-width: 112px; }
+.sort-control .select-menu { max-width: 90px; }
+.sort-control .select-menu-list { right: 0; left: auto; }
+.scene-filter-control .select-menu { min-width: 78px; }
+
+/* Form variants use the same menu behavior but inherit the field dimensions
+   from their surrounding drawer. */
+.channel-form-grid .select-menu,
+.channel-advanced-grid .select-menu,
+.production-field .select-menu {
+  display: flex;
+  width: 100%;
+  max-width: none;
+}
+
+.channel-form-grid .select-menu-trigger,
+.channel-advanced-grid .select-menu-trigger,
+.production-field .select-menu-trigger {
+  min-height: 34px;
+  padding: 0 9px;
+  border: 1px solid #3a3833;
+  border-radius: 4px;
+  background: #10100f;
+  color: var(--text, #e6e1d8);
+  font-size: 10px;
+}
+
+.channel-form-grid .select-menu-trigger:hover:not(:disabled),
+.channel-advanced-grid .select-menu-trigger:hover:not(:disabled),
+.production-field .select-menu-trigger:hover:not(:disabled) {
+  background: #171714;
+}
+
+.channel-form-grid .select-menu-trigger:focus-visible,
+.channel-advanced-grid .select-menu-trigger:focus-visible,
+.production-field .select-menu-trigger:focus-visible {
+  outline-offset: 0;
+  border-color: #8b4b42;
+  box-shadow: 0 0 0 2px rgb(139 75 66 / 13%);
+}

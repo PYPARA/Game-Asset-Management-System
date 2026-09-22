@@ -9,6 +9,7 @@ dependencies = [
   "fastapi>=0.116,<1",
   "httpx>=0.28,<1",
   "jsonschema>=4.23,<5",
+  "openai-codex==0.144.4",
   "pillow>=11.2,<12",
   "pydantic-settings>=2.9,<3",
   "pyyaml>=6.0,<7",

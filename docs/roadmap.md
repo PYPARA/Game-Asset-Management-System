@@ -1,7 +1,7 @@
 # GAMS 路线图
 
 > 文档状态：已确认的目标计划
-> 当前验收日期：2026-07-31
+> 当前验收日期：2026-08-06
 > 本文同时记录“当前能力”和“目标能力”。只有带“已完成”验收记录的里程碑属于当前能力；其余目标不得理解为已经实现。
 
 ## 产品方向
@@ -17,7 +17,7 @@ GAMS 的 v1 目标不是单纯调用图片供应商，而是建立一条可恢�
 
 ## 当前基线
 
-当前系统处于“M6 v1 发布候选验收已接通；游戏 checkout 的既有 E2E 文案断言待维护者修正”的阶段。下面是截至 2026-07-31 从代码和验收记录确认的状态。
+当前系统处于“M7 v1.1 叙事地图已接通；游戏 checkout 的既有 E2E 文案断言待维护者修正”的阶段。下面是截至 2026-08-06 从代码和验收记录确认的状态。
 
 | 能力 | 当前状态 | 说明 |
 |---|---|---|
@@ -34,7 +34,7 @@ GAMS 的 v1 目标不是单纯调用图片供应商，而是建立一条可恢�
 | Codex 监督 Agent | 已实现 M4 | 通过隔离 stdio 适配层生成只读上下文和结构化 Finding；AgentSession/AgentEvent 可审计，固定动作交回 Controller，越权代码/文档修改只形成待批准 ChangeSet，失败统一人工降级。 |
 | Emperor 试点 | 已实现 M5（游戏 E2E 待修） | 五项真实资产 replay、旧媒体内容寻址升级、Artifact/Finding/Action/Evidence 链、媒体基线 Release v2、隔离 checkout Delivery 和 `gams-lock.json` 已接通；`pnpm check`/`pnpm build` 通过，既有 E2E 测试仍寻找已改名的开始按钮。 |
 | v1 发布验收 | 已实现 M6（真实供应商 run 可选） | `gams acceptance m6`/`scripts/m6_acceptance.py` 提供 OpenAI-compatible 成功与故障矩阵、并发、磁盘不足、Delivery 中断、SQLite 删除重建和格式边界演练；用户操作、故障和升级手册已补齐。真实供应商连通性需显式提供 URL/API Key，Emperor E2E 文案阻塞仍由游戏仓库维护者处理。 |
-| 叙事地图 | 未开始 | 类型化关系模型已具备，UI 安排在 v1.1。 |
+| 叙事地图与项目规范 | 已实现 M7 后续 | 章节树、场景候选编辑、关系画布、覆盖率、缺失资产规划，以及可见可编辑的风格圣经/Prompt 配方已接通；缺失项仍物化为普通 Catalog Asset 后进入现有 M2–M4 闭环。 |
 
 历史验收快照记录了前端 25 项测试、API 23 项测试和 Emperor Project 扫描通过；这些数字属于 [设计 QA 基线](../design-qa.md)，不是持续监控结果。当前 M0–M6 验收结果见下方带日期的记录。
 
@@ -142,7 +142,7 @@ M1 已满足 M2 和 M3 的共同事实源前置条件。M4 必须建立在 M2.1 
 - 自动化验证覆盖删除 workspace、使用全新 SQLite 重建、批准失效、QA fail、大小写路径碰撞、来源/运行 Blob 缺失或损坏，以及批准/Release 文件故障注入回滚。
 - 前端测试 28 项、API 测试 30 项全部通过；生产构建和 Python 编译检查通过。
 - 真实 `Emperor-Simulator` Project 兼容扫描通过：1,144 个资产、1,144 个修订、189 个 rendition、1 个历史 Release，0 个扫描错误。
-- 浏览器回归通过：1,144 个资产的分类计数与 186 项 2D 媒体可见，当前 1920×1080 已批准预览和固定任务栏正常加载，控制台无 warning/error。
+- 浏览器回归通过：1,144 个资产的分类计数与 186 项媒体资产可见（历史验收记录），当时 1920×1080 已批准预览和固定任务栏正常加载，控制台无 warning/error。
 - 该次 M1 验收时 Release 仍使用 v1 Manifest，生产 Controller 与外部 Delivery 分别留给 M2/M3；其中 M2 现已完成，Manifest v2、snapshot hash 与外部 Delivery 仍由 M3 负责。
 
 ### M2：确定性生产闭环
@@ -326,6 +326,24 @@ M1 已满足 M2 和 M3 的共同事实源前置条件。M4 必须建立在 M2.1 
 - 叙事地图生成的生产计划使用同一 M2–M4 闭环。
 - 不为 UI 功能引入第二套资产身份或发布语义。
 
+#### M7 验收记录（2026-08-06）
+
+状态：已完成。
+
+- 新增 Project 事实聚合的叙事地图 API，支持章节/故事弧、场景/事件、`contains`、`node_keys`、参与角色、引用、rendition 和覆盖状态；SQLite 删除后仍可由现有 Project 文件重建。
+- Web 以 `reference-narrative-atlas.png` 为三栏布局与信息结构基准，并继承 `reference-workbench.png` 的炭灰色主题，包含章节树、场景案卷、类型化关系画布、覆盖盘点、场景候选编辑与缺失资产生产方案。
+- 场景保存继续调用普通不可变 Revision；缺失需求只会创建普通 Catalog Asset，随后打开现有生成计划编辑器执行供应商/模型、DAG、预算、QA 与审核确认。Project `format_version`、Artifact、Review、Release 与 Delivery 契约未改变。
+- Web 58 项测试、API 79 项测试、前端生产构建、Python 编译和 `git diff --check` 通过。真实 Emperor Simulator 聚合出 88 个章节、675 个场景；1488×1057 应用内浏览器检查无 body overflow、无控制台 warning/error，设计 QA 最终通过。详细记录见 [M7 v1.1 叙事地图验收](m7-narrative-map.md)。
+
+#### M7 后续验收记录（2026-08-06）
+
+状态：已完成。
+
+- 扫描 `production/style-bible.md` 与 `production/prompt-recipes/emperor-primary.json`，登记 `design.style_bible.primary` 和 `production.prompt_recipe.emperor_primary`；首次导入为已批准基线，真实 Project 总资产为 1,146，重复扫描保持幂等。
+- 项目规范编辑遵循“候选 → 人工批准 → 原子写回”流程；源哈希漂移生成唯一候选，驳回不写源文件，缺失保留最后批准版本，`production/style-bible.json` 只作为批准时生成的 profile。
+- 资产库移除同级媒体总入口，媒体改为互斥叶子视图；场景视图复用叙事地图集合，真实结果为 675（510 已入章 / 165 未分章），支持章节归属和覆盖筛选及双向定位。
+- 新增项目规范 Markdown 安全预览、Prompt JSON 文档模式、筛选后检查器同步与 revision format 判断；Web/API 回归、构建、Python 编译和 `git diff --check` 作为同一验收门禁。
+
 ## 公共能力状态
 
 当前已经实现：
@@ -336,6 +354,7 @@ M1 已满足 M2 和 M3 的共同事实源前置条件。M4 必须建立在 M2.1 
 - Release v1 的 fail-closed 创建 API；M3 的 Manifest v2、Delivery API/UI、CLI 和可重建收据。
 - M5 的旧媒体升级 API、显式 Release 资产子集、Emperor replay/证据脚本和失败可审计的 Delivery 报告。
 - M6 的 `gams acceptance m6`/`scripts/m6_acceptance.py` 验收收据、供应商故障矩阵、恢复演练和 v1 操作/升级手册。
+- M7 的章节树、场景候选编辑、类型化关系画布、资产覆盖与缺失资产规划；规划复用现有生成计划闭环。
 
 仍属于后续目标：
 

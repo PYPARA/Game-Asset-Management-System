@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from datetime import datetime
 from enum import StrEnum
@@ -72,6 +73,17 @@ class ProviderKind(StrEnum):
     FAKE = "fake"
 
 
+class ProviderCredentialMode(StrEnum):
+    REQUIRED = "required"
+    OPTIONAL = "optional"
+    NONE = "none"
+
+
+class ProviderModelDiscoveryMode(StrEnum):
+    AUTO = "auto"
+    MANUAL = "manual"
+
+
 class TaskKind(StrEnum):
     TEXT = "text"
     IMAGE = "image"
@@ -135,6 +147,7 @@ class AgentSessionStatus(StrEnum):
     RUNNING = "running"
     COMPLETED = "completed"
     AWAITING_USER = "awaiting_user"
+    AWAITING_INPUT = "awaiting_input"
     FAILED = "failed"
     UNAVAILABLE = "unavailable"
 
@@ -269,6 +282,12 @@ class RelationRead(ORMModel):
     created_at: datetime
 
 
+class NarrativeRequirementMaterialize(BaseModel):
+    """Select scene requirements to promote into ordinary Catalog assets."""
+
+    requirement_ids: list[str] = Field(default_factory=list, max_length=500)
+
+
 class RenditionRead(ORMModel):
     id: str
     revision_id: str
@@ -305,13 +324,19 @@ class ProviderCreate(BaseModel):
     name: str = Field(min_length=1, max_length=160)
     kind: ProviderKind = ProviderKind.OPENAI_COMPATIBLE
     base_url: str = "https://api.openai.com/v1"
-    text_model: str = Field(default="gpt-5.1", min_length=1, max_length=160)
-    image_model: str = Field(default="gpt-image-2", min_length=1, max_length=160)
+    # Legacy compatibility fields. New provider profiles do not carry an
+    # implicit model route; model selection lives in the explicit catalog and
+    # global routing defaults.
+    text_model: str = Field(default="", max_length=160)
+    image_model: str = Field(default="", max_length=160)
     quality: str = "high"
     concurrency: int = Field(default=6, ge=1, le=32)
     max_retries: int = Field(default=2, ge=0, le=8)
     allow_private_network: bool = False
     pricing: dict[str, Any] | None = None
+    credential_mode: ProviderCredentialMode = ProviderCredentialMode.REQUIRED
+    model_discovery_mode: ProviderModelDiscoveryMode = ProviderModelDiscoveryMode.AUTO
+    models_path: str | None = Field(default="models", max_length=240)
 
 
 class ProviderUpdate(BaseModel):
@@ -324,28 +349,56 @@ class ProviderUpdate(BaseModel):
     max_retries: int | None = Field(default=None, ge=0, le=8)
     allow_private_network: bool | None = None
     pricing: dict[str, Any] | None = None
+    credential_mode: ProviderCredentialMode | None = None
+    model_discovery_mode: ProviderModelDiscoveryMode | None = None
+    models_path: str | None = Field(default=None, max_length=240)
 
 
 class ProviderModelRead(BaseModel):
     id: str
-    modalities: list[Literal["text", "image"]] = Field(default_factory=list)
+    modalities: list[Literal["text", "image", "video", "audio"]] = Field(default_factory=list)
     classification: Literal["provider", "heuristic", "manual", "unknown"] = "unknown"
     available: bool = True
+    enabled: bool = True
+
+
+class ProviderModelsSyncRead(BaseModel):
+    state: Literal["never", "synced", "empty", "manual_required", "error"] = "never"
+    checked_at: datetime | None = None
+    endpoint: str | None = None
+    status_code: int | None = None
+    message: str | None = None
+    hint: str | None = None
+    request_id: str | None = None
 
 
 class ProviderModelsRead(BaseModel):
     provider_profile_id: str
     models: list[ProviderModelRead] = Field(default_factory=list)
     refreshed_at: datetime | None = None
+    new_model_ids: list[str] = Field(default_factory=list)
+    cleared_default_routes: list[Literal["text", "image", "video", "audio"]] = Field(
+        default_factory=list
+    )
+    model_catalog_api_version: Literal[2] = 2
+    models_sync: ProviderModelsSyncRead = Field(default_factory=ProviderModelsSyncRead)
 
 
 class ProviderModelOverride(BaseModel):
     id: str = Field(min_length=1, max_length=240)
-    modalities: list[Literal["text", "image"]] = Field(default_factory=list)
+    modalities: list[Literal["text", "image", "video", "audio"]] = Field(default_factory=list)
+    classification: Literal["provider", "heuristic", "manual", "unknown"] | None = None
+    available: bool | None = None
+    enabled: bool | None = None
 
 
 class ProviderModelsUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     models: list[ProviderModelOverride] = Field(default_factory=list)
+    removed_model_ids: list[str] = Field(default_factory=list)
+    catalog_refreshed: bool = False
+    request_id: str | None = Field(default=None, max_length=240)
 
 
 class ProviderDefaultRoute(BaseModel):
@@ -356,11 +409,19 @@ class ProviderDefaultRoute(BaseModel):
 class ProviderDefaultsUpdate(BaseModel):
     text: ProviderDefaultRoute | None = None
     image: ProviderDefaultRoute | None = None
+    video: ProviderDefaultRoute | None = None
+    audio: ProviderDefaultRoute | None = None
+    max_concurrency: int = Field(default=3, ge=1, le=32)
+    max_transport_retries: int = Field(default=2, ge=0, le=8)
 
 
 class ProviderDefaultsRead(BaseModel):
     text: ProviderDefaultRoute | None = None
     image: ProviderDefaultRoute | None = None
+    video: ProviderDefaultRoute | None = None
+    audio: ProviderDefaultRoute | None = None
+    max_concurrency: int = 3
+    max_transport_retries: int = 2
     updated_at: datetime | None = None
 
 
@@ -376,11 +437,16 @@ class ProviderRead(ORMModel):
     max_retries: int
     allow_private_network: bool
     pricing: dict[str, Any] | None
+    credential_mode: ProviderCredentialMode = ProviderCredentialMode.REQUIRED
+    model_discovery_mode: ProviderModelDiscoveryMode = ProviderModelDiscoveryMode.AUTO
+    models_path: str | None = None
     is_active: bool = True
     models: list[ProviderModelRead] = Field(
         default_factory=list, validation_alias="models_json"
     )
     models_refreshed_at: datetime | None = None
+    models_sync: ProviderModelsSyncRead = Field(default_factory=ProviderModelsSyncRead)
+    model_catalog_api_version: Literal[2] = 2
     is_unlocked: bool = False
     created_at: datetime
     updated_at: datetime
@@ -421,7 +487,7 @@ class GenerationPlanCreate(BaseModel):
     extra_call_budget: int | None = Field(default=None, ge=0, le=10_000)
     max_paid_remediation_rounds: int = Field(default=2, ge=0, le=20)
     max_transport_retries: int = Field(default=2, ge=0, le=8)
-    max_concurrency: int = Field(default=6, ge=1, le=32)
+    max_concurrency: int = Field(default=3, ge=1, le=32)
 
 
 class GenerationPlanRead(ORMModel):
@@ -572,6 +638,257 @@ class AgentSessionCreate(AgentDiagnoseRequest):
     job_id: str
 
 
+class GenerationConversationCreate(BaseModel):
+    """Create a user-facing, planning-focused Agent session."""
+
+    project_id: str
+    seed_asset_ids: list[str] = Field(default_factory=list, max_length=100)
+    title: str | None = Field(default=None, max_length=200)
+    agent_model: str | None = Field(default=None, max_length=160)
+
+
+class GenerationConversationMessageCreate(BaseModel):
+    content: str = Field(min_length=1, max_length=20_000)
+    context_asset_ids: list[str] = Field(default_factory=list, max_length=100)
+    client_message_id: str | None = Field(default=None, max_length=160)
+
+
+class GenerationConversationSteerCreate(BaseModel):
+    content: str = Field(min_length=1, max_length=20_000)
+
+
+class GenerationInputOption(BaseModel):
+    label: str = Field(min_length=1, max_length=100)
+    description: str = Field(default="", max_length=500)
+
+
+class GenerationInputQuestion(BaseModel):
+    id: str = Field(min_length=1, max_length=100, pattern=STABLE_KEY_RE.pattern)
+    header: str = Field(min_length=1, max_length=80)
+    question: str = Field(min_length=1, max_length=1000)
+    options: list[GenerationInputOption] | None = Field(default=None, max_length=3)
+    isOther: bool = False
+    isSecret: bool = False
+
+
+class GenerationInputRequestRead(BaseModel):
+    id: str
+    turn_id: str
+    response_mode: Literal["resume_turn", "new_turn"]
+    status: Literal["pending", "resolved", "cancelled"]
+    questions: list[GenerationInputQuestion]
+    answers: dict[str, dict[str, list[str]]] = Field(default_factory=dict)
+    auto_resolution_ms: int | None = None
+    fallback_reason: str | None = None
+
+
+class GenerationInputAnswerCreate(BaseModel):
+    client_response_id: str = Field(min_length=1, max_length=160)
+    answers: dict[str, dict[str, list[str]]] = Field(min_length=1, max_length=3)
+
+
+class GenerationInputAnswerRead(BaseModel):
+    request_id: str
+    turn_id: str
+    status: str
+    next_sequence: int
+
+
+class GenerationConversationDraftUpdate(BaseModel):
+    base_hash: str = Field(min_length=8, max_length=128)
+    draft: dict[str, Any]
+
+
+class GenerationConversationConfirm(BaseModel):
+    draft_hash: str = Field(min_length=8, max_length=128)
+    context_hash: str | None = Field(default=None, min_length=8, max_length=128)
+    accepted_warning_codes: list[str] = Field(default_factory=list, max_length=100)
+
+
+class GenerationConversationRead(ORMModel):
+    model_config = ConfigDict(from_attributes=True, use_enum_values=True, populate_by_name=True)
+
+    id: str
+    project_id: str
+    plan_id: str | None
+    thread_id: str | None
+    purpose: str
+    title: str | None
+    agent_model: str | None
+    status: str
+    context_hash: str
+    seed_asset_ids: list[str] = Field(default_factory=list)
+    context: dict[str, Any] = Field(default_factory=dict, validation_alias="context_json")
+    draft: dict[str, Any] = Field(default_factory=dict, validation_alias="draft_json")
+    draft_hash: str | None
+    draft_version: int
+    budget_limit: int
+    budget_used: int
+    turn_count: int
+    diagnostic_reason: str | None
+    stop_reason: str | None
+    usage: dict[str, Any] = Field(default_factory=dict)
+    last_error: dict[str, Any] | None = None
+    pending_input: GenerationInputRequestRead | None = None
+    created_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None
+    archived_at: datetime | None
+
+
+class GenerationConversationSummary(BaseModel):
+    id: str
+    project_id: str
+    plan_id: str | None = None
+    title: str | None = None
+    agent_model: str | None = None
+    status: str
+    turn_count: int = 0
+    budget_limit: int = 0
+    budget_used: int = 0
+    seed_asset_ids: list[str] = Field(default_factory=list)
+    error_summary: dict[str, Any] | None = None
+    created_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None = None
+    archived_at: datetime | None = None
+
+
+class GenerationConversationMessageRead(BaseModel):
+    turn_id: str
+    status: str
+    next_sequence: int = 0
+
+
+class GenerationConversationSettingsUpdate(BaseModel):
+    agent_model: str | None = Field(default=None, max_length=160)
+
+
+class GenerationConversationContextUpdate(BaseModel):
+    seed_asset_ids: list[str] = Field(default_factory=list, max_length=100)
+
+
+class GenerationAgentCapabilitiesRead(BaseModel):
+    available: bool
+    interactive_user_input: bool = False
+    adapter: str
+    version: str
+    models: list[dict[str, Any]] = Field(default_factory=list)
+    diagnostic: dict[str, Any] = Field(default_factory=dict)
+
+
+class GenerationConversationEventRead(ORMModel):
+    sequence: int
+    id: str
+    session_id: str
+    event_type: str
+    thread_id: str | None
+    turn_id: str | None
+    data: dict[str, Any] = Field(default_factory=dict, validation_alias="data_json")
+    created_at: datetime
+
+
+class GenerationConversationConfirmRead(BaseModel):
+    conversation: GenerationConversationRead
+    plan: GenerationPlanRead
+    jobs: list[GenerationJobRead]
+    created_assets: list[AssetRead] = Field(default_factory=list)
+
+
+class GenerationAssetProposal(BaseModel):
+    mode: Literal["existing", "new"] = "existing"
+    asset_id: str | None = None
+    key: str | None = Field(default=None, max_length=240)
+    kind: AssetKind | None = None
+    subtype: str | None = Field(default=None, max_length=80)
+    title: str | None = Field(default=None, max_length=240)
+    schema_ref: str | None = Field(default=None, max_length=240)
+    tags: list[str] = Field(default_factory=list, max_length=50)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class GenerationReferenceProposal(BaseModel):
+    asset_id: str
+    role: Literal["primary", "supporting"] = "supporting"
+    reason: str = Field(default="", max_length=1_000)
+    revision_id: str | None = None
+    rendition_id: str | None = None
+    sha256: str | None = None
+
+
+class GenerationTaskProposal(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str = Field(min_length=1, max_length=160)
+    asset: GenerationAssetProposal
+    kind: TaskKind
+    prompt: str = Field(min_length=1, max_length=20_000)
+    provider_profile_id: str | None = None
+    model: str | None = Field(default=None, max_length=160)
+    output_schema: dict[str, Any] | None = Field(
+        default=None, validation_alias="schema", serialization_alias="schema"
+    )
+    depends_on: list[str] = Field(default_factory=list, max_length=100)
+    width: int | None = Field(default=None, ge=1, le=8192)
+    height: int | None = Field(default=None, ge=1, le=8192)
+    max_bytes: int | None = Field(default=None, ge=1, le=2_000_000_000)
+    transparent: bool = False
+    reference_task_id: str | None = None
+    references: list[GenerationReferenceProposal] = Field(default_factory=list, max_length=20)
+    target_path: str | None = Field(default=None, max_length=1_000)
+    candidate_path: str | None = Field(default=None, max_length=1_000)
+    locked_fields: list[str] = Field(default_factory=list, max_length=100)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class GenerationPlanningWarning(BaseModel):
+    """A user-visible warning that must be explicitly accepted at confirmation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    code: str = Field(min_length=1, max_length=160, pattern=STABLE_KEY_RE.pattern)
+    message: str = Field(min_length=1, max_length=2_000)
+
+
+class GenerationPlanningDraft(BaseModel):
+    version: int = Field(default=1, ge=1, le=10)
+    title: str = Field(default="新资产生成任务", min_length=1, max_length=200)
+    summary: str = Field(default="", max_length=4_000)
+    tasks: list[GenerationTaskProposal] = Field(default_factory=list, max_length=200)
+    questions: list[str] = Field(default_factory=list, max_length=50)
+    assumptions: list[str] = Field(default_factory=list, max_length=100)
+    warnings: list[GenerationPlanningWarning] = Field(default_factory=list, max_length=100)
+    settings: dict[str, Any] = Field(default_factory=dict)
+    context_hash: str | None = None
+
+    @field_validator("warnings", mode="before")
+    @classmethod
+    def normalize_legacy_warnings(cls, value: Any) -> Any:
+        """Keep older/string model output usable without making warnings optional."""
+
+        if not isinstance(value, list):
+            return value
+        normalized: list[Any] = []
+        for item in value:
+            if not isinstance(item, str):
+                normalized.append(item)
+                continue
+            message = " ".join(item.split())
+            if not message:
+                normalized.append(item)
+                continue
+            digest = hashlib.sha256(message.encode("utf-8")).hexdigest()[:12]
+            normalized.append({"code": f"agent_warning_{digest}", "message": message})
+        return normalized
+
+
+# Public planning vocabulary.  Keep the longer internal names for backwards
+# compatibility with the first API implementation, while exposing the concise
+# names used by the conversation contract and by client integrations.
+AssetProposal = GenerationAssetProposal
+ReferenceProposal = GenerationReferenceProposal
+
+
 class AgentProposal(BaseModel):
     """Versioned adapter output. Unknown fields remain auditable but actions do not."""
 
@@ -601,14 +918,20 @@ class AgentSessionRead(ORMModel):
     adapter_version: str | None
     schema_version: int
     status: str
+    purpose: str = "diagnosis"
+    title: str | None = None
     context_hash: str
     context_path: str | None
     context: dict[str, Any] = Field(default_factory=dict, validation_alias="context_json")
+    draft: dict[str, Any] = Field(default_factory=dict, validation_alias="draft_json")
+    draft_hash: str | None = None
+    draft_version: int = 0
     sandbox: dict[str, Any] = Field(default_factory=dict, validation_alias="sandbox_json")
     allowed_actions: list[str] = Field(default_factory=list, validation_alias="allowed_actions_json")
     writable_allowlist: list[str] = Field(default_factory=list, validation_alias="writable_allowlist_json")
     budget_limit: int
     budget_used: int
+    turn_count: int = 0
     diagnostic_reason: str | None
     result: dict[str, Any] = Field(default_factory=dict, validation_alias="result_json")
     stop_reason: str | None

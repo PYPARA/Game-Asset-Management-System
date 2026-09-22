@@ -4,23 +4,32 @@ const kindLabels: Record<AssetKind, string> = {
   content: "叙事内容",
   design: "设计文档",
   entity: "游戏实体",
-  media: "2D 媒体",
+  media: "媒体",
   production: "生产资料",
 };
 
 const subtypeLabels: Record<string, string> = {
+  scene: "场景",
+  story_event: "场景",
+  dialogue_scene: "场景",
   story_arc: "故事弧",
   event: "事件",
   memorial: "奏折",
+  ending: "结局内容",
   character: "角色",
+  location: "地点",
   item: "物品",
   achievement: "成就",
   portrait: "角色立绘",
   background: "场景背景",
   cg: "剧情 CG",
   icon: "物品图标",
+  ending_illustration: "结局插画",
+  ending_illustration_media: "结局插画",
   visual_anchor: "视觉锚点",
   style_bible: "风格圣经",
+  prompt_recipe: "Prompt 配方",
+  action: "游戏设计",
   audio: "音频",
 };
 
@@ -44,7 +53,10 @@ export function assetKindLabel(kind: AssetKind): string {
 }
 
 export function assetSubtypeLabel(kind: AssetKind, subtype: string): string {
-  if (subtype === "ending") return kind === "media" ? "结局图" : "结局内容";
+  if (subtype === "ending") return kind === "media" ? "结局插画" : "结局内容";
+  if (["character_portrait", "character-portrait"].includes(subtype)) return "角色立绘";
+  if (["scene_background", "scene-background"].includes(subtype)) return "场景背景";
+  if (["story_cg", "story-cg"].includes(subtype)) return "剧情 CG";
   return subtypeLabels[subtype] ?? "自定义类型";
 }
 
