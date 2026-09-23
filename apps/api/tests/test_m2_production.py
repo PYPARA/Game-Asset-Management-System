@@ -873,6 +873,7 @@ def test_unknown_delivery_after_restart_requires_explicit_action(tmp_path: Path)
         runner = first_client.app.state.runner
 
         async def never_returns(*_args: Any, **_kwargs: Any) -> ProviderResult:
+            _args[0].on_dispatch("simulated_provider")
             await asyncio.Event().wait()
             raise AssertionError("unreachable")
 
@@ -907,11 +908,18 @@ def test_unknown_delivery_after_restart_requires_explicit_action(tmp_path: Path)
                 "reason": "人工确认未知调用后显式重试",
             },
         )
+        assert retry.status_code == 409, retry.text
+        # An unknown delivery cannot be silently retried. A newly authorized
+        # regeneration is a distinct, budgeted operation.
+        retry = recovered_client.post(f"/api/jobs/{job_id}/remediations", json={
+            "action": "regenerate", "strategy": "manual-new-generation",
+            "reason": "已核对供应商，明确授权新增一次生成", "expected_additional_calls": 1,
+        })
         assert retry.status_code == 201, retry.text
         completed = wait_for_job(recovered_client, job_id)
         assert completed["status"] == "candidate_ready"
         attempts = recovered_client.get(f"/api/jobs/{job_id}/attempts").json()
-        assert [attempt["purpose"] for attempt in attempts] == ["base", "retry"]
+        assert [attempt["purpose"] for attempt in attempts] == ["base", "regenerate"]
         assert recovered_client.get(f"/api/generation-plans/{plan['id']}").json()[
             "actual_calls"
         ] == 2

@@ -315,6 +315,7 @@ def provider_http_error(
         mapping.get(exc.category.value, 502),
         detail={
             "category": exc.category.value,
+            **({"error_code": exc.error_code} if exc.error_code else {}),
             "message": str(exc),
             "status_code": exc.status_code,
             "endpoint": exc.endpoint or fallback_endpoint,
@@ -871,7 +872,8 @@ async def refresh_provider_model_catalog(
         session.commit()
         return provider_models_view(profile)
     try:
-        discovered = await build_provider(profile, credentials).discover_models()
+        provider = build_provider(profile, credentials)
+        discovered = await provider.discover_models()
     except ProviderError as exc:
         if exc.status_code in {404, 405}:
             update_models_sync(
@@ -921,7 +923,9 @@ async def refresh_provider_model_catalog(
         endpoint=endpoint,
         status_code=200,
         message=("模型目录已同步。" if discovered else "供应商返回了空模型列表。"),
-        hint=(None if discovered else "请检查供应商模型权限，或手动登记模型 ID。"),
+        hint=("已自动兼容 Fake-IP DNS（fake_ip_compatible），继续使用域名及 TLS 校验。"
+              if getattr(provider, "network_policy", None) == "fake_ip_compatible"
+              else None if discovered else "请检查供应商模型权限，或手动登记模型 ID。"),
     )
     profile.updated_at = utcnow()
     session.commit()
@@ -1092,6 +1096,7 @@ def _generation_conversation_detail(row: AgentSession) -> dict[str, Any]:
     }
     attached = object_session(row)
     pending = pending_input_request(attached, row.id) if attached is not None else None
+    from .planning_runtime import runtime_detail
     return {
         "id": row.id,
         "project_id": row.project_id,
@@ -1115,6 +1120,7 @@ def _generation_conversation_detail(row: AgentSession) -> dict[str, Any]:
         "usage": result.get("usage") if isinstance(result.get("usage"), dict) else {},
         "last_error": result.get("last_error") if isinstance(result.get("last_error"), dict) else None,
         "pending_input": public_input_request(pending) if pending else None,
+        **runtime_detail(attached, row),
         "created_at": row.created_at,
         "updated_at": row.updated_at,
         "completed_at": row.completed_at,
@@ -1244,7 +1250,15 @@ def patch_generation_conversation_settings(
     session: Session = Depends(db),
 ) -> dict[str, Any]:
     row = _planning_session(session, session_id)
-    row = update_generation_conversation_settings(session, row, agent_model=payload.agent_model)
+    if payload.title is not None:
+        if not payload.title.strip():
+            raise ServiceError(422, "会话标题不能为空")
+        row.title = payload.title.strip()
+    if "agent_model" in payload.model_fields_set:
+        row = update_generation_conversation_settings(session, row, agent_model=payload.agent_model)
+    else:
+        row.updated_at = utcnow()
+        session.commit()
     return _generation_conversation_detail(row)
 
 
@@ -1382,6 +1396,9 @@ async def steer_generation_conversation_turn(
     session: Session = Depends(db),
 ) -> GenerationConversationMessageRead:
     row = _planning_session(session, session_id)
+    prior = find_generation_message(session, row, payload.client_message_id)
+    if prior:
+        return GenerationConversationMessageRead(turn_id=prior[0],status=row.status,next_sequence=prior[1])
     if row.status != "running":
         raise ServiceError(409, "this conversation has no active turn")
     runner = getattr(
@@ -1391,7 +1408,7 @@ async def steer_generation_conversation_turn(
     )
     if runner is None:
         raise ServiceError(503, "generation planning runner is unavailable")
-    turn_id, next_sequence = await runner.steer(session_id, payload.content)
+    turn_id, next_sequence = await runner.steer(session_id, payload.content, client_message_id=payload.client_message_id)
     return GenerationConversationMessageRead(
         turn_id=turn_id,
         status="running",
@@ -1474,6 +1491,10 @@ def confirm_generation_conversation_route(
     request: Request,
     session: Session = Depends(db),
 ) -> dict[str, Any]:
+    # Serialize confirmation before reading the draft; a simultaneous retry
+    # observes the committed immutable batch instead of creating another plan.
+    if session.bind.dialect.name == "sqlite":
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
     row = _planning_session(session, session_id)
     result = confirm_generation_conversation(
         session,
@@ -2068,6 +2089,12 @@ def resume_job(
                 RemediationStatus.RUNNING.value,
             }
         )
+        if latest and latest.dispatch_state == "not_sent" and not job.pending_action_id:
+            create_remediation(session, job=job, payload=RemediationCreate(
+                action=RemediationKind.RETRY, strategy="same-request", reason="继续执行已确认任务",
+                idempotency_key=f"resume:{job.id}:{job.attempt_count}",
+            ))
+            return job
         if not has_recoverable_action and not has_recoverable_output:
             raise ServiceError(
                 409,
@@ -2082,8 +2109,6 @@ def resume_job(
     )
     job.cancel_requested = False
     job.progress = 0.0
-    job.error_category = None
-    job.error_message = None
     job.updated_at = utcnow()
     if job.status != previous_status:
         record_run_event(
@@ -2270,3 +2295,34 @@ def export_rollback_endpoint(
 def get_deliveries(project_id: str, session: Session = Depends(db)) -> list[Delivery]:
     require(session, Project, project_id, "project")
     return list_deliveries(session, project_id=project_id)
+
+
+@router.post("/generation-conversations/{session_id}/turns/{turn_id}/recover")
+async def recover_generation_turn(session_id: str, turn_id: str, payload: dict[str, str], request: Request, session: Session = Depends(db)) -> dict[str, Any]:
+    from .planning_runtime import recover_turn, backfill_planning
+    key = payload.get("client_request_id", "")
+    if not key or len(key) > 160:
+        raise ServiceError(422, "client_request_id is required (1–160 characters)")
+    row = _planning_session(session, session_id)
+    backfill_planning(session)
+    attempt = recover_turn(session, row, turn_id, key)
+    session.commit()
+    runner = request.app.state.generation_planning_runner
+    if attempt.status == "queued" and session_id not in getattr(runner, "_tasks", {}):
+        runner.submit(session_id, turn_id)
+    return {"attempt_id": attempt.id, "turn_id": turn_id, "status": attempt.status}
+
+
+@router.post("/generation-conversations/{session_id}/proposal")
+def resolve_generation_proposal(session_id: str, payload: dict[str, Any], session: Session = Depends(db)) -> dict[str, Any]:
+    row = _planning_session(session, session_id)
+    proposed = (row.result_json or {}).get("pending_proposal")
+    if not proposed:
+        raise ServiceError(409, "没有待处理提案")
+    if payload.get("action") == "apply":
+        update_generation_draft(session, row, GenerationConversationDraftUpdate(base_hash=payload.get("base_hash", ""), draft=proposed))
+    elif payload.get("action") != "keep":
+        raise ServiceError(422, "action must be apply or keep")
+    row.result_json = {k: v for k, v in dict(row.result_json or {}).items() if k != "pending_proposal"}
+    session.commit()
+    return _generation_conversation_detail(row)

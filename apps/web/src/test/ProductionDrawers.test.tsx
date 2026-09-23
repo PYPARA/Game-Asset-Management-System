@@ -621,6 +621,7 @@ describe("M2 生产抽屉", () => {
       if (url === "/api/generation-plans/plan-1/inspect") return json(inspection);
       if (url === "/api/jobs/job-1/remediations" && init?.method === "POST") {
         expect(JSON.parse(String(init.body))).toEqual({
+          idempotency_key: expect.any(String),
           action: "tool_repair",
           strategy: "normalize",
           reason: "宽度不符合规格",

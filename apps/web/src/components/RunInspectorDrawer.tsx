@@ -60,7 +60,7 @@ const stageLabels: Record<string, string> = {
   output_received: "输出落盘",
   hard_qa: "硬 QA",
   semantic_qa: "语义复核",
-  candidate_ready: "候选就绪",
+  candidate_ready: "候选待批准",
 };
 
 const statusLabels: Record<string, string> = {
@@ -71,7 +71,7 @@ const statusLabels: Record<string, string> = {
   output_received: "输出已落盘",
   hard_qa: "硬 QA",
   semantic_qa: "语义复核",
-  candidate_ready: "候选就绪",
+  candidate_ready: "生成成功 · 待批准",
   remediating: "返工中",
   awaiting_user: "等待人工",
   credentials_locked: "等待凭据",
@@ -142,6 +142,25 @@ function evidenceLabel(item: RunEvidenceItem): string {
   return labels[item.kind] ?? item.label;
 }
 
+function evidenceDescription(item: RunEvidenceItem): string {
+  if (item.kind === "overlay") return "参考图与候选图各占 50%，用于检查构图、轮廓和透明边缘；不是失败提示。";
+  if (item.kind === "difference") return "高亮两图的像素变化，适合同源修订；不同角色之间仅供诊断留档。";
+  if (item.kind === "side_by_side") return "并排核对参考与候选的风格、比例和构图。";
+  if (item.kind.startsWith("contact_sheet")) return "在不同背景上检查透明通道、边缘和可读性。";
+  return "";
+}
+
+function attemptTitle(purpose: string, phase: string, dispatchState?: string): string {
+  const purposeLabel = purpose === "base" ? "初次生成" : purpose === "retry" ? "恢复重试" : purpose;
+  const phaseLabel = phase === "succeeded" ? "已完成" : phase === "failed" ? "未完成" : phase;
+  return `${purposeLabel} · ${phaseLabel}${dispatchState === "not_sent" ? "（历史）" : ""}`;
+}
+
+function networkPolicyLabel(policy?: string | null): string {
+  if (policy === "fake_ip_compatible") return "Fake-IP 兼容";
+  return policy ?? "";
+}
+
 function jobAssetId(job: GenerationJobRun): string {
   return typeof job.request?.asset_id === "string" ? job.request.asset_id : "";
 }
@@ -163,6 +182,7 @@ function suggestedAction(
   job: GenerationJobRun,
   findings: ProductionFindingRun[],
 ): RemediationChoice {
+  if (job.recovery_eligible) return "retry";
   const suggestion = findings.find((finding) => finding.job_id === job.id && !finding.resolved_at)
     ?.suggested_action;
   if (suggestion === "tool_repair" && job.task_kind !== "text") return "tool_repair";
@@ -256,7 +276,7 @@ export function RunInspectorDrawer({
     const nextAction = suggestedAction(selectedJob, inspection.findings);
     setAction(nextAction);
     setStrategy(strategyDefault(nextAction));
-    setReason(selectedJob.error_message ?? "");
+    setReason(selectedJob.blocking_reason ?? selectedJob.error_message ?? "");
     setPromptAdjustment("");
   }, [selectedJob?.id]);
 
@@ -303,6 +323,7 @@ export function RunInspectorDrawer({
     }
   };
 
+  const operationKeys = useRef(new Map<string, string>());
   const submitRemediation = async () => {
     if (!selectedJob) return;
     setBusy(true);
@@ -312,7 +333,10 @@ export function RunInspectorDrawer({
         .filter((finding) => finding.blocking && !finding.resolved_at)
         .map((finding) => finding.id);
       const paid = action === "regenerate" || action === "image_edit";
+      const fingerprint = JSON.stringify([selectedJob.id, selectedJob.attempt_count, action, strategy, reason.trim(), promptAdjustment.trim(), findingIds]);
+      if (!operationKeys.current.has(fingerprint)) operationKeys.current.set(fingerprint, crypto.randomUUID());
       await createRunRemediation(selectedJob.id, {
+        idempotency_key: operationKeys.current.get(fingerprint),
         action,
         strategy,
         reason: reason.trim(),
@@ -376,6 +400,20 @@ export function RunInspectorDrawer({
     : action === "retry"
       ? "实际供应商请求仍写入调用台账"
       : "停止当前任务，等待明确决定";
+  const candidateReady = selectedJob?.status === "candidate_ready";
+  const remediationControls = inspection ? <div className="remediation-controls">
+    <div className="action-choice-grid">
+      {(selectedJob?.task_kind === "text"
+        ? ["regenerate", "retry", "await_user"]
+        : ["tool_repair", "regenerate", "image_edit", "retry", "await_user"]
+      ).map((choice) => <button key={choice} type="button" className={action === choice ? "active" : ""} aria-pressed={action === choice} disabled={choice === "retry" && ["dispatch_started", "legacy_unknown"].includes(selectedJob?.delivery_state ?? "")} onClick={() => chooseAction(choice as RemediationChoice)}>{choice === "tool_repair" ? <Wrench size={15} /> : choice === "retry" ? <ArrowsClockwise size={15} /> : choice === "await_user" ? <WarningCircle size={15} /> : <ImagesSquare size={15} />}{actionLabel(choice as RemediationChoice)}</button>)}
+    </div>
+    {action === "tool_repair" ? <label className="production-field"><span>已注册 Worker</span><SelectMenu ariaLabel="已注册 Worker" value={strategy} options={[{ value: "normalize", label: "编码 / 尺寸归一化" }, { value: "color_key", label: "角点色键移除" }, { value: "smart_matte", label: "智能抠图适配" }, { value: "edge_cleanup", label: "边缘清理" }]} onChange={setStrategy} /></label> : <label className="production-field"><span>策略记录</span><input value={strategy} onChange={(event) => setStrategy(event.target.value)} /></label>}
+    {(action === "regenerate" || action === "image_edit") ? <label className="production-field"><span>本轮必须改变的生成约束</span><textarea rows={3} value={promptAdjustment} onChange={(event) => setPromptAdjustment(event.target.value)} placeholder="例如：保持人物身份，改为正面半身构图，移除背景文字。" /></label> : null}
+    <label className="production-field"><span>判断依据</span><textarea rows={4} value={reason} onChange={(event) => setReason(event.target.value)} placeholder="引用证据并说明为什么选择该动作。" /></label>
+    <div className={`action-impact ${paidAction ? "paid" : "free"}`}><CurrencyDollar size={17} /><div><strong>{paidAction ? "预计增加 1 次供应商调用" : "不占付费返工额度"}</strong><small>{paidAction ? `剩余额度 ${Math.max(0, inspection.plan.extra_call_budget - inspection.plan.extra_calls_used)} 次` : freeActionDetail}</small></div></div>
+    <button className="button primary remediation-submit" type="button" onClick={submitRemediation} disabled={busy || !canAct}>{busy ? "正在写入…" : "记录并执行动作"}</button>
+  </div> : null;
 
   return (
     <div className="drawer-backdrop production-drawer-backdrop" onMouseDown={onClose}>
@@ -406,7 +444,7 @@ export function RunInspectorDrawer({
             <section className="run-ledger" aria-label="运行预算">
               <div><CurrencyDollar size={17} /><span>实际 / 基础调用</span><strong>{inspection.plan.actual_calls} / {inspection.plan.estimated_calls}</strong></div>
               <div><span>额外返工</span><strong>{inspection.plan.extra_calls_used} / {inspection.plan.extra_call_budget}</strong></div>
-              <div><span>实际成本</span><strong>{formatCost(inspection.plan.actual_cost)}</strong></div>
+              <div><span>费用估算</span><strong>{formatCost((!inspection.attempts.length || inspection.attempts.some(a => a.estimated_cost == null)) ? null : inspection.plan.actual_cost)}</strong></div>
               <div><Heartbeat size={17} /><span>计划并发</span><strong>{inspection.plan.max_concurrency}</strong></div>
               <label><span>调整额外额度</span><input aria-label="额外调用预算" type="number" min={inspection.plan.extra_calls_used} value={budgetValue} onChange={(event) => setBudgetValue(Number(event.target.value))} /></label>
               <button className="button secondary" type="button" onClick={saveBudget} disabled={busy || !budgetValid || budgetValue === inspection.plan.extra_call_budget}>保存预算</button>
@@ -446,7 +484,7 @@ export function RunInspectorDrawer({
                       <b>{frozenModel(selectedJob)}</b>
                     </section>
                     <section className="stage-sequence">
-                      <div className="run-section-heading"><span>阶段状态</span><small>{selectedJob.error_message ?? "当前没有停止原因"}</small></div>
+                      <div className="run-section-heading"><span>阶段状态</span><small>{candidateReady ? "生成和 QA 已完成，等待人工批准" : selectedJob.blocking_reason ?? selectedJob.error_message ?? "当前没有停止原因"}</small></div>
                       <ol>{stages.map((stage, index) => {
                         const currentIndex = stages.indexOf(selectedJob.stage as typeof stages[number]);
                         const completed = currentIndex > index || selectedJob.status === "candidate_ready";
@@ -456,7 +494,7 @@ export function RunInspectorDrawer({
                     </section>
                     <section className="attempt-register">
                       <div className="run-section-heading"><span>Attempt 台账</span><small>每次实际供应商请求均独立计数</small></div>
-                      {selectedAttempts.length === 0 ? <p className="run-empty-copy">尚无 Attempt。</p> : <ol>{selectedAttempts.map((attempt) => <li key={attempt.id}><span className={attempt.billable ? "billable" : "worker"}>{attempt.billable ? `调用 ${attempt.number}` : "Worker"}</span><div><strong>{attempt.purpose} · {attempt.phase}</strong><em>{frozenProviderName(selectedJob)} / {frozenModel(selectedJob)}</em><small>{attempt.request_id ?? attempt.idempotency_key ?? "无供应商请求 ID"}</small></div><div><strong>{formatCost(attempt.estimated_cost)}</strong><small>{formatTime(attempt.completed_at ?? attempt.started_at)}</small></div></li>)}</ol>}
+                      {selectedAttempts.length === 0 ? <p className="run-empty-copy">尚无 Attempt。</p> : <ol>{selectedAttempts.map((attempt) => <li key={attempt.id}><span className={attempt.dispatch_state === "not_sent" ? "not-sent" : attempt.billable ? "billable" : "worker"}>{attempt.dispatch_state === "not_sent" ? "未发送 · 未计费" : attempt.dispatch_state === "response_received" ? "已收到结果" : attempt.billable ? "已发送" : "Worker"}</span><div><strong>{attemptTitle(attempt.purpose, attempt.phase, attempt.dispatch_state)}</strong><em>{frozenProviderName(selectedJob)} / {frozenModel(selectedJob)}</em><small>{attempt.dispatch_state === "dispatch_started" ? "交付状态未知，需要核对" : attempt.dispatch_state === "response_received" ? "供应商已响应，本次调用已计入台账" : attempt.dispatch_state === "not_sent" ? "本地准备失败，未调用供应商" : "历史发送状态未确认"}</small>{attempt.network_policy && <small>网络策略：{networkPolicyLabel(attempt.network_policy)}</small>}{(attempt.error_message || attempt.error_hint) && <details className="attempt-error-details"><summary>查看历史错误</summary>{attempt.error_message && <small>{attempt.error_message}</small>}{attempt.error_hint && <small>{attempt.error_hint}</small>}</details>}<small>{attempt.request_id ?? attempt.idempotency_key ?? "无供应商请求 ID"}</small></div><div><strong>{attempt.dispatch_state === "not_sent" ? "未计费" : formatCost(attempt.estimated_cost)}</strong><small>{formatTime(attempt.completed_at ?? attempt.started_at)}</small></div></li>)}</ol>}
                     </section>
                     <section className="finding-register">
                       <div className="run-section-heading"><span>Finding</span><small>稳定 code 决定策略切换与停止</small></div>
@@ -468,7 +506,7 @@ export function RunInspectorDrawer({
                 {tab === "evidence" ? (
                   <div className="run-tab-scroll evidence-board">
                     <div className="run-section-heading"><span>人工证据板</span><small>联系表与对比图均由确定性 Worker 生成</small></div>
-                    {selectedEvidence.length === 0 ? <p className="run-empty-copy">当前任务还没有证据。</p> : <div className="evidence-grid">{selectedEvidence.map((item) => <article key={item.id} className={item.path ? "" : "evidence-unavailable"}>{item.path ? <img src={runEvidenceUrl(item.id)} alt={evidenceLabel(item)} loading="lazy" /> : <WarningCircle size={24} />}<div><strong>{evidenceLabel(item)}</strong><small>{item.sha256 ? item.sha256.slice(0, 12) : String(item.metadata.reason ?? "不适用")}</small></div></article>)}</div>}
+                    {selectedEvidence.length === 0 ? <p className="run-empty-copy">当前任务还没有证据。</p> : <div className="evidence-grid">{selectedEvidence.map((item) => <article key={item.id} className={item.path ? "" : "evidence-unavailable"}>{item.path ? <img src={runEvidenceUrl(item.id)} alt={evidenceLabel(item)} loading="lazy" /> : <WarningCircle size={24} />}<div><strong>{evidenceLabel(item)}</strong>{evidenceDescription(item) && <p>{evidenceDescription(item)}</p>}<small>{item.sha256 ? item.sha256.slice(0, 12) : String(item.metadata.reason ?? "不适用")}</small></div></article>)}</div>}
                   </div>
                 ) : null}
 
@@ -485,18 +523,11 @@ export function RunInspectorDrawer({
               </section>
 
               <aside className="remediation-console" aria-label="返工动作">
-                <div className="run-section-heading"><span>需要重做</span><small>{selectedJob ? `${selectedJob.task_id} · ${statusLabels[selectedJob.status] ?? selectedJob.status}` : "选择任务"}</small></div>
-                <div className="action-choice-grid">
-                  {(selectedJob?.task_kind === "text"
-                    ? ["regenerate", "retry", "await_user"]
-                    : ["tool_repair", "regenerate", "image_edit", "retry", "await_user"]
-                  ).map((choice) => <button key={choice} type="button" className={action === choice ? "active" : ""} aria-pressed={action === choice} onClick={() => chooseAction(choice as RemediationChoice)}>{choice === "tool_repair" ? <Wrench size={15} /> : choice === "retry" ? <ArrowsClockwise size={15} /> : choice === "await_user" ? <WarningCircle size={15} /> : <ImagesSquare size={15} />}{actionLabel(choice as RemediationChoice)}</button>)}
-                </div>
-                {action === "tool_repair" ? <label className="production-field"><span>已注册 Worker</span><SelectMenu ariaLabel="已注册 Worker" value={strategy} options={[{ value: "normalize", label: "编码 / 尺寸归一化" }, { value: "color_key", label: "角点色键移除" }, { value: "smart_matte", label: "智能抠图适配" }, { value: "edge_cleanup", label: "边缘清理" }]} onChange={setStrategy} /></label> : <label className="production-field"><span>策略记录</span><input value={strategy} onChange={(event) => setStrategy(event.target.value)} /></label>}
-                {(action === "regenerate" || action === "image_edit") ? <label className="production-field"><span>本轮必须改变的生成约束</span><textarea rows={3} value={promptAdjustment} onChange={(event) => setPromptAdjustment(event.target.value)} placeholder="例如：保持人物身份，改为正面半身构图，移除背景文字。" /></label> : null}
-                <label className="production-field"><span>判断依据</span><textarea rows={4} value={reason} onChange={(event) => setReason(event.target.value)} placeholder="引用证据并说明为什么选择该动作。" /></label>
-                <div className={`action-impact ${paidAction ? "paid" : "free"}`}><CurrencyDollar size={17} /><div><strong>{paidAction ? "预计增加 1 次供应商调用" : "不占付费返工额度"}</strong><small>{paidAction ? `剩余额度 ${Math.max(0, inspection.plan.extra_call_budget - inspection.plan.extra_calls_used)} 次` : freeActionDetail}</small></div></div>
-                <button className="button primary remediation-submit" type="button" onClick={submitRemediation} disabled={busy || !canAct}>{busy ? "正在写入…" : "记录并执行动作"}</button>
+                <div className="run-section-heading"><span>{candidateReady ? "下一步" : "处理任务"}</span><small>{selectedJob ? `${selectedJob.task_id} · ${statusLabels[selectedJob.status] ?? selectedJob.status}` : "选择任务"}</small></div>
+                {candidateReady ? <>
+                  <div className="candidate-ready-summary"><CheckCircle size={22} weight="fill" /><div><strong>生成与 QA 已完成</strong><p>候选尚未批准。请回到结果栏前往资产库审核；只有确实需要修改时才创建返工。</p></div></div>
+                  <details className="candidate-remediation-options"><summary>需要调整候选</summary>{remediationControls}</details>
+                </> : remediationControls}
               </aside>
             </div>
           </div>

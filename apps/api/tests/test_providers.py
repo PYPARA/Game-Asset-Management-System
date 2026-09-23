@@ -100,7 +100,7 @@ def test_resolved_private_or_reserved_address_reports_address_and_requires_opt_i
         providers_module.socket,
         "getaddrinfo",
         lambda *_args, **_kwargs: [
-            (providers_module.socket.AF_INET, providers_module.socket.SOCK_STREAM, 6, "", ("198.18.0.64", 443)),
+            (providers_module.socket.AF_INET, providers_module.socket.SOCK_STREAM, 6, "", ("10.0.0.64", 443)),
         ],
     )
 
@@ -109,7 +109,7 @@ def test_resolved_private_or_reserved_address_reports_address_and_requires_opt_i
 
     error = raised.value
     assert error.category == ErrorCategory.VALIDATION
-    assert "198.18.0.64" in str(error)
+    assert "10.0.0.64" in str(error)
     assert error.hint is not None
     assert "允许访问局域网或私有地址" in error.hint
 

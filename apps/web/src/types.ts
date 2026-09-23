@@ -36,6 +36,7 @@ export interface ProjectSummary {
 
 export interface AssetRevision {
   id: string;
+  parentRevisionId?: string | null;
   sequence: number;
   label: string;
   image: string;
@@ -247,6 +248,7 @@ export interface ProviderModelRecord {
 }
 
 export interface ProviderDefaultRoute {
+  reasoning_effort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
   provider_profile_id: string;
   model: string;
 }
@@ -393,7 +395,13 @@ export interface GenerationConversationEvent {
   created_at: string;
 }
 
+export interface GenerationBatch { id: string; plan_id: string; draft_hash: string; draft_version: number; status: string; created_at: string; draft: GenerationPlanningDraft; }
 export interface GenerationConversation {
+  current_turn_id?: string | null;
+  recovery_status?: string | null;
+  last_sequence?: number;
+  batches?: GenerationBatch[];
+  pending_proposal?: GenerationPlanningDraft | null;
   id: string;
   project_id: string;
   plan_id: string | null;
@@ -478,6 +486,9 @@ export interface GenerationAgentModel {
 }
 
 export interface GenerationAgentCapabilities {
+  can_connect?: boolean;
+  can_start?: boolean;
+  can_resume?: boolean | null;
   available: boolean;
   interactive_user_input?: boolean;
   adapter: string;
@@ -559,6 +570,9 @@ export interface GenerationPlanRun {
 }
 
 export interface GenerationJobRun {
+  blocking_reason?: string | null;
+  recovery_eligible?: boolean;
+  delivery_state?: string | null;
   id: string;
   plan_id: string;
   project_id: string;
@@ -585,6 +599,12 @@ export interface GenerationJobRun {
 }
 
 export interface GenerationAttemptRun {
+  dispatch_state?: string;
+  dispatch_count?: number;
+  dispatched_at?: string | null;
+  error_code?: string | null;
+  error_hint?: string | null;
+  network_policy?: string | null;
   id: string;
   job_id: string;
   number: number;

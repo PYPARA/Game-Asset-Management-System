@@ -3144,10 +3144,10 @@ input[type="checkbox"] {
   background: var(--chat-bg);
   color: var(--chat-copy);
 }
-.generation-drawer-page { position: relative; z-index: 41; grid-row: 2; grid-column: 1; width: 100%; min-width: 0; max-width: none; height: 100%; border: 0; box-shadow: none; transform: translateX(0); transition: transform 180ms ease-out, visibility 180ms ease-out; }
+.generation-drawer-page { position: relative; z-index: 1; grid-row: 2; grid-column: 1; width: 100%; min-width: 0; max-width: none; height: 100%; border: 0; box-shadow: none; transform: translateX(0); transition: transform 180ms ease-out, visibility 180ms ease-out; }
 .generation-drawer-page.closed { visibility: hidden; pointer-events: none; transform: translateX(calc(100% + 2px)); }
 .generation-chat-loading, .generation-drawer-loading { display: grid; place-items: center; gap: 9px; background: #0e0f0e; color: var(--chat-muted); font-size: 12px; }
-.generation-chat-loading, .generation-chat-error-screen, .generation-drawer-loading { position: relative; z-index: 41; grid-row: 2; grid-column: 1; width: 100%; height: 100%; border: 0; box-shadow: none; }
+.generation-chat-loading, .generation-chat-error-screen, .generation-drawer-loading { position: relative; z-index: 1; grid-row: 2; grid-column: 1; width: 100%; height: 100%; border: 0; box-shadow: none; }
 .generation-chat-error-screen { display: grid; min-height: auto; place-content: center; gap: 10px; margin: 0; padding: 28px; background: #0e0f0e; color: var(--chat-copy); }
 .generation-chat-error-mark { display: grid; width: 48px; height: 48px; place-items: center; margin-bottom: 4px; border: 1px solid #704039; background: #2b1d1b; color: #e29b88; }
 .generation-chat-error-screen h1 { margin: 0; font-family: "Songti SC", STSong, serif; font-size: 21px; font-weight: 650; }
@@ -5273,14 +5273,156 @@ input[type="checkbox"] {
   box-shadow: 0 0 0 3px #1e3020;
 }
 
+/* Run inspector readability and state hierarchy. */
+.run-inspector-drawer {
+  font-size: 13px;
+}
+
+.run-inspector-drawer .run-state-badge,
+.run-inspector-drawer .production-loading,
+.run-inspector-drawer .production-message,
+.run-inspector-drawer .production-status {
+  font-size: 12px;
+}
+
+.run-inspector-drawer .run-ledger span,
+.run-inspector-drawer .run-ledger label span,
+.run-inspector-drawer .run-rail-heading > span,
+.run-inspector-drawer .run-section-heading small,
+.run-inspector-drawer .manual-fallback-note p,
+.run-inspector-drawer .agent-session-note small,
+.run-inspector-drawer .live-run-copy {
+  font-size: 11px;
+}
+
+.run-inspector-drawer .run-ledger strong,
+.run-inspector-drawer .run-rail-heading strong,
+.run-inspector-drawer .run-section-heading > span,
+.run-inspector-drawer .run-tabs button,
+.run-inspector-drawer .run-job-list strong,
+.run-inspector-drawer .manual-fallback-note strong,
+.run-inspector-drawer .action-choice-grid button,
+.run-inspector-drawer .action-impact strong {
+  font-size: 12px;
+}
+
+.run-inspector-drawer .run-job-list small,
+.run-inspector-drawer .run-job-list em,
+.run-inspector-drawer .stage-sequence li strong,
+.run-inspector-drawer .finding-register small,
+.run-inspector-drawer .finding-register li > span,
+.run-inspector-drawer .run-empty-copy,
+.run-inspector-drawer .action-impact small {
+  font-size: 11px;
+}
+
+.run-inspector-drawer .stage-sequence li > span,
+.run-inspector-drawer .attempt-register li > span,
+.run-inspector-drawer .attempt-register strong,
+.run-inspector-drawer .attempt-register small,
+.run-inspector-drawer .finding-register strong,
+.run-inspector-drawer .evidence-grid strong,
+.run-inspector-drawer .evidence-grid small,
+.run-inspector-drawer .event-timeline li > span,
+.run-inspector-drawer .event-timeline strong,
+.run-inspector-drawer .event-timeline small,
+.run-inspector-drawer .event-timeline p {
+  font-size: 11px;
+}
+
+.run-inspector-drawer .run-inspector-body {
+  grid-template-rows: 68px minmax(0, 1fr);
+}
+
+.run-inspector-drawer .run-work-area {
+  grid-template-columns: 260px minmax(420px, 1fr) 340px;
+}
+
+.run-inspector-drawer .attempt-register li {
+  grid-template-columns: 104px minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 12px;
+  padding: 11px;
+}
+
+.run-inspector-drawer .attempt-register li > span {
+  line-height: 1.35;
+}
+
+.run-inspector-drawer .attempt-register .not-sent {
+  background: #222d23;
+  color: #a7c2a2;
+}
+
+.attempt-error-details summary {
+  cursor: pointer;
+  color: #bb9186;
+  font-size: 11px;
+}
+
+.attempt-error-details small {
+  display: block;
+  overflow: visible;
+  margin-top: 4px;
+  color: #a98278;
+  line-height: 1.45;
+  text-overflow: clip;
+  white-space: normal;
+}
+
+.evidence-grid article > div p {
+  margin: 0;
+  color: #9f9a91;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.candidate-ready-summary {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  gap: 10px;
+  padding: 13px;
+  border: 1px solid #3f5b3f;
+  background: #1b281c;
+  color: #9fc19a;
+}
+
+.candidate-ready-summary strong {
+  color: #d7e7d3;
+  font-size: 13px;
+}
+
+.candidate-ready-summary p {
+  margin: 5px 0 0;
+  color: #acb9aa;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.candidate-remediation-options {
+  margin-top: 14px;
+  border-top: 1px solid var(--line-soft);
+  padding-top: 12px;
+}
+
+.candidate-remediation-options > summary {
+  cursor: pointer;
+  color: #c5a69d;
+  font-size: 12px;
+}
+
+.candidate-remediation-options .remediation-controls {
+  margin-top: 12px;
+}
+
 @media (max-width: 1220px) {
   .production-drawer {
     width: 100vw;
     min-width: 0;
   }
 
-  .run-work-area {
-    grid-template-columns: 200px minmax(330px, 1fr) 278px;
+  .run-inspector-drawer .run-work-area {
+    grid-template-columns: 220px minmax(360px, 1fr) 300px;
   }
 
   .run-ledger {
@@ -5305,8 +5447,8 @@ input[type="checkbox"] {
     grid-template-columns: 1fr 1fr;
   }
 
-  .run-work-area {
-    grid-template-columns: 184px minmax(320px, 1fr) 258px;
+  .run-inspector-drawer .run-work-area {
+    grid-template-columns: 200px minmax(320px, 1fr) 280px;
   }
 
   .run-ledger > div:nth-child(3) {
@@ -6614,3 +6756,5 @@ input[type="checkbox"] {
   .system-settings-drawer,
   .model-picker-dialog { animation: none; }
 }
+
+.workbench-shell.generation-mode {grid-template-rows:62px minmax(0,1fr);}

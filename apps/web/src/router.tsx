@@ -12,7 +12,9 @@ const workbenchRoute = createRoute({
   component: Workbench,
 });
 
-const routeTree = rootRoute.addChildren([workbenchRoute]);
+const generationRoute = createRoute({getParentRoute:()=>rootRoute,path:"/generation",component:Workbench});
+const generationSessionRoute = createRoute({getParentRoute:()=>rootRoute,path:"/generation/$sessionId",component:Workbench});
+const routeTree = rootRoute.addChildren([workbenchRoute,generationRoute,generationSessionRoute]);
 
 export const router = createRouter({ routeTree });
 

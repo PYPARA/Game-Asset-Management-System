@@ -4,7 +4,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from .domain import (
@@ -129,6 +129,25 @@ def refresh_plan_status(session: Session, plan: GenerationPlan) -> str:
     return plan.status
 
 
+def execution_diagnostic(job: GenerationJob, latest: GenerationAttempt | None) -> dict[str, Any]:
+    state = latest.dispatch_state if latest else None
+    stopped = job.status in {"awaiting_user", "failed", "credentials_locked", "qa_failed"}
+    reason = None
+    if job.status not in SUCCESS_STATUSES and job.status != "cancelled":
+        reason = job.error_message or (latest.error_message if latest else None)
+        if stopped and latest:
+            if state == "not_sent":
+                detail = "供应商地址检查未通过" if latest.error_code == "provider_address_blocked" else (reason or "本地准备失败")
+                reason = f"请求未发出：{detail}"
+            elif state == "dispatch_started":
+                reason = "交付状态未知，需要核对。" + (reason or "请求发送后未收到可确认的响应。")
+        if reason and latest and latest.error_hint:
+            reason += "；" + latest.error_hint
+    return {"blocking_reason": reason, "delivery_state": state,
+            "recovery_eligible": bool(stopped and latest and state == "not_sent"
+                                      and not job.result_revision_id and not job.pending_action_id)}
+
+
 def inspect_run(session: Session, plan: GenerationPlan, *, event_limit: int = 500) -> dict[str, Any]:
     jobs = list(
         session.scalars(
@@ -209,9 +228,15 @@ def inspect_run(session: Session, plan: GenerationPlan, *, event_limit: int = 50
         ).all()
     )
     events.reverse()
+    projected_jobs = []
+    from .domain import GenerationJobRead
+    for job in jobs:
+        latest = next((a for a in reversed(attempts) if a.job_id == job.id), None)
+        projected_jobs.append(GenerationJobRead.model_validate(job).model_copy(
+            update=execution_diagnostic(job, latest)))
     return {
         "plan": plan,
-        "jobs": jobs,
+        "jobs": projected_jobs,
         "attempts": attempts,
         "findings": findings,
         "evidence": evidence,
@@ -375,12 +400,42 @@ def create_remediation(
     plan = session.get(GenerationPlan, job.plan_id)
     if plan is None:
         raise ServiceError(404, "generation plan not found")
+    # Serialize decisions before checking the current state (including duplicate clicks).
+    session.execute(update(GenerationJob).where(GenerationJob.id == job.id).values(updated_at=utcnow()))
+    session.refresh(job)
+    action_id = stable_id("remediation", job.id, payload.idempotency_key) if payload.idempotency_key else new_id()
+    existing = session.get(RemediationAction, action_id)
+    if existing:
+        if (existing.action != payload.action.value or existing.strategy != payload.strategy
+                or existing.reason != payload.reason or existing.parameters_json != payload.parameters
+                or existing.finding_ids_json != payload.finding_ids):
+            raise ServiceError(409, "幂等键已用于不同操作。")
+        session.commit()
+        return existing
+    previous_action = session.scalar(select(RemediationAction).where(
+        RemediationAction.job_id == job.id).order_by(RemediationAction.created_at.desc()).limit(1))
+    if previous_action and previous_action.action == payload.action.value and previous_action.strategy == payload.strategy:
+        same = (previous_action.reason == payload.reason and previous_action.parameters_json == payload.parameters
+                and previous_action.finding_ids_json == payload.finding_ids)
+        if same and ((payload.action == RemediationKind.AWAIT_USER and job.status == "awaiting_user")
+                     or job.pending_action_id == previous_action.id):
+            session.commit()
+            return previous_action
+    latest = session.scalar(select(GenerationAttempt).where(
+        GenerationAttempt.job_id == job.id).order_by(GenerationAttempt.number.desc()).limit(1))
+    if payload.action == RemediationKind.RETRY and latest:
+        if latest.dispatch_state in {"dispatch_started", "legacy_unknown"} and not attempt_output_is_valid(session, job, latest):
+            raise ServiceError(409, "交付状态未知，请先核对供应商结果；不能直接重试。")
+        if payload.parameters:
+            raise ServiceError(422, "同请求重试不能修改已确认参数。")
+
     if job.status not in {
         GenerationStatus.CANDIDATE_READY.value,
         GenerationStatus.SUCCEEDED.value,
         GenerationStatus.QA_FAILED.value,
         GenerationStatus.AWAITING_USER.value,
         GenerationStatus.FAILED.value,
+        GenerationStatus.CREDENTIALS_LOCKED.value,
     }:
         raise ServiceError(409, "job is not ready for a remediation decision")
     if job.pending_action_id:
@@ -417,7 +472,7 @@ def create_remediation(
             raise ServiceError(409, "asset paid-remediation round limit is exhausted")
 
     action = RemediationAction(
-        id=new_id(),
+        id=action_id,
         project_id=job.project_id,
         plan_id=job.plan_id,
         job_id=job.id,
@@ -433,10 +488,7 @@ def create_remediation(
     session.add(action)
     session.flush()
     job.pending_action_id = action.id
-    job.error_category = None
-    job.error_message = None
     job.cancel_requested = False
-    job.progress = 0.0
     job.lease_owner = None
     job.lease_token = None
     job.lease_expires_at = None
@@ -546,6 +598,13 @@ def resume_recoverable_jobs(
                 RemediationStatus.RUNNING.value,
             }
         )
+        if (job.status in {GenerationStatus.AWAITING_USER.value, GenerationStatus.CREDENTIALS_LOCKED.value}
+                and latest and latest.dispatch_state == "not_sent" and not job.pending_action_id):
+            create_remediation(session, job=job, payload=RemediationCreate(
+                action=RemediationKind.RETRY, strategy="same-request", reason="继续执行已确认任务",
+                idempotency_key=f"resume:{job.id}:{job.attempt_count}",
+            ))
+            continue
         if (
             job.status == GenerationStatus.CREDENTIALS_LOCKED.value
             and job.provider_profile_id in available_provider_ids
@@ -557,8 +616,6 @@ def resume_recoverable_jobs(
             job.status = GenerationStatus.QUEUED.value
         else:
             continue
-        job.error_category = None
-        job.error_message = None
         job.lease_owner = None
         job.lease_token = None
         job.lease_expires_at = None

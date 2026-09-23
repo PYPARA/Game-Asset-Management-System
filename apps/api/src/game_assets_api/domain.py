@@ -512,6 +512,9 @@ class GenerationPlanRead(ORMModel):
 
 
 class GenerationJobRead(ORMModel):
+    blocking_reason: str | None = None
+    recovery_eligible: bool = False
+    delivery_state: str | None = None
     id: str
     plan_id: str
     project_id: str
@@ -543,6 +546,12 @@ class GenerationJobRead(ORMModel):
 
 
 class GenerationAttemptRead(ORMModel):
+    dispatch_state: str = "legacy_unknown"
+    dispatched_at: datetime | None = None
+    dispatch_count: int = 0
+    error_code: str | None = None
+    error_hint: str | None = None
+    network_policy: str | None = None
     id: str
     job_id: str
     number: int
@@ -618,6 +627,7 @@ class RunEvidenceRead(ORMModel):
 
 
 class RemediationCreate(BaseModel):
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=160)
     action: RemediationKind
     strategy: str = Field(min_length=1, max_length=120)
     reason: str = Field(min_length=1, max_length=2_000)
@@ -654,6 +664,7 @@ class GenerationConversationMessageCreate(BaseModel):
 
 
 class GenerationConversationSteerCreate(BaseModel):
+    client_message_id: str | None = Field(default=None, max_length=160)
     content: str = Field(min_length=1, max_length=20_000)
 
 
@@ -730,6 +741,11 @@ class GenerationConversationRead(ORMModel):
     usage: dict[str, Any] = Field(default_factory=dict)
     last_error: dict[str, Any] | None = None
     pending_input: GenerationInputRequestRead | None = None
+    current_turn_id: str | None = None
+    recovery_status: str | None = None
+    last_sequence: int = 0
+    batches: list[dict[str, Any]] = Field(default_factory=list)
+    pending_proposal: dict[str, Any] | None = None
     created_at: datetime
     updated_at: datetime
     completed_at: datetime | None
@@ -761,6 +777,7 @@ class GenerationConversationMessageRead(BaseModel):
 
 
 class GenerationConversationSettingsUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=200)
     agent_model: str | None = Field(default=None, max_length=160)
 
 
@@ -771,6 +788,9 @@ class GenerationConversationContextUpdate(BaseModel):
 class GenerationAgentCapabilitiesRead(BaseModel):
     available: bool
     interactive_user_input: bool = False
+    can_connect: bool = False
+    can_start: bool = False
+    can_resume: bool | None = None
     adapter: str
     version: str
     models: list[dict[str, Any]] = Field(default_factory=list)

@@ -274,6 +274,12 @@ class GenerationAttempt(Base):
     output_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     output_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     result_revision_id: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    dispatch_state: Mapped[str] = mapped_column(String(32), default="legacy_unknown", server_default="legacy_unknown")
+    dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    dispatch_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    error_hint: Mapped[str | None] = mapped_column(Text, nullable=True)
+    network_policy: Mapped[str | None] = mapped_column(String(40), nullable=True)
     billable: Mapped[bool] = mapped_column(Boolean, default=True)
     estimated_cost: Mapped[float | None] = mapped_column(Float, nullable=True)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -596,4 +602,53 @@ class Delivery(Base):
     files_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
     validation_results_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
     rollback_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class PlanningTurn(Base):
+    """A logical user turn; retries never manufacture another user message."""
+    __tablename__ = "planning_turns"
+    id: Mapped[str] = mapped_column(String(48), primary_key=True)
+    session_id: Mapped[str] = mapped_column(ForeignKey("agent_sessions.id", ondelete="CASCADE"), index=True)
+    status: Mapped[str] = mapped_column(String(30), default="queued", index=True)
+    input_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    context_hash: Mapped[str] = mapped_column(String(128), default="")
+    draft_hash: Mapped[str | None] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class PlanningAttempt(Base):
+    __tablename__ = "planning_attempts"
+    id: Mapped[str] = mapped_column(String(48), primary_key=True, default=new_id)
+    turn_id: Mapped[str] = mapped_column(ForeignKey("planning_turns.id", ondelete="CASCADE"), index=True)
+    request_key: Mapped[str] = mapped_column(String(200), unique=True)
+    status: Mapped[str] = mapped_column(String(30), default="queued", index=True)
+    lease_owner: Mapped[str | None] = mapped_column(String(80))
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    error_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class PlanningCommand(Base):
+    """Durable IPC for interactive commands addressed to the planning worker."""
+    __tablename__ = "planning_commands"
+    id: Mapped[str] = mapped_column(String(200), primary_key=True)
+    session_id: Mapped[str] = mapped_column(ForeignKey("agent_sessions.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(30))
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(30), default="queued", index=True)
+    result_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ConversationBatch(Base):
+    __tablename__ = "conversation_batches"
+    __table_args__ = (UniqueConstraint("session_id", "draft_hash"),)
+    id: Mapped[str] = mapped_column(String(48), primary_key=True, default=new_id)
+    session_id: Mapped[str] = mapped_column(ForeignKey("agent_sessions.id", ondelete="CASCADE"), index=True)
+    plan_id: Mapped[str] = mapped_column(ForeignKey("generation_plans.id", ondelete="CASCADE"), unique=True)
+    draft_hash: Mapped[str] = mapped_column(String(128))
+    draft_version: Mapped[int] = mapped_column(Integer)
+    draft_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

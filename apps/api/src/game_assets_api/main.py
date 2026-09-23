@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -10,9 +12,11 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .api import router
-from .codex_adapter import build_codex_adapter
+from .codex_adapter import build_codex_adapter, AppServerCodexAdapter
+from .planning_provider import ProviderPlanningAdapter, serve_credentials
 from .database import Database
 from .generation_planning import GenerationPlanningRunner
+from .planning_runtime import PlanningQueueClient
 from .providers import CredentialVault
 from .runner import JobRunner
 from .services import ServiceError, discover_projects
@@ -29,9 +33,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         codex_bin=settings.codex_bin,
         timeout_seconds=settings.codex_timeout_seconds,
     )
-    generation_planning_runner = GenerationPlanningRunner(
+    planning_adapter = codex_adapter
+    if isinstance(codex_adapter, AppServerCodexAdapter):
+        codex_adapter.isolated_home = settings.state_dir / "planning-codex" / "capabilities"
+        planning_adapter = ProviderPlanningAdapter(codex_adapter, database.sessions, settings, vault)
+    generation_planning_runner = (PlanningQueueClient if settings.planning_external_worker else GenerationPlanningRunner)(
         database.sessions,
-        codex_adapter,  # planning and diagnosis share the isolated adapter boundary
+        planning_adapter,
         settings,
     )
 
@@ -43,6 +51,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         codex_start = getattr(codex_adapter, "start", None)
         if codex_start is not None:
             await codex_start()
+        credential_server = await serve_credentials(settings.state_dir, vault) if settings.planning_external_worker else None
         await generation_planning_runner.start()
         await runner.start()
         try:
@@ -52,7 +61,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await generation_planning_runner.stop()
             codex_close = getattr(codex_adapter, "close", None)
             if codex_close is not None:
-                await codex_close()
+                try:
+                    await asyncio.wait_for(codex_close(), timeout=5)
+                except TimeoutError:
+                    pass
+            if credential_server is not None:
+                credential_server.close()
+                await credential_server.wait_closed()
             vault.clear()
 
     app = FastAPI(

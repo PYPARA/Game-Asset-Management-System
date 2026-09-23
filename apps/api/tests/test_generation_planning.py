@@ -800,15 +800,23 @@ def test_context_and_settings_staleness_are_rejected(client: TestClient) -> None
     assert response.status_code == 422
     assert "max_concurrency" in response.text
 
-    # A new Catalog fact changes the immutable project snapshot.  The old
-    # conversation cannot be confirmed against that stale context hash.
+    # Unrelated catalog drift must not block ordinary draft edits.
+    # Confirmation still rechecks the project snapshot and live references.
     create_asset(client, project["id"], key="entity.context-drift")
     edited = client.patch(
         f"/api/generation-conversations/{conversation['id']}/draft",
         json={"base_hash": conversation["draft_hash"], "draft": draft},
     )
-    assert edited.status_code == 409
-    assert "context changed" in edited.text
+    assert edited.status_code == 200, edited.text
+    saved = edited.json()
+    for effort, transparent in [("high", True), ("low", False)]:
+        modified = deepcopy(saved["draft"])
+        modified["settings"]["route_defaults"] = {"text":{"provider_profile_id":provider["id"],"model":"fake-text","reasoning_effort":effort}}
+        modified["tasks"][0]["transparent"] = transparent
+        response = client.patch(f"/api/generation-conversations/{conversation['id']}/draft",json={"base_hash":saved["draft_hash"],"draft":modified})
+        assert response.status_code == 200, response.text
+        saved = response.json()
+        assert saved["draft"]["tasks"][0]["transparent"] == transparent
 
 
 def test_adapter_events_never_persist_nested_hidden_reasoning() -> None:
@@ -947,3 +955,22 @@ def test_generation_conversation_lifecycle_and_reference_context(client: TestCli
     rescanned = client.post(f"/api/projects/{project['id']}/scan")
     assert rescanned.status_code == 200, rescanned.text
     assert rescanned.json()["errors"] == []
+
+
+def test_document_source_hash_alias_is_canonicalized_without_accepting_stale_hashes():
+    from game_assets_api.domain import GenerationReferenceProposal
+    from game_assets_api.models import Asset, AssetRevision
+    asset = SimpleNamespace(id='asset', project_id='project', key='design.style_bible.primary')
+    revision = SimpleNamespace(id='revision', asset_id='asset', format='json', content_hash='a'*64, input_hash='b'*64)
+    class Session:
+        def get(self, model, key):
+            return asset if model is Asset and key == 'asset' else revision if model is AssetRevision and key == 'revision' else None
+    ref = GenerationReferenceProposal(asset_id='asset',revision_id='revision',sha256='b'*64)
+    planning._reference_rows(Session(),'project',ref)
+    assert ref.sha256 == 'a'*64
+    ref.sha256 = 'c'*64
+    with pytest.raises(ServiceError,match='hash is stale'):
+        planning._reference_rows(Session(),'project',ref)
+    ref.revision_id = 'other'
+    with pytest.raises(ServiceError,match='revision.*invalid'):
+        planning._reference_rows(Session(),'project',ref)

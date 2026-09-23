@@ -82,6 +82,12 @@ class Database:
                 ("pending_action_id", "VARCHAR(48)"),
             ),
             "generation_attempts": (
+                ("dispatch_state", "VARCHAR(32) NOT NULL DEFAULT 'legacy_unknown'"),
+                ("dispatched_at", "DATETIME"),
+                ("dispatch_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("error_code", "VARCHAR(80)"),
+                ("error_hint", "TEXT"),
+                ("network_policy", "VARCHAR(40)"),
                 ("phase", "VARCHAR(40) NOT NULL DEFAULT 'succeeded'"),
                 ("purpose", "VARCHAR(40) NOT NULL DEFAULT 'base'"),
                 ("idempotency_key", "VARCHAR(160)"),

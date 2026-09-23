@@ -513,6 +513,7 @@ function normalizeJob(value: unknown): JobSummary {
 interface RevisionApiRecord {
   id: string;
   asset_id: string;
+  parent_revision_id?: string | null;
   sequence: number;
   format: "json" | "markdown" | "media";
   content: unknown;
@@ -599,6 +600,7 @@ function normalizeRevision(
   const suffix = status === "candidate" ? "候选" : status === "approved" ? "已批准" : status === "superseded" ? "已被替代" : "已驳回";
   return {
     id: revision.id,
+    parentRevisionId: revision.parent_revision_id,
     sequence: revision.sequence,
     label: `r${sequence}（${suffix}）`,
     image: rendition ? renditionUrl(rendition.id) : "",
@@ -630,7 +632,7 @@ async function mapWithConcurrency<T, R>(
   return results;
 }
 
-export async function fetchAssetDetails(asset: GameAsset): Promise<GameAsset> {
+export async function fetchAssetDetails(asset: GameAsset, requestedRevisionId?: string | null): Promise<GameAsset> {
   const revisions = await request<RevisionApiRecord[]>(
     `/revisions?asset_id=${encodeURIComponent(asset.id)}`,
   );
@@ -640,9 +642,14 @@ export async function fetchAssetDetails(asset: GameAsset): Promise<GameAsset> {
   const approved = asset.approvedRevisionId
     ? revisions.find((revision) => revision.id === asset.approvedRevisionId)
     : undefined;
-  const relevant = [candidate, approved].filter(
-    (revision): revision is RevisionApiRecord => Boolean(revision),
-  );
+  const requested = requestedRevisionId
+    ? revisions.find((revision) => revision.id === requestedRevisionId)
+    : undefined;
+  const relevant = Array.from(new Map(
+    [candidate, approved, requested]
+      .filter((revision): revision is RevisionApiRecord => Boolean(revision))
+      .map((revision) => [revision.id, revision]),
+  ).values());
   const renditionLists = await Promise.all(
     relevant.map((revision) =>
       request<RenditionApiRecord[]>(
@@ -1502,10 +1509,11 @@ export async function fetchGenerationConversations(
 export async function steerGenerationConversationTurn(
   sessionId: string,
   content: string,
+  clientMessageId?: string,
 ): Promise<GenerationConversationMessageResult> {
   return request<GenerationConversationMessageResult>(generationConversationPath(sessionId, "/steer"), {
     method: "POST",
-    body: JSON.stringify({ content }),
+    body: JSON.stringify({ content, client_message_id: clientMessageId }),
     timeoutMs: 20_000,
   });
 }
@@ -1556,10 +1564,15 @@ export async function fetchGenerationConversationEvents(
   sessionId: string,
   after = 0,
 ): Promise<GenerationConversationEvent[]> {
-  return request<GenerationConversationEvent[]>(
-    `${generationConversationPath(sessionId, "/events")}?after=${Math.max(0, after)}`,
-    { timeoutMs: 15_000 },
-  );
+  const events: GenerationConversationEvent[] = [];
+  let cursor = after;
+  while (true) {
+    const page = await request<GenerationConversationEvent[]>(`${generationConversationPath(sessionId, "/events")}?after=${Math.max(0,cursor)}&limit=2000`, { timeoutMs: 15_000 });
+    events.push(...page);
+    const next = Math.max(cursor, ...page.map(x=>x.sequence));
+    if (page.length < 2000 || next <= cursor) return events;
+    cursor = next;
+  }
 }
 
 export async function updateGenerationConversationDraft(
@@ -1764,6 +1777,7 @@ export async function resumeGenerationPlan(planId: string): Promise<GenerationJo
 export async function createRunRemediation(
   jobId: string,
   payload: {
+    idempotency_key?: string;
     action: "retry" | "tool_repair" | "regenerate" | "image_edit" | "await_user";
     strategy: string;
     reason: string;
@@ -1874,4 +1888,14 @@ export function subscribeToJobEvents(
     source.removeEventListener("job", handleJob as EventListener);
     source.close();
   };
+}
+
+export async function recoverGenerationTurn(sessionId: string, turnId: string, clientRequestId: string) {
+  return request(generationConversationPath(sessionId, `/turns/${encodeURIComponent(turnId)}/recover`), { method: "POST", body: JSON.stringify({client_request_id: clientRequestId}), timeoutMs: 20_000 });
+}
+export async function renameGenerationConversation(sessionId: string, title: string) {
+  return request<GenerationConversation>(generationConversationPath(sessionId, "/settings"), {method:"PATCH",body:JSON.stringify({title})});
+}
+export async function resolveGenerationProposal(sessionId: string, action: "keep" | "apply", baseHash: string) {
+  return request<GenerationConversation>(generationConversationPath(sessionId,"/proposal"), {method:"POST",body:JSON.stringify({action,base_hash:baseHash})});
 }

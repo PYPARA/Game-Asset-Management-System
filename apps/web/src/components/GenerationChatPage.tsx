@@ -36,6 +36,9 @@ import {
 } from "@phosphor-icons/react";
 import {
   ApiError,
+  recoverGenerationTurn,
+  renameGenerationConversation,
+  resolveGenerationProposal,
   answerGenerationInput,
   cancelGenerationConversationTurn,
   confirmGenerationConversation,
@@ -54,7 +57,6 @@ import {
   unarchiveGenerationConversation,
   updateGenerationConversationContext,
   updateGenerationConversationDraft,
-  updateGenerationConversationSettings,
 } from "../lib/api";
 import type {
   GenerationAssetProposal,
@@ -75,6 +77,10 @@ import { assetKindLabel, assetSubtypeLabel } from "../lib/labels";
 import { useModalFocus } from "../hooks/useModalFocus";
 import { MarkdownPreview } from "./MarkdownPreview";
 import { GenerationInputCard } from "./GenerationInputCard";
+import { useGenerationEvents } from "../lib/generationStore";
+import { GenerationAssetPreview, ReferenceTile } from "./GenerationAssetPreview";
+import { GenerationResults } from "./GenerationResults";
+import "./GenerationWorkspace.css";
 import { SelectMenu } from "./SelectMenu";
 
 function textValue(value: unknown, fallback = "") {
@@ -97,11 +103,17 @@ function queryErrorMessage(value: unknown, fallback: string): string {
 
 function eventText(event: GenerationConversationEvent): string {
   const data = event.data ?? {};
+  if (["turn.failed", "agent.unavailable"].includes(event.event_type)) {
+    if (/paginated_threads|thread\/resume.*not supported/i.test(String(data.reason))) return "原会话的恢复协议不兼容。继续本轮会保留已回答问题和当前方案，重建规划上下文。";
+    if (data.error_code === "process_restarted") return "服务重启中断了这次规划；对话与回答已保存，可以继续本轮。";
+  }
   return textValue(data.content ?? data.message ?? data.reason ?? data.text);
 }
 
-function compactConversationEvents(events: GenerationConversationEvent[]): GenerationConversationEvent[] {
-  const finalMessageTurns = new Set(events.filter((event) => event.event_type === "assistant.message").map((event) => event.turn_id).filter(Boolean));
+export function compactConversationEvents(events: GenerationConversationEvent[]): GenerationConversationEvent[] {
+  const streamKey = (event: GenerationConversationEvent) => `${event.turn_id}:${event.data.item_id ?? event.data.itemId ?? "legacy"}`;
+  const finalMessageItems = new Set(events.filter(event => event.event_type === "assistant.message" && (event.data.item_id || event.data.itemId)).map(streamKey));
+  const finalMessageTurns = new Set(events.filter(event => event.event_type === "assistant.message" && event.data.phase !== "commentary" && !event.data.item_id && !event.data.itemId).map(event => event.turn_id));
   const toolResults = new Set(events.filter((event) => event.event_type === "tool.result").map((event) => `${event.turn_id}:${textValue(event.data.itemId ?? event.data.item_id ?? event.data.tool)}`));
   const terminalErrorByTurn = new Map<string, string>();
   const activityCounts = new Map<string, number>();
@@ -122,8 +134,8 @@ function compactConversationEvents(events: GenerationConversationEvent[]): Gener
         if (!activityFirst.has(turnKey)) activityFirst.set(turnKey, event);
       }
     }
-    if (event.event_type === "assistant.delta" && !finalMessageTurns.has(event.turn_id)) {
-      assistantDeltas.set(turnKey, `${assistantDeltas.get(turnKey) ?? ""}${eventText(event)}`);
+    if (event.event_type === "assistant.delta" && !finalMessageTurns.has(event.turn_id) && !finalMessageItems.has(streamKey(event))) {
+      assistantDeltas.set(streamKey(event), `${assistantDeltas.get(streamKey(event)) ?? ""}${eventText(event)}`);
     }
     if (event.event_type === "reasoning.summary") {
       reasoningSummaries.set(turnKey, `${reasoningSummaries.get(turnKey) ?? ""}${eventText(event)}`);
@@ -137,6 +149,7 @@ function compactConversationEvents(events: GenerationConversationEvent[]): Gener
   const emittedReasoning = new Set<string>();
   const seenFinalMessages = new Set<string>();
   return events.flatMap((event) => {
+    if (event.event_type.startsWith("tool.") && event.data.tool === "userMessage") return [];
     if (event.event_type === "draft.updated" && event.data.source === "system") return [];
     if (event.event_type === "user.message" && event.data.input_request_answer === true) return [];
     const turnKey = event.turn_id ?? event.id;
@@ -145,9 +158,13 @@ function compactConversationEvents(events: GenerationConversationEvent[]): Gener
       && terminalErrorByTurn.get(turnKey) !== event.id
     ) return [];
     if (event.event_type === "assistant.delta") {
-      if (finalMessageTurns.has(event.turn_id) || emittedDeltas.has(turnKey)) return [];
-      emittedDeltas.add(turnKey);
-      return [{ ...event, data: { ...event.data, content: assistantDeltas.get(turnKey) ?? eventText(event) } }];
+      const key = streamKey(event);
+      if (finalMessageTurns.has(event.turn_id) || finalMessageItems.has(key) || emittedDeltas.has(key)) return [];
+      emittedDeltas.add(key);
+      const raw = assistantDeltas.get(key) ?? eventText(event);
+      // Structured draft JSON is progress, not user-facing prose.
+      const content = /\{\s*"(?:message|draft_json)"/.test(raw) ? `方案输出已接收 ${raw.length.toLocaleString()} 字符；完整输出通过校验后会显示方案。` : raw;
+      return [{ ...event, data: { ...event.data, content } }];
     }
     const activityName = textValue(event.data.tool, event.event_type === "reasoning.summary" ? "reasoning" : "commandExecution");
     if ((event.event_type === "tool.started" || event.event_type === "tool.result" || event.event_type === "reasoning.summary")
@@ -306,6 +323,7 @@ export interface GenerationChatPageProps {
   onSelectSession?: (sessionId: string) => void;
   onSessionCreated?: (sessionId: string) => void;
   onConfirmed?: (planId: string) => void;
+  onOpenAsset?: (assetId: string) => void;
   onSessionRemoved?: (sessionId: string) => void;
   workbenchData?: WorkbenchPayload;
 }
@@ -320,6 +338,7 @@ export function GenerationChatPage({
   onSelectSession,
   onSessionCreated,
   onConfirmed,
+  onOpenAsset,
   onSessionRemoved,
   workbenchData,
 }: GenerationChatPageProps = {}) {
@@ -333,10 +352,49 @@ export function GenerationChatPage({
   });
   const [conversation, setConversation] = useState<GenerationConversation | null>(null);
   const [draft, setDraft] = useState<GenerationPlanningDraft | null>(null);
-  const [events, setEvents] = useState<GenerationConversationEvent[]>([]);
+  const stream = useGenerationEvents(activeSessionId);
+  const events = stream.events;
+  const allVisibleEvents = useMemo(()=>compactConversationEvents(events),[events]);
+
+  const connected = stream.connected;
   const [inputRequests, setInputRequests] = useState<Record<string, GenerationInputRequest>>({});
   const [input, setInput] = useState("");
-  const [connected, setConnected] = useState(false);
+  const inputOwner = useRef<string | null | undefined>(undefined);
+  const sendBusy = useRef(false);
+  const messageKey = useRef<{content:string;id:string}|null>(null);
+  const recoverKeys = useRef(new Map<string,string>());
+  const [sessionSearch, setSessionSearch] = useState("");
+  const [renaming, setRenaming] = useState<string | null>(null);
+  const [renameText, setRenameText] = useState("");
+  const [workTab, setWorkTab] = useState<"plan"|"references"|"results">("plan");
+  const [previewAsset, setPreviewAsset] = useState<GameAsset|null>(null);
+  const [taskPickerOpen, setTaskPickerOpen] = useState(false);
+  const [taskSearch, setTaskSearch] = useState("");
+  const taskDialogRef=useRef<HTMLElement>(null);
+  const renameDialogRef=useRef<HTMLElement>(null);
+  useModalFocus({open:taskPickerOpen,dialogRef:taskDialogRef,initialFocusRef:taskDialogRef,onClose:()=>setTaskPickerOpen(false)});
+  useModalFocus({open:!!renaming,dialogRef:renameDialogRef,initialFocusRef:renameDialogRef,onClose:()=>setRenaming(null)});
+  const [historyLimit, setHistoryLimit] = useState(60);
+  const [newMessages, setNewMessages] = useState(false);
+  const chatScroll = useRef<HTMLDivElement>(null);
+  const followBottom = useRef(true);
+  const restoreScroll = useRef<number|null>(null);
+  const lifecycleCursor = useRef(0);
+  useEffect(()=>{
+    inputOwner.current = activeSessionId;
+    setInput(activeSessionId ? sessionStorage.getItem(`gams.composer.${activeSessionId}`) ?? "" : "");
+    try { messageKey.current = JSON.parse(sessionStorage.getItem(`gams.operation.${activeSessionId}`) ?? "null"); } catch { messageKey.current = null; }
+    lifecycleCursor.current = 0;
+    setHistoryLimit(60);
+    const savedScroll=activeSessionId ? sessionStorage.getItem(`gams.scroll.${activeSessionId}`) : null;
+    restoreScroll.current=savedScroll===null?null:Number(savedScroll);
+    followBottom.current=savedScroll===null;
+  },[activeSessionId]);
+  const changeInput = (value:string) => {
+    setInput(value);
+    if (activeSessionId) sessionStorage.setItem(`gams.composer.${activeSessionId}`,value);
+  };
+
   const [sending, setSending] = useState(false);
   const [saving, setSaving] = useState(false);
   const [draftSaveFailed, setDraftSaveFailed] = useState(false);
@@ -345,9 +403,14 @@ export function GenerationChatPage({
   const [previewOpen, setPreviewOpen] = useState(false);
   const [acceptedWarningCodes, setAcceptedWarningCodes] = useState<string[]>([]);
   const [manualMode, setManualMode] = useState(false);
-  const [agentModel, setAgentModel] = useState<string | null>(null);
   const [leftCollapsed, setLeftCollapsed] = useState(false);
-  const [planCollapsed, setPlanCollapsed] = useState(false);
+  const [planCollapsed, setPlanCollapsed] = useState(()=>window.innerWidth < 1200);
+  useEffect(()=>{
+    const onResize=()=>{ if(window.innerWidth<1200)setPlanCollapsed(true); };
+    window.addEventListener("resize",onResize);
+    return ()=>window.removeEventListener("resize",onResize);
+  },[]);
+  const [panelWidth,setPanelWidth] = useState(400);
   const [activePanel, setActivePanel] = useState<"context" | "chat" | "plan">("chat");
   const [selectedContextIds, setSelectedContextIds] = useState<string[]>(seedAssetIds);
   const [toast, setToast] = useState("");
@@ -369,10 +432,10 @@ export function GenerationChatPage({
   }, [conversation]);
 
   useEffect(() => {
-    setEvents([]);
+
     setInputRequests({});
     eventCursor.current = 0;
-    setConnected(false);
+
     setSending(false);
     setError("");
     setConversation(null);
@@ -386,6 +449,7 @@ export function GenerationChatPage({
     queryFn: () => fetchGenerationConversation(activeSessionId as string),
     enabled: Boolean(activeSessionId),
     staleTime: 0,
+    refetchInterval: 3000,
   });
 
   const recentQuery = useQuery<GenerationConversationSummary[]>({
@@ -393,6 +457,7 @@ export function GenerationChatPage({
     queryFn: () => fetchGenerationConversations(workbench?.project.id),
     enabled: Boolean(workbench?.project.id),
     staleTime: 10_000,
+    refetchInterval: 5000,
   });
   const capabilitiesQuery = useQuery<GenerationAgentCapabilities>({
     queryKey: ["generation-agent-capabilities"],
@@ -410,9 +475,6 @@ export function GenerationChatPage({
   const [referencePickerOpen, setReferencePickerOpen] = useState(false);
   const [referenceSaving, setReferenceSaving] = useState(false);
   const [referenceSearch, setReferenceSearch] = useState("");
-  const [agentModelOpen, setAgentModelOpen] = useState(false);
-  const [agentModelSearch, setAgentModelSearch] = useState("");
-  const [agentModelSaving, setAgentModelSaving] = useState(false);
   const [recentMenuId, setRecentMenuId] = useState<string | null>(null);
   const [archivedOpen, setArchivedOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<GenerationConversationSummary | null>(null);
@@ -446,9 +508,11 @@ export function GenerationChatPage({
   useEffect(() => {
     const value = existingConversationQuery.data;
     if (!value) return;
+    if (value.last_sequence !== undefined && value.last_sequence < lifecycleCursor.current && conversationRef.current) return;
+    lifecycleCursor.current = value.last_sequence ?? lifecycleCursor.current;
     setConversation(value);
     if (value.pending_input) setInputRequests((current) => ({ ...current, [value.pending_input!.id]: value.pending_input! }));
-    setDraft(value.draft);
+    if (!pendingDraftRef.current && !saveInFlightRef.current) setDraft(value.draft);
     setSending(value.status === "running");
     setDraftSaveFailed(false);
     setManualMode(value.status === "unavailable" || value.status === "failed");
@@ -461,94 +525,40 @@ export function GenerationChatPage({
   }, [capabilitiesQuery.data]);
 
   useEffect(() => {
-    if (!conversation) return;
-    setAgentModel(conversation.agent_model ?? null);
-  }, [conversation?.id, conversation?.agent_model]);
-
-  useEffect(() => {
-    if (!activeSessionId) return;
-    let cancelled = false;
-    const applyLifecycleEvent = (event: GenerationConversationEvent) => {
+    const fresh = events.filter(event=>event.sequence > lifecycleCursor.current);
+    for (const event of fresh) {
+      lifecycleCursor.current = event.sequence;
       if (event.event_type === "user_input.requested" && typeof event.data.id === "string") {
         const item = event.data as unknown as GenerationInputRequest;
-        setInputRequests((current) => ({ ...current, [item.id]: item }));
-        setConversation((current) => current ? { ...current, status: item.response_mode === "resume_turn" ? "awaiting_input" : "awaiting_user", pending_input: item } : current);
+        setInputRequests(current=>({...current,[item.id]:item}));
+        setConversation(current=>current ? {...current,status:"awaiting_input",pending_input:item} : current);
         setSending(false);
-      } else if ((event.event_type === "user_input.fallback" || event.event_type === "user_input.resolved" || event.event_type === "user_input.cancelled") && typeof event.data.id === "string") {
-        const item = event.data as unknown as GenerationInputRequest;
-        setInputRequests((current) => ({ ...current, [item.id]: item }));
-        setConversation((current) => current ? { ...current, status: item.status === "resolved" ? "running" : "awaiting_user", pending_input: item.status === "pending" ? item : null } : current);
-        setSending(item.status === "resolved");
-      } else if (event.event_type === "agent.unavailable") {
-        setManualMode(true);
+      } else if (["user_input.resolved","user_input.cancelled","user_input.fallback"].includes(event.event_type) && typeof event.data.id === "string") {
+        const item=event.data as unknown as GenerationInputRequest;
+        setInputRequests(current=>({...current,[item.id]:item}));
+      } else if (["turn.started","turn.recovering"].includes(event.event_type)) {
+        setSending(true); setManualMode(false);
+        setConversation(current=>current ? {...current,status:"running"} : current);
+      } else if (["turn.failed","turn.completed","agent.unavailable"].includes(event.event_type)) {
         setSending(false);
-        setConversation((current) => current ? { ...current, status: "unavailable" } : current);
-      } else if (event.event_type === "turn.failed") {
-        setSending(false);
-        setConversation((current) => current ? {
-          ...current,
-          status: current.status === "unavailable" ? "unavailable" : "awaiting_user",
-        } : current);
-      } else if (event.event_type === "turn.completed") {
-        setSending(false);
-        setConversation((current) => current ? { ...current, status: "awaiting_user" } : current);
+        setConversation(current=>current ? {...current,status:"awaiting_user"} : current);
       }
-    };
-    void fetchGenerationConversationEvents(activeSessionId, 0).then((history) => {
-      if (cancelled) return;
-      // The SSE subscription starts before the durable history request can
-      // finish. Merge both sources so a live event is never overwritten by a
-      // slower initial GET response (this is especially common on refresh).
-      setEvents((current) => {
-        const byId = new Map(current.map((item) => [item.id, item]));
-        for (const item of history) byId.set(item.id, item);
-        return [...byId.values()].sort((left, right) => left.sequence - right.sequence);
-      });
-      eventCursor.current = Math.max(
-        eventCursor.current,
-        history.reduce((max, item) => Math.max(max, item.sequence), 0),
-      );
-      for (const event of history) applyLifecycleEvent(event);
-    }).catch((reason: unknown) => {
-      if (!cancelled) setError(reason instanceof Error ? reason.message : "历史事件读取失败。");
-    });
-    const unsubscribe = subscribeToGenerationConversationEvents(
-      activeSessionId,
-      (event) => {
-        setEvents((current) => {
-          if (current.some((item) => item.id === event.id || (event.sequence > 0 && item.sequence === event.sequence))) return current;
-          return [...current, event].sort((left, right) => left.sequence - right.sequence);
-        });
-        eventCursor.current = Math.max(eventCursor.current, event.sequence);
-        if (event.event_type === "draft.updated" && event.data.draft && typeof event.data.draft === "object") {
-          if (pendingDraftRef.current || saveInFlightRef.current) return;
-          setDraft(event.data.draft as GenerationPlanningDraft);
-          setDraftSaveFailed(false);
-          setConversation((current) => current ? {
-            ...current,
-            draft: event.data.draft as GenerationPlanningDraft,
-            draft_hash: textValue(event.data.draft_hash, current.draft_hash ?? "") || null,
-            draft_version: numberValue(event.data.draft_version, current.draft_version),
-            status: "awaiting_user",
-          } : current);
-        }
-        applyLifecycleEvent(event);
-      },
-      setConnected,
-      eventCursor.current,
-    );
-    return () => {
-      cancelled = true;
-      unsubscribe();
-    };
-  }, [activeSessionId]);
-
-  useEffect(() => {
-    const target = chatEndRef.current;
-    if (target && typeof target.scrollIntoView === "function") {
-      target.scrollIntoView({ behavior: "smooth", block: "end" });
+      if (event.event_type === "draft.updated" && event.data.draft && !pendingDraftRef.current && !saveInFlightRef.current) {
+        setDraft(event.data.draft as GenerationPlanningDraft);
+        setConversation(current=>current ? {...current,draft_hash:textValue(event.data.draft_hash,current.draft_hash ?? ""),draft_version:numberValue(event.data.draft_version,current.draft_version)} : current);
+      }
     }
-  }, [events.length]);
+    // Hydrate answered cards even when the server snapshot is newer than history.
+    const requests:Record<string,GenerationInputRequest>={};
+    for (const event of events) if (event.event_type.startsWith("user_input.") && typeof event.data.id === "string") requests[event.data.id]=event.data as unknown as GenerationInputRequest;
+    setInputRequests(current=>({...current,...requests}));
+  },[events,conversation?.id]);
+  useEffect(()=>{
+    if (restoreScroll.current!==null && chatScroll.current && events.length) {
+      chatScroll.current.scrollTop=restoreScroll.current;restoreScroll.current=null;
+    } else if (followBottom.current) chatEndRef.current?.scrollIntoView?.({block:"end"});
+    else setNewMessages(true);
+  },[events]);
 
   useEffect(() => {
     if (!toast) return;
@@ -559,7 +569,7 @@ export function GenerationChatPage({
   useEffect(() => {
     if (!previewOpen) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setPreviewOpen(false);
+      if (!event.defaultPrevented && event.key === "Escape") setPreviewOpen(false);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
@@ -573,7 +583,7 @@ export function GenerationChatPage({
   useEffect(() => {
     if (!open) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
+      if (event.defaultPrevented || event.key !== "Escape") return;
       if (document.querySelector('[data-nested-modal="true"]')) return;
       if (previewOpen) {
         setPreviewOpen(false);
@@ -591,15 +601,11 @@ export function GenerationChatPage({
         setDeleteTarget(null);
         return;
       }
-      if (agentModelOpen) {
-        setAgentModelOpen(false);
-        return;
-      }
       onClose?.();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [agentModelOpen, archivedOpen, deleteTarget, onClose, open, previewOpen, referencePickerOpen]);
+  }, [archivedOpen, deleteTarget, onClose, open, previewOpen, referencePickerOpen]);
 
   useEffect(() => () => {
     if (saveTimerRef.current !== null) window.clearTimeout(saveTimerRef.current);
@@ -674,7 +680,7 @@ export function GenerationChatPage({
         const next = pendingDraftRef.current;
         pendingDraftRef.current = null;
         const currentConversation = conversationRef.current;
-        if (!next || !currentConversation?.draft_hash || currentConversation.plan_id) break;
+        if (!next || !currentConversation?.draft_hash || currentConversation.status === "completed") break;
         setError("");
         let failed = false;
         const requestPromise = (async () => {
@@ -721,6 +727,19 @@ export function GenerationChatPage({
     }, 280);
   }, [flushDraftSave]);
 
+  const refreshAndKeepDraft = async () => {
+    const pending=pendingDraftRef.current;
+    const current=conversationRef.current;
+    if (!pending || !current) return;
+    try {
+      const refreshed=await updateGenerationConversationContext(current.id,selectedContextIds);
+      conversationRef.current=refreshed;
+      setConversation(refreshed);
+      pendingDraftRef.current={...pending,context_hash:refreshed.context_hash};
+      setSaving(true);
+      await flushDraftSave();
+    } catch(reason) { setError(queryErrorMessage(reason,"刷新失败，编辑仍保留。")); }
+  };
   const retryDraftSave = useCallback(() => {
     if (!pendingDraftRef.current || saving) return;
     setDraftSaveFailed(false);
@@ -738,31 +757,42 @@ export function GenerationChatPage({
     scheduleDraftSave(next);
   }, [currentDraft, scheduleDraftSave]);
 
-  const sendMessage = async (retryContent?: string, refreshContext = false, forceNewTurn = false) => {
-    const content = (retryContent ?? input).trim();
-    if (!content || !conversation || conversation.plan_id || hasPendingInput) return;
-    setInput("");
+  const sendMessage = async () => {
+    const content=input.trim();
+    if (!content || !conversation || hasPendingInput || sendBusy.current) return;
+    sendBusy.current=true;
+    const id=conversation.id;
+    messageKey.current = messageKey.current?.content===content ? messageKey.current : {content,id:crypto.randomUUID()};
+    sessionStorage.setItem(`gams.operation.${id}`,JSON.stringify(messageKey.current));
     setError("");
     try {
-      let activeConversation = conversation;
-      if (refreshContext && (forceNewTurn || conversation.status !== "running")) {
-        activeConversation = await updateGenerationConversationContext(conversation.id, selectedContextIds);
-        conversationRef.current = activeConversation;
-        setConversation(activeConversation);
-        setDraft(activeConversation.draft);
-      }
-      if (!forceNewTurn && (sending || activeConversation.status === "running")) {
-        await steerGenerationConversationTurn(activeConversation.id, content);
-        setToast("追加指令已发送到当前 Codex 回合。");
+      if (sending || conversation.status === "running") {
+        await steerGenerationConversationTurn(id, content, messageKey.current.id);
       } else {
         setSending(true);
-        await sendGenerationConversationMessage(activeConversation.id, content, selectedContextIds);
-        setConversation((current) => current ? { ...current, status: "running", turn_count: current.turn_count + 1 } : current);
+        await sendGenerationConversationMessage(id, content, selectedContextIds, messageKey.current.id);
       }
-    } catch (reason: unknown) {
-      if (forceNewTurn || conversation.status !== "running") setSending(false);
-      setError(reason instanceof Error ? reason.message : "消息发送失败。");
-    }
+      if (inputOwner.current === id) {
+        changeInput(""); messageKey.current=null; sessionStorage.removeItem(`gams.operation.${id}`);
+        const latest=await fetchGenerationConversation(id);
+        if (inputOwner.current === id) { setConversation(latest); setDraft(latest.draft); }
+        setToast("指令已接受");
+      }
+    } catch (reason) {
+      if (inputOwner.current===id) { setSending(false);setError(reason instanceof Error ? reason.message : "发送失败，原文已保留。"); }
+    } finally { sendBusy.current=false; }
+  };
+  const recover = async (turnId:string) => {
+    if (!conversation || sendBusy.current) return;
+    sendBusy.current=true;
+    const key=recoverKeys.current.get(turnId) ?? crypto.randomUUID();
+    recoverKeys.current.set(turnId,key);
+    try {
+      await recoverGenerationTurn(conversation.id,turnId,key);
+      setSending(true);setManualMode(false);
+      void existingConversationQuery.refetch();
+    } catch(reason) { setError(reason instanceof Error ? reason.message : "恢复失败，现场已保留。"); }
+    finally {sendBusy.current=false;}
   };
 
   const answerInput = async (item: GenerationInputRequest, answers: Record<string, { answers: string[] }>, clientResponseId: string) => {
@@ -805,15 +835,12 @@ export function GenerationChatPage({
         setConversation(refreshed);
         setDraft(refreshed.draft);
         if (!refreshed.draft_hash) throw new Error("上下文已刷新，但方案尚未保存完成。");
-        result = await confirmGenerationConversation(
-          refreshed.id,
-          refreshed.draft_hash,
-          acceptedWarningCodes,
-          refreshed.context_hash,
-        );
+        setConfirmChecked(false);
+        throw new Error("项目快照已刷新，编辑内容已保留。请重新核对当前预览并勾选确认后执行。");
       }
       setConversation(result.conversation);
-      setToast("已确认。正在打开运行检查器…");
+      setToast("已确认，执行进度与结果会保留在当前会话。");
+      setPreviewOpen(false);setConfirmChecked(false);setWorkTab("results");
       onConfirmed?.(result.plan.id);
     } catch (reason: unknown) {
       setError(reason instanceof ApiError ? reason.message : reason instanceof Error ? reason.message : "确认执行失败。");
@@ -843,28 +870,6 @@ export function GenerationChatPage({
       setError(reason instanceof ApiError ? reason.message : reason instanceof Error ? reason.message : "参考资产保存失败。");
     } finally {
       setReferenceSaving(false);
-    }
-  };
-
-  const selectAgentModel = async (nextModel: string | null) => {
-    if (!conversation || agentModelSaving || conversation.plan_id) return;
-    const previous = agentModel;
-    setAgentModel(nextModel);
-    setAgentModelSaving(true);
-    setError("");
-    try {
-      const saved = await updateGenerationConversationSettings(conversation.id, nextModel);
-      conversationRef.current = saved;
-      setConversation(saved);
-      setAgentModel(saved.agent_model ?? null);
-      setAgentModelOpen(false);
-      setAgentModelSearch("");
-      setToast(nextModel ? `规划 Agent 已切换为 ${nextModel}。` : "规划 Agent 将使用 Codex 默认模型。");
-    } catch (reason: unknown) {
-      setAgentModel(previous);
-      setError(reason instanceof ApiError ? reason.message : reason instanceof Error ? reason.message : "规划模型保存失败。");
-    } finally {
-      setAgentModelSaving(false);
     }
   };
 
@@ -977,49 +982,47 @@ export function GenerationChatPage({
   const recent = recentQuery.data ?? [];
   const archived = (archivedQuery.data ?? []).filter((item) => Boolean(item.archived_at));
   const providers = providersQuery.data ?? [];
-  const agentModels = capabilitiesQuery.data?.models ?? [];
-  const filteredAgentModels = agentModels.filter((model) => {
-    const needle = agentModelSearch.trim().toLocaleLowerCase();
-    return !needle || `${model.id} ${model.name}`.toLocaleLowerCase().includes(needle);
-  });
   const routeDefaults = currentDraft?.settings.route_defaults ?? {};
-  const visibleEvents = compactConversationEvents(events);
-  const routeEditingDisabled = !conversation || sending || hasPendingInput || conversation.status === "running" || saving || Boolean(conversation.plan_id);
+  const historyEnd = Math.max(0, allVisibleEvents.length - historyLimit + 60);
+  const visibleEvents = allVisibleEvents.slice(Math.max(0, historyEnd - 60), historyEnd);
+  const routeEditingDisabled = !conversation || sending || hasPendingInput || conversation.status === "running" || saving || conversation.status === "completed";
 
   return (
     <div
+      style={{"--generation-panel-width": `${panelWidth}px`} as React.CSSProperties}
       className={`generation-chat-page generation-drawer-page ${open ? "open" : "closed"} ${leftCollapsed ? "left-collapsed" : ""} ${planCollapsed ? "plan-collapsed" : ""} panel-${activePanel}`}
     >
       <header className="generation-chat-topbar">
         <button ref={closeButtonRef} className="generation-close-button" type="button" onClick={onClose} aria-label="收起生成中心"><X size={18} /> <span>生成中心</span></button>
-        <div className="generation-title-lockup"><span className="generation-kicker">AGENT WORKBENCH / 生成中心</span><h1>{currentDraft?.title ?? conversation?.title ?? "生成中心"}</h1></div>
-        <div className="generation-topbar-meta"><span className={`generation-connection ${connected ? "online" : ""}`}><i />{connected ? "事件流已连接" : "正在连接事件流"}</span><span className={`generation-connection ${capabilitiesQuery.data?.available ? "online" : ""}`}><i />{capabilitiesQuery.isLoading ? "检测 Codex" : capabilitiesQuery.data?.available ? "Codex 可用" : "人工模式"}</span><AgentModelPicker models={agentModels} value={agentModel} search={agentModelSearch} open={agentModelOpen} saving={agentModelSaving} disabled={!conversation || Boolean(conversation?.plan_id)} onSearch={setAgentModelSearch} onOpen={() => setAgentModelOpen((current) => !current)} onSelect={(value) => void selectAgentModel(value)} /><span className="generation-project-name">{projectName}</span></div>
+        <div className="generation-title-lockup"><span className="generation-kicker">AGENT WORKBENCH / 生成中心</span><h1>{conversation?.title ?? currentDraft?.title ?? "生成中心"}</h1></div>
+        <div className="generation-topbar-meta"><button type="button" className="button secondary" onClick={()=>setPlanCollapsed(x=>!x)}>工作面板</button><span className={`generation-connection ${connected ? "online" : ""}`}><i />{connected ? "事件流已连接" : "正在连接事件流"}</span><span className="generation-planning-route" title="规划与文字产物使用下方文字路由；运行记录和凭据与个人 Codex 隔离">规划 · {routeLabel(routeDefaults.text, providers)}</span><span className="generation-project-name">{projectName}</span></div>
       </header>
 
       <nav className="generation-mobile-tabs" aria-label="生成中心面板">
         <button type="button" className={activePanel === "context" ? "active" : ""} onClick={() => setActivePanel("context")}><ChatCircleDots size={14} /> 会话</button>
-        <button type="button" className={activePanel === "chat" ? "active" : ""} onClick={() => setActivePanel("chat")}><Sparkle size={14} /> 对话</button>
-        <button type="button" className={activePanel === "plan" ? "active" : ""} onClick={() => setActivePanel("plan")}><ListChecks size={14} /> 方案</button>
+        <button type="button" className={activePanel === "chat" ? "active" : ""} onClick={() => {setActivePanel("chat");if(window.innerWidth<900)setPlanCollapsed(true);}}><Sparkle size={14} /> 对话</button>
+        <button type="button" className={activePanel === "plan" ? "active" : ""} onClick={() => {setActivePanel("plan");setPlanCollapsed(false);}}><ListChecks size={14} /> 方案</button>
       </nav>
 
       <div className="generation-chat-body">
-        <aside className="generation-context-rail" aria-label="本次上下文">
-          <div className="generation-rail-heading"><span>本次上下文</span><button className="icon-button" type="button" onClick={() => setLeftCollapsed(true)} aria-label="折叠上下文栏"><Minus size={16} /></button></div>
-          <div className="generation-context-orbit"><span className="orbit-core"><Sparkle size={18} weight="fill" /></span><span className="orbit-ring orbit-ring-one" /><span className="orbit-ring orbit-ring-two" /><strong>{selectedContextIds.length}</strong><small>固定资产</small></div>
-          <div className="generation-context-list">
-            {selectedAssets.length > 0 ? selectedAssets.map((asset) => (
-              <div className="generation-context-item" key={asset.id}><span className="context-icon">{asset.kind === "media" ? <ImageSquare size={15} /> : <FileArrowUp size={15} />}</span><div><strong>{asset.name}</strong><small>{asset.key}</small></div><button type="button" onClick={() => void updateReferenceContext(selectedContextIds.filter((id) => id !== asset.id))} aria-label={`移除参考 ${asset.name}`} disabled={referenceSaving}><X size={13} /></button></div>
-            )) : <p className="generation-muted-copy">还没有固定参考资产。你可以从输入框打开筛选器，或直接告诉 Agent 要参考什么。</p>}
-          </div>
-          <div className="generation-rail-section"><div className="generation-rail-heading"><span>最近会话</span><span className="generation-rail-actions"><button className="icon-button generation-new-session-button" type="button" onClick={onNewSession} aria-label="新建会话"><Plus size={15} /></button><ChatCircleDots size={15} /></span></div>{recent.slice(0, 5).map((item) => <div key={item.id} className={`generation-recent-row ${item.id === conversation?.id ? "active" : ""}`}><button className="generation-recent-item" type="button" onClick={() => onSelectSession?.(item.id)}><span>{item.title ?? "未命名任务"}</span><small>{item.status === "completed" ? "已确认" : item.status === "awaiting_input" ? "等待回答" : item.status === "unavailable" ? "人工模式" : `${item.turn_count} 回合`}</small></button><button className="icon-button generation-recent-menu-button" type="button" aria-label={`管理会话 ${item.title ?? "未命名任务"}`} onClick={() => setRecentMenuId((current) => current === item.id ? null : item.id)}><DotsThree size={16} /></button>{recentMenuId === item.id && <div className="generation-recent-menu" role="menu"><button type="button" onClick={() => void archiveSession(item)} disabled={item.status === "running" || item.status === "awaiting_input"}><Archive size={14} /> 归档</button><button type="button" className="danger" onClick={() => { setDeleteTarget(item); setRecentMenuId(null); }} disabled={item.status === "running" || item.status === "awaiting_input"}><Trash size={14} /> 永久删除</button></div>}</div>) }<button type="button" className="generation-archive-link" onClick={() => setArchivedOpen(true)}><Archive size={13} /> 已归档会话{archivedQuery.data ? ` · ${archived.length}` : ""}</button></div>
-          <div className="generation-context-footer"><button className="button secondary compact" type="button" onClick={() => setLeftCollapsed(true)}><CaretRight size={15} /> 收起栏</button></div>
+        <aside className="generation-context-rail" aria-label="会话列表">
+          <div className="generation-sessions-head"><h2>会话</h2><button className="button secondary" type="button" onClick={onNewSession} aria-label="新建会话"><Plus size={16}/> 新建</button></div>
+          <label className="generation-session-search"><MagnifyingGlass size={16}/><input aria-label="搜索会话" placeholder="搜索会话" value={sessionSearch} onChange={e=>setSessionSearch(e.target.value)}/></label>
+          <div className="generation-sessions-list">{recent.filter(item=>(item.title??"").includes(sessionSearch)).map(item=><div key={item.id} className={`generation-recent-row ${item.id===conversation?.id ? "active":""}`}>
+            <button className="generation-recent-item" type="button" onClick={()=>onSelectSession?.(item.id)}><span>{item.title??"新会话"}</span><small>{item.status==="running" ? "规划中" : item.status==="awaiting_input" ? "待回答" : item.status==="unavailable" ? "需要恢复" : item.plan_id ? "查看结果" : "可继续"} · {new Date(item.updated_at).toLocaleDateString("zh-CN")}</small></button>
+            <button className="icon-button" type="button" aria-label={`管理会话 ${item.title??"新会话"}`} onClick={()=>setRecentMenuId(recentMenuId===item.id?null:item.id)}><DotsThree size={18}/></button>
+            {recentMenuId===item.id && <div className="generation-recent-menu"><button type="button" onClick={()=>{setRenaming(item.id);setRenameText(item.title??"");setRecentMenuId(null);}}>重命名</button><button type="button" disabled={item.status==="running"||item.status==="awaiting_input"} onClick={()=>void archiveSession(item)}>归档</button></div>}
+          </div>)}</div>
+          <button type="button" className="generation-archive-link" onClick={()=>setArchivedOpen(true)}><Archive size={16}/> 已归档会话</button>
         </aside>
 
         <main className="generation-conversation-column">
           {conversation ? <>
-          <div className="generation-conversation-scroll">
-            <section className="generation-intro-card"><div className="generation-intro-mark"><MagicWand size={22} weight="duotone" /></div><div><span className="generation-kicker">规划回合 {conversation?.turn_count ?? 0}</span><h2>把目标说清楚，方案会自己长出来。</h2><p>Agent 只读取项目事实和固定参考，不会在确认前创建资产、计划或调用供应商。</p></div><span className={`generation-mode-badge ${manualMode ? "manual" : "agent"}`}>{manualMode ? <><SlidersHorizontal size={14} /> 人工编排</> : <><Robot size={14} /> Agent 规划</>}</span></section>
-            {manualMode && <div className="generation-manual-banner" role="status"><ShieldWarning size={18} weight="fill" /><div><strong>Agent 暂不可用，方案编辑仍可继续。</strong><span>{capabilitiesQuery.data?.diagnostic?.hint || "检查本机 Codex 是否安装并登录；也可以在右侧手动补齐资源、参考图、渠道和落地路径。"}</span></div><button type="button" onClick={() => setManualMode(false)}>继续人工编排</button></div>}
+          <div className="generation-conversation-scroll" ref={chatScroll} onScroll={()=>{const el=chatScroll.current;if(el) {followBottom.current=el.scrollHeight-el.scrollTop-el.clientHeight<100;if(activeSessionId)sessionStorage.setItem(`gams.scroll.${activeSessionId}`,String(el.scrollTop));}}}>
+            {allVisibleEvents.length>historyLimit && <button className="button secondary" type="button" onClick={()=>{followBottom.current=false;setHistoryLimit(n=>n+60);}}>加载更早的对话</button>}
+            {historyLimit > 60 && <button className="button secondary" type="button" onClick={()=>setHistoryLimit(n=>Math.max(60,n-60))}>较新的对话</button>}
+            {events.length < 3 && <section className="generation-intro-card"><div className="generation-intro-mark"><MagicWand size={22} weight="duotone" /></div><div><span className="generation-kicker">规划回合 {conversation?.turn_count ?? 0}</span><h2>把目标说清楚，方案会自己长出来。</h2><p>Agent 只读取项目事实和固定参考，规划会使用所选文字供应商；资产生成须另行确认。</p></div><span className={`generation-mode-badge ${manualMode ? "manual" : "agent"}`}>{manualMode ? <><SlidersHorizontal size={14} /> 人工编排</> : <><Robot size={14} /> Agent 规划</>}</span></section>}
+            {manualMode && !capabilitiesQuery.data?.available && <div className="generation-manual-banner" role="status"><ShieldWarning size={18} weight="fill" /><div><strong>Agent 暂不可用，方案编辑仍可继续。</strong><span>{capabilitiesQuery.data?.diagnostic?.hint || "检查本机 Codex 是否安装并登录；也可以在右侧手动补齐资源、参考图、渠道和落地路径。"}</span></div><button type="button" onClick={() => setManualMode(false)}>继续人工编排</button></div>}
             {visibleEvents.map((event) => {
               const isUser = event.event_type === "user.message";
               const isTool = event.event_type === "tool.started" || event.event_type === "tool.progress" || event.event_type === "tool.result";
@@ -1027,9 +1030,11 @@ export function GenerationChatPage({
               if (event.event_type === "user_input.requested") {
                 const requestId = textValue(event.data.id);
                 const item = inputRequests[requestId] ?? (conversation.pending_input?.id === requestId ? conversation.pending_input : null);
+                if (pendingInput?.id === requestId) return null;
                 return item ? <GenerationInputCard key={requestId} request={item} onAnswer={answerInput} /> : null;
               }
               if (["user_input.resolved", "user_input.fallback", "user_input.cancelled"].includes(event.event_type)) return null;
+              if (event.event_type === "draft.updated" && event.data.source === "context.refresh") return null;
               if (event.event_type === "draft.updated") {
                 return <article className="generation-draft-event" key={event.id}><CheckCircle size={15} /><span><strong>方案已更新</strong><small>{event.data.source === "context.refresh" ? "项目上下文发生变化，已刷新草案哈希" : `草案版本 ${event.data.draft_version == null ? "—" : String(event.data.draft_version)}`}</small></span></article>;
               }
@@ -1039,29 +1044,35 @@ export function GenerationChatPage({
                 const activitySummary = textValue(event.data.summary);
                 return <article className={`generation-event-card tool-event ${event.event_type === "tool.result" ? "result" : ""}`} key={event.id}><button type="button" className="generation-tool-head" onClick={() => setExpandedTools((current) => ({ ...current, [event.id]: !expanded }))}><span className="generation-tool-icon"><Toolbox size={15} /></span><span><strong>{toolName === "agent.activity" ? "Agent 活动摘要" : toolName}</strong><small>{activitySummary || (event.event_type === "tool.started" ? "开始" : event.event_type === "tool.progress" ? "进行中" : "已完成")}</small></span><CaretDown size={14} className={expanded ? "rotated" : ""} /></button>{expanded && <pre>{JSON.stringify(event.data, null, 2)}</pre>}</article>;
               }
-              const message = eventText(event) || (event.event_type === "turn.completed" ? "方案已更新，可以在右侧继续编辑。" : "");
-              const retryContent = textValue([...events].reverse().find((item) => item.event_type === "user.message")?.data.content);
-              const refreshContext = event.data.error_code === "context_invalid";
+              const message = event.event_type === "conversation.confirmed" ? "本批方案已确认，执行进度和产物在右侧结果中查看。" : eventText(event) || (event.event_type === "turn.completed" ? "方案已更新，可以在右侧继续编辑。" : "");
+              const retryTurn = event.turn_id ?? conversation.current_turn_id;
+              const latestError = [...allVisibleEvents].reverse().find(item=>item.event_type === "turn.failed" || item.event_type === "agent.unavailable");
+              const repairedDraft = isErrorEvent && event.data.error_code === "draft_invalid" && events.some(item=>item.sequence>event.sequence && item.event_type==="draft.updated" && Array.isArray((item.data.draft as GenerationPlanningDraft | undefined)?.tasks) && ((item.data.draft as GenerationPlanningDraft).tasks.length > 0));
+              if (repairedDraft) return <details key={event.id} className="generation-history-error"><summary>历史方案校验错误 · 后续方案已保存</summary><pre>{JSON.stringify(event.data,null,2)}</pre></details>;
+              if (isErrorEvent && (event.id !== latestError?.id || sending || events.some(item=>item.sequence>event.sequence && ["turn.completed","conversation.confirmed"].includes(item.event_type)))) return null;
+              if (["usage.updated","turn.started","conversation.settings.updated","context.updated"].includes(event.event_type)) return null;
+
               const fieldPath = textValue(event.data.field_path);
               const validationMessage = textValue(event.data.validation_message);
-              return <article className={`generation-message ${isUser ? "user" : "assistant"} ${isErrorEvent ? "error" : ""}`} key={event.id}><div className="generation-message-avatar">{isUser ? <span>你</span> : isErrorEvent ? <WarningCircle size={17} weight="fill" /> : <Sparkle size={16} weight="fill" />}</div><div className="generation-message-content"><div className="generation-message-meta"><strong>{isUser ? "你" : isErrorEvent ? textValue(event.data.error_code, "系统提示") : event.event_type === "reasoning.summary" ? "思考摘要" : "Agent"}</strong><small>{event.event_type === "assistant.delta" ? "流式片段" : event.event_type === "assistant.message" ? textValue(event.data.phase, "可见消息") : event.event_type === "usage.updated" ? "Token usage" : "事件"}</small></div>{message && (isUser ? <p>{message}</p> : <MarkdownPreview content={message} className="generation-message-markdown" />)}{isErrorEvent && fieldPath && validationMessage && <p className="generation-validation-detail"><code>{fieldPath}</code> {validationMessage}</p>}{isErrorEvent && <div className="generation-error-actions"><button type="button" className="text-button" onClick={() => setManualMode(true)}>人工编辑 <CaretRight size={14} /></button>{event.data.retryable !== false && retryContent && <button type="button" className="text-button" onClick={() => void sendMessage(retryContent, refreshContext, true)}><ArrowsClockwise size={13} /> {refreshContext ? "刷新上下文并重试" : "重试本轮"}</button>}</div>}</div></article>;
+              return <article className={`generation-message ${isUser ? "user" : "assistant"} ${isErrorEvent ? "error" : ""}`} key={event.id}><div className="generation-message-avatar">{isUser ? <span>你</span> : isErrorEvent ? <WarningCircle size={17} weight="fill" /> : <Sparkle size={16} weight="fill" />}</div><div className="generation-message-content"><div className="generation-message-meta"><strong>{isUser ? "你" : isErrorEvent ? "规划需要恢复" : event.event_type === "reasoning.summary" ? "思考摘要" : "Agent"}</strong><small>{event.event_type === "assistant.delta" ? "流式片段" : event.event_type === "assistant.message" ? "" : ""}</small></div>{message && (isUser ? <p>{message}</p> : <MarkdownPreview content={message} className="generation-message-markdown" />)}{isErrorEvent && fieldPath && validationMessage && <p className="generation-validation-detail"><code>{fieldPath}</code> {validationMessage}</p>}{isErrorEvent && <details><summary>诊断详情</summary><pre>{JSON.stringify(event.data,null,2)}</pre></details>}{isErrorEvent && <div className="generation-error-actions"><button type="button" className="text-button" onClick={() => setManualMode(true)}>人工编辑 <CaretRight size={14} /></button>{event.data.retryable !== false && retryTurn && <button type="button" className="text-button" onClick={() => void recover(retryTurn!)}><ArrowsClockwise size={13} /> 继续本轮</button>}</div>}</div></article>;
             })}
-            {error && <article className="generation-inline-error" role="alert"><WarningCircle size={17} weight="fill" /><div><strong>当前操作未完成</strong><span>{error}</span>{draftSaveFailed && <button className="generation-inline-retry" type="button" onClick={retryDraftSave}><ArrowsClockwise size={14} /> 重试保存</button>}</div><button type="button" onClick={() => setError("")} aria-label="关闭错误"><X size={14} /></button></article>}
-            {pendingInput && !visibleEvents.some((event) => event.event_type === "user_input.requested" && event.data.id === pendingInput.id) && <GenerationInputCard request={pendingInput} onAnswer={answerInput} />}
-            {sending && !hasPendingInput && <div className="generation-thinking"><span className="thinking-dots"><i /><i /><i /></span><span>Agent 正在检索项目规范与参考资源…</span></div>}
+            {conversation.pending_proposal && <article className="generation-inline-error"><div><strong>你编辑了方案，Agent 新提案等待处理</strong><details><summary>比较当前方案与新提案</summary><h4>我的当前方案</h4><pre>{JSON.stringify(currentDraft,null,2)}</pre><h4>Agent 新提案</h4><pre>{JSON.stringify(conversation.pending_proposal,null,2)}</pre></details>{(["keep","apply"] as const).map(action=><button key={action} type="button" onClick={()=>void resolveGenerationProposal(conversation.id,action,conversation.draft_hash??"").then(value=>{setConversation(value);setDraft(value.draft);}).catch(e=>setError(String(e)))}>{action==="keep"?"保留我的编辑":"应用 Agent 提案"}</button>)}</div></article>}
+            {error && <article className="generation-inline-error" role="alert"><WarningCircle size={17} weight="fill" /><div><strong>当前操作未完成</strong><span>{error}</span>{draftSaveFailed && <button className="generation-inline-retry" type="button" onClick={retryDraftSave}><ArrowsClockwise size={14} /> 重试保存</button>}{draftSaveFailed && /context|上下文/.test(error) && <button type="button" onClick={()=>void refreshAndKeepDraft()}>刷新引用快照并保留编辑</button>}</div><button type="button" onClick={() => setError("")} aria-label="关闭错误"><X size={14} /></button></article>}
+            {pendingInput && <GenerationInputCard key={pendingInput.id} request={pendingInput} onAnswer={answerInput} />}
+            {sending && !hasPendingInput && <div className="generation-thinking"><span className="thinking-dots"><i /><i /><i /></span><span>规划进行中 · 流式输出和阶段进度显示在上方</span></div>}
             {!visibleEvents.length && <div className="generation-empty-chat"><Question size={28} /><strong>从一句目标开始</strong><span>例如：为序章场景生成一张 16:9 的夜雨背景，参考当前风格圣经。</span></div>}
             <div ref={chatEndRef} />
           </div>
           <div className="generation-composer-wrap">
             <div className="generation-composer-hint"><span><Lightning size={14} weight="fill" /> 只读沙箱</span><span>{hasPendingInput ? "请先回答上方问题" : selectedContextIds.length ? `已固定 ${selectedContextIds.length} 项参考资产` : "可随时加入参考资产"}</span>{(sending || conversation.status === "awaiting_input") && <button type="button" onClick={() => void stopTurn()}><Stop size={13} weight="fill" /> 停止当前回合</button>}</div>
             <div className="generation-composer">
-              <textarea value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void sendMessage(); } }} placeholder={hasPendingInput ? "请先回答上方问题…" : sending ? "向正在运行的回合追加指令…" : "描述你想生成的资源、用途、风格或需要参考的资产…"} rows={3} disabled={!conversation || hasPendingInput || Boolean(conversation.plan_id)} />
+              <textarea value={input} onChange={(event) => changeInput(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing && event.keyCode !== 229) { event.preventDefault(); void sendMessage(); } }} placeholder={hasPendingInput ? "请先回答上方问题…" : sending ? "向正在运行的回合追加指令…" : "描述你想生成的资源、用途、风格或需要参考的资产…"} rows={3} disabled={!conversation || hasPendingInput} />
               <div className="generation-reference-chips">
                 <GenerationRouteControl values={routeDefaults} providers={providers} disabled={routeEditingDisabled} onChange={updateSessionRoute} />
-                {selectedAssets.map((asset) => <span key={asset.id} className="generation-reference-chip">{asset.name}<button type="button" onClick={() => void updateReferenceContext(selectedContextIds.filter((id) => id !== asset.id))} aria-label={`移除参考 ${asset.name}`} disabled={referenceSaving || sending}><X size={11} /></button></span>)}
-                <button type="button" className="generation-context-picker" onClick={() => setReferencePickerOpen(true)} disabled={!conversation || Boolean(conversation.plan_id) || referenceSaving || sending || hasPendingInput}><Plus size={15} /> 添加参考资产{referenceSaving && <CircleNotch size={12} className="spin" />}</button>
+                {selectedAssets.map((asset) => <span key={asset.id} className="generation-reference-chip"><button type="button" onClick={()=>setPreviewAsset(asset)} aria-label={`预览 ${asset.name}`}>{asset.name}</button><button type="button" onClick={() => void updateReferenceContext(selectedContextIds.filter((id) => id !== asset.id))} aria-label={`移除参考 ${asset.name}`} disabled={referenceSaving || sending}><X size={11} /></button></span>)}
+                <button type="button" className="generation-context-picker" onClick={() => setReferencePickerOpen(true)} disabled={!conversation || conversation.status === "completed" || referenceSaving || sending || hasPendingInput}><Plus size={15} /> 添加参考资产{referenceSaving && <CircleNotch size={12} className="spin" />}</button>
                 <span className="generation-shortcut">Enter 发送 · Shift+Enter 换行</span>
-                <button type="button" className="button primary send-button" onClick={() => void sendMessage()} disabled={!input.trim() || referenceSaving || hasPendingInput || Boolean(conversation?.plan_id)}><PaperPlaneRight size={17} weight="fill" /> {sending ? "追加指令" : "发送"}</button>
+                <button type="button" className="button primary send-button" onClick={() => void sendMessage()} disabled={!input.trim() || referenceSaving || hasPendingInput}><PaperPlaneRight size={17} weight="fill" /> {sending ? "追加指令" : "发送"}</button>
               </div>
             </div>
           </div>
@@ -1075,43 +1086,43 @@ export function GenerationChatPage({
         </main>
 
         <aside className="generation-plan-rail" aria-label="生成方案检查器">
-          <div className="generation-plan-header"><div><span className="generation-kicker">PLAN INSPECTOR</span><h2>生成方案</h2></div><button className="icon-button" type="button" onClick={() => setPlanCollapsed(true)} aria-label="折叠方案检查器"><Minus size={16} /></button></div>
-          {currentDraft ? <div className="generation-plan-scroll">
-            <div className="generation-plan-summary"><div className="plan-summary-mark"><ListChecks size={20} /></div><div><strong>{currentDraft.tasks.length} 项任务</strong><span>{currentDraft.summary || "等待 Agent 进一步说明资源与依赖。"}</span></div></div>
-            <section className="generation-plan-section"><div className="generation-section-title"><span>会话默认生成路由</span><Funnel size={15} /></div><p className="generation-field-help generation-route-help">在聊天输入框的“生成路由”中修改；任务内明确指定的渠道仍然优先。</p><div className="generation-route-summary"><div><span>文字</span><strong>{routeLabel(routeDefaults.text, providers)}</strong></div><div><span>图片</span><strong>{routeLabel(routeDefaults.image, providers)}</strong></div></div></section>
-            <section className="generation-plan-section"><div className="generation-section-title"><span>资源清单</span><span className="generation-count">{currentDraft.tasks.length}</span></div>{currentDraft.tasks.map((task, index) => <TaskProposalEditor key={`${task.id || "task"}-${index}`} task={task} index={index} assets={assets} allTasks={currentDraft.tasks} providers={providers} sessionRoute={routeDefaults[task.kind === "text" ? "text" : "image"] ?? null} onChange={(updater) => editAndSave((value) => { const target = value.tasks[index]; if (target) updater(target); })} onRemove={() => editAndSave((value) => { value.tasks.splice(index, 1); })} />)}<div className="generation-add-task-row"><button className="generation-add-task" type="button" onClick={() => { const candidate = assets.find((asset) => !currentDraft.tasks.some((task) => task.asset.asset_id === asset.id)); if (candidate) addTaskFromAsset(candidate); }} disabled={!assets.some((asset) => !currentDraft.tasks.some((task) => task.asset.asset_id === asset.id))}><Plus size={15} /> 从项目资产添加任务</button><button className="generation-add-task" type="button" onClick={() => editAndSave((value) => { value.tasks.push(draftTaskForNewAsset(value.tasks.length)); })}><Plus size={15} /> 手动新建资源</button></div></section>
-            <section className="generation-plan-section"><div className="generation-section-title"><span>预算与执行</span><SlidersHorizontal size={15} /></div><div className="generation-settings-grid"><NumberField label="基础调用" value={numberValue(currentDraft.settings.extra_call_budget, 2)} onChange={(value) => editAndSave((draftValue) => { draftValue.settings.extra_call_budget = value; })} /><NumberField label="并发" value={numberValue(currentDraft.settings.max_concurrency, 3)} onChange={(value) => editAndSave((draftValue) => { draftValue.settings.max_concurrency = value; })} /><NumberField label="重试" value={numberValue(currentDraft.settings.max_transport_retries, 2)} onChange={(value) => editAndSave((draftValue) => { draftValue.settings.max_transport_retries = value; })} /><NumberField label="付费返工" value={numberValue(currentDraft.settings.max_paid_remediation_rounds, 2)} onChange={(value) => editAndSave((draftValue) => { draftValue.settings.max_paid_remediation_rounds = value; })} /></div><div className="generation-path-legend"><span><i className="candidate-dot" />候选暂存</span><code>workspace/candidates/&lt;job&gt;</code><span><i className="target-dot" />批准后落地</span></div></section>
+          <div className="generation-plan-header"><label className="generation-panel-resize">面板宽度<input aria-label="工作面板宽度" type="range" min="320" max="560" value={panelWidth} onChange={e=>setPanelWidth(Number(e.target.value))}/></label><div><span className="generation-kicker">PLAN INSPECTOR</span><h2>生成方案</h2></div><button className="icon-button" type="button" onClick={() => setPlanCollapsed(true)} aria-label="折叠方案检查器"><Minus size={16} /></button></div>
+          <div className="generation-work-tabs" role="tablist" aria-label="工作面板">{([["plan","方案"],["references","参考"],["results","结果"]] as const).map(([id,label])=><button role="tab" aria-selected={workTab===id} type="button" key={id} onClick={()=>setWorkTab(id)}>{label}</button>)}</div>
+          {workTab === "references" && <div className="generation-plan-scroll"><h3>项目规则</h3><p className="generation-muted-copy">Agent 自动读取项目规范。固定参考用于补充本次目标，无需重复固定全部规则。</p>{assets.filter(a=>a.kind==="production" && /style_bible|prompt_recipe/.test(a.subtype)).map(asset=><ReferenceTile key={asset.id} asset={asset} onPreview={setPreviewAsset}/>)}<h3>用户固定参考</h3>{selectedAssets.map(asset=><ReferenceTile key={asset.id} asset={asset} onPreview={setPreviewAsset}/>)}<button className="button secondary" type="button" onClick={()=>setReferencePickerOpen(true)}>添加参考资产</button><h3>任务引用</h3>{[...new Set(currentDraft?.tasks.flatMap(task=>task.references.map(ref=>ref.asset_id))??[])].map(id=>{const asset=assets.find(x=>x.id===id);return asset?<ReferenceTile key={id} asset={asset} onPreview={setPreviewAsset}/>:<p key={id}>参考资产已缺失</p>;})}</div>}
+          {workTab === "results" && <div className="generation-plan-scroll"><GenerationResults batches={conversation?.batches??[]} assets={assets} onOpenAsset={onOpenAsset}/></div>}
+          {workTab === "plan" && (currentDraft ? <div className="generation-plan-scroll">
+            <div className="generation-plan-summary"><div className="plan-summary-mark"><ListChecks size={20} /></div><div><strong>{currentDraft.tasks.length ? `${currentDraft.tasks.length} 项产物` : "当前目标"}</strong><span>{currentDraft.summary || events.find(e=>e.event_type==="user.message")?.data.content as string || "描述你的目标，我们一起确定产物和参考。"}</span></div></div>
+            <details className="generation-advanced"><summary>模型与生成路由</summary><section className="generation-plan-section"><div className="generation-section-title"><span>会话模型路由</span><Funnel size={15} /></div><p className="generation-field-help generation-route-help">规划使用文字路由。在聊天输入框的“生成路由”中修改；任务内明确指定的渠道仍然优先。</p><div className="generation-route-summary"><div><span>文字</span><strong>{routeLabel(routeDefaults.text, providers)}</strong></div><div><span>图片</span><strong>{routeLabel(routeDefaults.image, providers)}</strong></div></div></section></details>
+            <section className="generation-plan-section"><div className="generation-section-title"><span>资源清单</span><span className="generation-count">{currentDraft.tasks.length}</span></div>{currentDraft.tasks.map((task, index) => <TaskProposalEditor key={`${task.id || "task"}-${index}`} task={task} index={index} assets={assets} allTasks={currentDraft.tasks} providers={providers} sessionRoute={routeDefaults[task.kind === "text" ? "text" : "image"] ?? null} onChange={(updater) => editAndSave((value) => { const target = value.tasks[index]; if (target) updater(target); })} onRemove={() => editAndSave((value) => { value.tasks.splice(index, 1); })} />)}<div className="generation-add-task-row"><button className="generation-add-task" type="button" onClick={() => setTaskPickerOpen(true)} disabled={!assets.some((asset) => !currentDraft.tasks.some((task) => task.asset.asset_id === asset.id))}><Plus size={15} /> 从项目资产添加任务</button><button className="generation-add-task" type="button" onClick={() => editAndSave((value) => { value.tasks.push(draftTaskForNewAsset(value.tasks.length)); })}><Plus size={15} /> 手动新建资源</button></div></section>
+            {currentDraft.tasks.length > 0 && <details className="generation-advanced"><summary>高级执行设置</summary><section className="generation-plan-section"><div className="generation-section-title"><span>预算与执行</span><SlidersHorizontal size={15} /></div><div className="generation-settings-grid"><NumberField label="额外调用上限" value={numberValue(currentDraft.settings.extra_call_budget, 2)} onChange={(value) => editAndSave((draftValue) => { draftValue.settings.extra_call_budget = value; })} /><NumberField label="并发" value={numberValue(currentDraft.settings.max_concurrency, 3)} onChange={(value) => editAndSave((draftValue) => { draftValue.settings.max_concurrency = value; })} /><NumberField label="重试" value={numberValue(currentDraft.settings.max_transport_retries, 2)} onChange={(value) => editAndSave((draftValue) => { draftValue.settings.max_transport_retries = value; })} /><NumberField label="付费返工" value={numberValue(currentDraft.settings.max_paid_remediation_rounds, 2)} onChange={(value) => editAndSave((draftValue) => { draftValue.settings.max_paid_remediation_rounds = value; })} /></div><div className="generation-path-legend"><span><i className="candidate-dot" />候选暂存</span><code>workspace/candidates/&lt;job&gt;</code><span><i className="target-dot" />批准后落地</span></div></section></details>}
             {(unresolvedQuestions.length > 0 || warnings.length > 0 || currentDraft.assumptions.length > 0 || hasPendingInput) && <section className="generation-plan-section"><div className="generation-section-title"><span>需要你的判断</span><Question size={15} /></div>{hasPendingInput && <button type="button" className="generation-answer-link" onClick={() => { document.getElementById(`generation-input-${pendingInput!.id}`)?.scrollIntoView({ behavior: "smooth", block: "center" }); document.getElementById(`generation-input-${pendingInput!.id}`)?.focus(); }}>在对话中回答</button>}{!hasPendingInput && unresolvedQuestions.map((question) => <div className="generation-question" key={question}><Question size={14} /><span>{question.replace(/^schema:/, "请补充 JSON Schema：")}</span></div>)}{currentDraft.assumptions.map((assumption) => <div className="generation-assumption" key={assumption}><CheckCircle size={14} /><span>{assumption}</span></div>)}{warnings.map((warning, index) => { const code = textValue(warning.code); return <label className="generation-warning generation-warning-check" key={`${code}-${index}`}><input type="checkbox" checked={Boolean(code && acceptedWarningCodes.includes(code))} onChange={(event) => { if (!code) return; setAcceptedWarningCodes((current) => event.target.checked ? [...new Set([...current, code])] : current.filter((item) => item !== code)); }} /><ShieldWarning size={14} /><span>{textValue(warning.message, "方案包含需要确认的警告")}</span></label>; })}</section>}
             {taskErrors.length > 0 && <section className="generation-plan-section generation-errors" role="alert"><div className="generation-section-title"><span>字段校验</span><WarningCircle size={15} /></div>{taskErrors.map((item) => <div className="generation-error-row" key={item}><WarningCircle size={13} />{item}</div>)}</section>}
-          </div> : <div className="generation-plan-empty">{conversation ? <><CircleNotch size={22} className="spin" /> 正在准备方案…</> : <><ListChecks size={22} /> 选择会话后查看生成方案</>}</div>}
-          {conversation && <div className="generation-confirm-area">
-            <label className="generation-confirm-check">
-              <input type="checkbox" checked={confirmChecked} onChange={(event) => setConfirmChecked(event.target.checked)} disabled={!currentDraft || Boolean(conversation?.plan_id)} />
-              <span>我已检查资源、参考图、路径、模型和预算，允许创建资产并进入执行队列。</span>
-            </label>
-            <div className="generation-confirm-actions">
-              <button className="button secondary generation-preview-button" type="button" onClick={() => setPreviewOpen(true)} disabled={!canPreview}>
-                <ListChecks size={16} /> 预览确认
-              </button>
-              <button className="button primary generation-confirm-button" type="button" onClick={() => void confirm()} disabled={!canConfirm}>
-                {confirmBusy ? <><CircleNotch size={17} className="spin" /> 正在确认…</> : <><Check size={17} weight="bold" /> 确认并执行</>}
-              </button>
-            </div>
+          </div> : <div className="generation-plan-empty">{conversation ? <><CircleNotch size={22} className="spin" /> 正在准备方案…</> : <><ListChecks size={22} /> 选择会话后查看生成方案</>}</div>)}
+          {conversation && workTab === "plan" && <div className="generation-confirm-area">
+            <button className="button primary generation-confirm-button" type="button" onClick={()=>setPreviewOpen(true)} disabled={!canPreview}>检查并生成</button>
+            <small>确认后才会创建执行批次。价格未知时以调用上限控制。</small>
             {saving && <small className="generation-save-state"><FloppyDisk size={13} /> 正在保存草案…</small>}
             {draftSaveFailed && <small className="generation-save-state error"><WarningCircle size={13} /> 草案尚未保存，预览与确认已暂停。</small>}
-            <small className="generation-confirm-note">确认前不会调用供应商，也不会创建 GenerationPlan。</small>
+            <small className="generation-confirm-note">确认前不会执行资产生成，也不会创建生成批次。</small>
           </div>}
         </aside>
       </div>
       {leftCollapsed && <button className="generation-restore-left" type="button" onClick={() => setLeftCollapsed(false)} aria-label="展开上下文栏"><CaretRight size={18} /></button>}
       {planCollapsed && <button className="generation-restore-plan" type="button" onClick={() => setPlanCollapsed(false)} aria-label="展开方案检查器"><CaretRight size={18} /></button>}
+      {newMessages && <button className="generation-new-messages" type="button" onClick={()=>{setHistoryLimit(60);followBottom.current=true;setNewMessages(false);chatEndRef.current?.scrollIntoView?.({block:"end"});}}>有新消息 ↓</button>}
+      {previewAsset && <GenerationAssetPreview asset={previewAsset} onClose={()=>setPreviewAsset(null)}/>}
+      {renaming && <div className="generation-modal-backdrop"><section ref={renameDialogRef} tabIndex={-1} data-nested-modal="true" className="generation-modal" role="dialog" aria-modal="true" aria-label="重命名会话"><h2>重命名会话</h2><input aria-label="会话名称" value={renameText} onChange={e=>setRenameText(e.target.value)}/><button type="button" onClick={()=>setRenaming(null)}>取消</button><button type="button" disabled={!renameText.trim()} onClick={()=>void renameGenerationConversation(renaming,renameText).then(()=>{setRenaming(null);void recentQuery.refetch();void existingConversationQuery.refetch();}).catch(e=>setError(String(e)))}>保存</button></section></div>}
+      {taskPickerOpen && <div className="generation-modal-backdrop"><section ref={taskDialogRef} tabIndex={-1} data-nested-modal="true" className="generation-modal" role="dialog" aria-modal="true" aria-label="选择任务资产"><h2>选择要生成的资产</h2><input aria-label="搜索任务资产" value={taskSearch} onChange={e=>setTaskSearch(e.target.value)} placeholder="搜索资产名称或 Key"/><div className="generation-task-picker">{assets.filter(a=>(a.name+a.key).includes(taskSearch)).slice(0,80).map(a=><div key={a.id}><ReferenceTile asset={a} onPreview={setPreviewAsset}/><button type="button" onClick={()=>{addTaskFromAsset(a);setTaskPickerOpen(false);}}>添加任务</button></div>)}</div><button type="button" onClick={()=>setTaskPickerOpen(false)}>关闭</button></section></div>}
       {previewOpen && currentDraft && <GenerationPlanPreview
         draft={currentDraft}
         assets={assets}
         confirmChecked={confirmChecked}
         canConfirm={canConfirm}
         confirmBusy={confirmBusy}
-        onConfirmChecked={setConfirmChecked}
+        acceptedWarningCodes={acceptedWarningCodes}
+        onWarningsChange={setAcceptedWarningCodes}
+        blockerMessage={error || (draftSaveFailed ? "方案保存失败，请返回编辑重试保存。" : saving ? "正在保存方案…" : taskErrors.join("；") || (hasPendingInput ? "请先回答对话中的问题。" : unresolvedQuestions.length ? "请先处理方案中的待补充信息。" : warningCodes.some(code=>!acceptedWarningCodes.includes(code)) ? "请勾选上方每项方案提示，再确认执行。" : ""))}
+        onConfirmChecked={checked=>{setConfirmChecked(checked);setError("");}}
         onConfirm={() => void confirm()}
         onClose={() => setPreviewOpen(false)}
       />}
@@ -1182,6 +1193,7 @@ function GenerationRouteControl({
       {open && <div className="generation-composer-route-popover" role="dialog" aria-label="选择资产生成供应商和模型">
         <header><div><span className="generation-kicker">ASSET GENERATION ROUTING</span><strong>选择生成供应商与模型</strong></div><button type="button" onClick={() => setOpen(false)} aria-label="关闭生成路由"><X size={14} /></button></header>
         <GenerationRouteSection modality="text" value={values.text ?? null} providers={providers} disabled={disabled} onChange={(route) => onChange("text", route)} />
+        <label className="generation-reasoning-field"><span>文字模型思考等级</span><SelectMenu ariaLabel="文字模型思考等级" value={values.text?.reasoning_effort ?? ""} options={[{value:"",label:"模型默认"},{value:"none",label:"无"},{value:"minimal",label:"最低"},{value:"low",label:"低"},{value:"medium",label:"中"},{value:"high",label:"高"},{value:"xhigh",label:"最高"}]} disabled={disabled || !values.text} onChange={effort=>{if(values.text) onChange("text",{...values.text,reasoning_effort:(effort || undefined) as ProviderDefaultRoute["reasoning_effort"]});}} /><small>应用于后续规划及文字生成；模型不支持时会返回明确错误，不会静默降级。请先选择文字路由。</small></label>
         <GenerationRouteSection modality="image" value={values.image ?? null} providers={providers} disabled={disabled} onChange={(route) => onChange("image", route)} />
         <footer>这是当前会话的默认路由；任务内明确选择的渠道仍然优先。</footer>
       </div>}
@@ -1238,7 +1250,7 @@ function GenerationRouteSection({
       <div className="generation-composer-route-heading"><span className={modality}>{modalityLabel.slice(0, 1)}</span><div><strong>{modalityLabel}生成</strong><small>{value ? routeLabel(value, providers) : "使用项目系统默认"}</small></div></div>
       <div className="generation-composer-route-fields">
         <label><span>供应商</span><SelectMenu ariaLabel={`${modalityLabel}生成供应商`} value={value?.provider_profile_id ?? ""} options={providerOptions} onChange={selectProvider} disabled={disabled} /></label>
-        <label><span>模型</span><SelectMenu ariaLabel={`${modalityLabel}生成模型`} value={currentModelAvailable ? value?.model ?? "" : ""} options={modelOptions} onChange={(model) => { if (currentProvider && model) onChange({ provider_profile_id: currentProvider.id, model }); }} disabled={disabled || !currentProvider || !currentProvider.is_unlocked || models.length === 0} placeholder={value?.model && !currentModelAvailable ? `当前模型不可用 · ${value.model}` : value ? "没有可用模型" : "由系统默认决定"} /></label>
+        <label><span>模型</span><SelectMenu ariaLabel={`${modalityLabel}生成模型`} value={currentModelAvailable ? value?.model ?? "" : ""} options={modelOptions} onChange={(model) => { if (currentProvider && model) onChange({ provider_profile_id: currentProvider.id, model, reasoning_effort: value?.reasoning_effort }); }} disabled={disabled || !currentProvider || !currentProvider.is_unlocked || models.length === 0} placeholder={value?.model && !currentModelAvailable ? `当前模型不可用 · ${value.model}` : value ? "没有可用模型" : "由系统默认决定"} /></label>
       </div>
       {currentProvider && !currentProvider.is_unlocked && <small className="generation-composer-route-warning"><ShieldWarning size={12} /> 渠道已锁定，请先到供应商渠道中解锁。</small>}
       {currentProvider?.is_unlocked && value?.model && !currentModelAvailable && models.length > 0 && <small className="generation-composer-route-warning"><WarningCircle size={12} /> 当前模型不可用，请重新选择。</small>}
@@ -1280,36 +1292,6 @@ function RoutePicker({
   );
 }
 
-function AgentModelPicker({
-  models,
-  value,
-  search,
-  open,
-  saving,
-  disabled,
-  onSearch,
-  onOpen,
-  onSelect,
-}: {
-  models: GenerationAgentCapabilities["models"];
-  value: string | null;
-  search: string;
-  open: boolean;
-  saving: boolean;
-  disabled: boolean;
-  onSearch: (value: string) => void;
-  onOpen: () => void;
-  onSelect: (value: string | null) => void;
-}) {
-  const current = models.find((model) => model.id === value);
-  return (
-    <div className="generation-agent-model-picker">
-      <button type="button" className="generation-agent-model-trigger" onClick={onOpen} disabled={disabled} aria-expanded={open}><Robot size={13} /><span><small>规划模型</small><strong>{saving ? "保存中…" : current?.name || value || "Codex 默认"}</strong></span><CaretDown size={12} /></button>
-      {open && <div className="generation-agent-model-popover" role="listbox" aria-label="选择规划 Agent 模型"><div className="generation-route-search"><MagnifyingGlass size={13} /><input autoFocus value={search} onChange={(event) => onSearch(event.target.value)} placeholder="搜索 Codex 模型" /></div><button type="button" className="generation-route-option inherited" onClick={() => onSelect(null)}><span><strong>Codex 默认模型</strong><small>由本机 App Server 决定</small></span><CheckCircle size={13} /></button>{models.filter((model) => !search.trim() || `${model.id} ${model.name}`.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase())).map((model) => <button key={model.id} type="button" className="generation-route-option" onClick={() => onSelect(model.id)}><span><strong>{model.name}</strong><small>{model.id}{model.is_default ? " · 推荐" : ""}</small></span><Check size={13} /></button>)}</div>}
-    </div>
-  );
-}
-
 function TaskProposalEditor({
   task,
   index,
@@ -1330,6 +1312,9 @@ function TaskProposalEditor({
   onRemove: () => void;
 }) {
   const [open, setOpen] = useState(index === 0);
+  const [referencePreview,setReferencePreview]=useState<GameAsset|null>(null);
+  const [referenceRevision,setReferenceRevision]=useState<string|null>(null);
+  const [referenceChoice,setReferenceChoice]=useState("");
   const assetLabel = task.asset.mode === "new"
     ? task.asset.title || task.asset.key || "待创建资源"
     : assets.find((asset) => asset.id === task.asset.asset_id)?.name ?? task.asset.key ?? "未选择资源";
@@ -1396,7 +1381,7 @@ function TaskProposalEditor({
           <div className="generation-select-field"><span>任务类型</span><SelectMenu ariaLabel="任务类型" value={task.kind} options={[{ value: "text", label: "结构化文字" }, { value: "image", label: "图像生成" }, { value: "image_edit", label: "图像编辑" }]} onChange={(kind) => onChange((value) => { value.kind = kind as GenerationTaskProposal["kind"]; })} /></div>
           <div className="generation-route-field"><span>任务渠道 / 模型</span><RoutePicker modality={task.kind === "text" ? "text" : "image"} value={task.provider_profile_id && task.model ? { provider_profile_id: task.provider_profile_id, model: task.model } : null} providers={providers} fallbackLabel={sessionRoute ? routeLabel(sessionRoute, providers, "沿用会话默认") : "沿用会话默认"} onChange={(route) => onChange((value) => { value.provider_profile_id = route?.provider_profile_id ?? null; value.model = route?.model ?? null; })} /></div>
         </div>
-        <label>Prompt<textarea value={task.prompt} rows={3} onChange={(event) => onChange((value) => { value.prompt = event.target.value; })} /></label>
+        <details className="generation-advanced"><summary>Prompt</summary><label>Prompt<textarea value={task.prompt} rows={3} onChange={(event) => onChange((value) => { value.prompt = event.target.value; })} /></label></details>
         {task.kind !== "text" && <>
           <div className="generation-field-row"><label>宽<input type="number" min={1} max={8192} value={task.width ?? ""} onChange={(event) => onChange((value) => { value.width = Number(event.target.value) || null; })} /></label><label>高<input type="number" min={1} max={8192} value={task.height ?? ""} onChange={(event) => onChange((value) => { value.height = Number(event.target.value) || null; })} /></label></div>
           <label className="generation-checkbox-line"><input type="checkbox" checked={task.transparent} onChange={(event) => onChange((value) => { value.transparent = event.target.checked; })} /> 保留透明通道</label>
@@ -1412,15 +1397,17 @@ function TaskProposalEditor({
         <div className="generation-editor-subsection">
           <div className="generation-subsection-title"><span>参考资源</span><small>一项 primary，其余 supporting</small></div>
           {task.references.map((reference, referenceIndex) => <div className="generation-reference-editor" key={`${reference.asset_id}-${referenceIndex}`}>
+            {assets.find(a=>a.id===reference.asset_id) && <ReferenceTile asset={assets.find(a=>a.id===reference.asset_id)!} onPreview={asset=>{setReferenceRevision(reference.revision_id??null);setReferencePreview(asset);}}/>}
             <div className="generation-field-row"><div className="generation-select-field"><span>参考资产</span><SelectMenu ariaLabel="参考资产" value={reference.asset_id} options={assets.map((asset) => ({ value: asset.id, label: `${asset.name} · ${asset.key}` }))} onChange={(assetId) => onChange((value) => { const item = value.references[referenceIndex]; if (item) item.asset_id = assetId; })} /></div><div className="generation-select-field"><span>角色</span><SelectMenu ariaLabel="角色" value={reference.role} options={[{ value: "primary", label: "主参考图" }, { value: "supporting", label: "辅助参考" }]} onChange={(role) => onChange((value) => { const item = value.references[referenceIndex]; if (item) item.role = role as GenerationReferenceProposal["role"]; })} /></div></div>
             <label>选择理由<input value={reference.reason} onChange={(event) => onChange((value) => { const item = value.references[referenceIndex]; if (item) item.reason = event.target.value; })} placeholder="说明它如何影响方案" /></label>
-            <div className="generation-field-row"><label>Revision ID<input value={reference.revision_id ?? ""} onChange={(event) => onChange((value) => { const item = value.references[referenceIndex]; if (item) item.revision_id = event.target.value || null; })} placeholder="确认时自动固定" /></label><label>SHA-256<input value={reference.sha256 ?? ""} onChange={(event) => onChange((value) => { const item = value.references[referenceIndex]; if (item) item.sha256 = event.target.value || null; })} placeholder="确认时自动固定" /></label></div>
+            <details><summary>引用版本技术详情</summary><div className="generation-field-row"><label>版本标识<input value={reference.revision_id ?? ""} onChange={(event) => onChange((value) => { const item = value.references[referenceIndex]; if (item) item.revision_id = event.target.value || null; })} placeholder="确认时自动固定" /></label><label>SHA-256<input value={reference.sha256 ?? ""} onChange={(event) => onChange((value) => { const item = value.references[referenceIndex]; if (item) item.sha256 = event.target.value || null; })} placeholder="确认时自动固定" /></label></div></details>
             <button type="button" className="text-button generation-remove-reference" onClick={() => onChange((value) => { value.references.splice(referenceIndex, 1); })}><Trash size={13} /> 移除参考</button>
           </div>)}
-          <button type="button" className="generation-inline-add" onClick={() => { const candidate = referenceCandidates[0]; if (candidate) onChange((value) => { value.references.push({ asset_id: candidate.id, role: value.references.some((item) => item.role === "primary") ? "supporting" : "primary", reason: "" }); }); }} disabled={!referenceCandidates.length}><Plus size={13} /> 添加参考资源</button>
+          <SelectMenu ariaLabel="选择任务参考" value={referenceChoice} options={[{value:"",label:"选择参考资产"},...referenceCandidates.map(a=>({value:a.id,label:a.name}))]} onChange={setReferenceChoice}/><button type="button" className="generation-inline-add" onClick={() => { const candidate = referenceCandidates.find(a=>a.id===referenceChoice); if (candidate) onChange((value) => { value.references.push({ asset_id: candidate.id, role: value.references.some((item) => item.role === "primary") ? "supporting" : "primary", reason: "" }); }); }} disabled={!referenceChoice}><Plus size={13} /> 添加参考资源</button>
         </div>
         <small className="generation-field-help">候选暂存由系统管理：workspace/candidates/&lt;job&gt;。确认时会固定参考 revision / rendition / hash，Provider 只接收 primary。</small>
       </div>}
+    {referencePreview && <GenerationAssetPreview asset={referencePreview} revisionId={referenceRevision} onClose={()=>setReferencePreview(null)}/>}
     </div>
   );
 }
@@ -1448,6 +1435,7 @@ function AssetReferencePicker({
   const [status, setStatus] = useState("all");
   const [draftIds, setDraftIds] = useState<string[]>(selectedIds);
   const [selectedOnly, setSelectedOnly] = useState(false);
+  const [assetPreview,setAssetPreview] = useState<GameAsset|null>(null);
   const dialogRef = useRef<HTMLElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   useModalFocus({ open: true, dialogRef, initialFocusRef: searchRef, onClose });
@@ -1463,6 +1451,7 @@ function AssetReferencePicker({
   const visibleAssets = filtered.slice(0, 120);
   return (
     <div className="generation-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      {assetPreview && <GenerationAssetPreview asset={assetPreview} onClose={()=>setAssetPreview(null)}/>}
       <section ref={dialogRef} className="generation-modal generation-reference-dialog" role="dialog" aria-modal="true" aria-labelledby="reference-picker-title" tabIndex={-1} data-nested-modal="true">
         <header className="generation-modal-header"><div><span className="generation-kicker">READ-ONLY CONTEXT / 参考范围</span><h2 id="reference-picker-title">选择 Agent 要读取的参考</h2><p>固定风格、角色或场景依据。这里只扩展只读上下文，不会创建资产或生成任务。</p></div><div className="generation-reference-header-actions"><span><strong>{draftIds.length}</strong> 项已选</span><button className="icon-button" type="button" onClick={onClose} aria-label="关闭参考资产选择器"><X size={17} /></button></div></header>
         <div className="generation-reference-filters">
@@ -1474,7 +1463,7 @@ function AssetReferencePicker({
         <div className="generation-reference-workspace">
           <div className="generation-reference-browser">
             <div className="generation-reference-result-meta"><span>{selectedOnly ? "正在查看已选参考" : `找到 ${filtered.length} 项`}{filtered.length > visibleAssets.length && <small>显示前 {visibleAssets.length} 项，请搜索缩小范围</small>}</span><button type="button" className={selectedOnly ? "active" : ""} aria-pressed={selectedOnly} onClick={() => setSelectedOnly((current) => !current)}><Check size={12} /> 只看已选</button></div>
-            <div className="generation-reference-results">{visibleAssets.length ? visibleAssets.map((asset) => { const selected = draftIds.includes(asset.id); const thumbnail = asset.thumbnails?.[0]; return <button key={asset.id} type="button" className={`generation-reference-result ${selected ? "selected" : ""}`} aria-pressed={selected} onClick={() => setDraftIds((current) => selected ? current.filter((id) => id !== asset.id) : [...current, asset.id])}><span className="generation-reference-preview">{thumbnail ? <img src={thumbnail} alt="" /> : asset.kind === "media" ? <ImageSquare size={18} /> : <FileArrowUp size={18} />}</span><span className="generation-reference-result-copy"><strong>{asset.name}</strong><small>{asset.key}</small><em>{assetKindLabel(asset.kind)} · {assetSubtypeLabel(asset.kind, asset.subtype)}</em>{asset.tags.length > 0 && <i>{asset.tags.slice(0, 3).map((tag) => `#${tag}`).join(" ")}</i>}</span><span className="generation-reference-check">{selected ? <Check size={14} weight="bold" /> : <Plus size={13} />}</span></button>; }) : <div className="generation-route-empty">{selectedOnly ? "还没有选择参考资产。" : "没有匹配的项目资产，试试减少筛选条件。"}</div>}</div>
+            <div className="generation-reference-results">{visibleAssets.length ? visibleAssets.map((asset) => { const selected = draftIds.includes(asset.id); const thumbnail = asset.thumbnails?.[0]; return <div key={asset.id} className="generation-reference-choice"><button type="button" className={`generation-reference-result ${selected ? "selected" : ""}`} aria-pressed={selected} onClick={() => setDraftIds((current) => selected ? current.filter((id) => id !== asset.id) : [...current, asset.id])}><span className="generation-reference-preview">{thumbnail ? <img src={thumbnail} alt="" /> : asset.kind === "media" ? <ImageSquare size={18} /> : <FileArrowUp size={18} />}</span><span className="generation-reference-result-copy"><strong>{asset.name}</strong><small>{asset.key}</small><em>{assetKindLabel(asset.kind)} · {assetSubtypeLabel(asset.kind, asset.subtype)}</em>{asset.tags.length > 0 && <i>{asset.tags.slice(0, 3).map((tag) => `#${tag}`).join(" ")}</i>}</span><span className="generation-reference-check">{selected ? <Check size={14} weight="bold" /> : <Plus size={13} />}</span></button><button type="button" className="generation-choice-preview" onClick={()=>setAssetPreview(asset)}>预览 {asset.name}</button></div>; }) : <div className="generation-route-empty">{selectedOnly ? "还没有选择参考资产。" : "没有匹配的项目资产，试试减少筛选条件。"}</div>}</div>
           </div>
           <aside className="generation-reference-selection" aria-label="已选参考资产">
             <header><div><span>已选参考</span><strong>{draftIds.length}</strong></div>{draftIds.length > 0 && <button type="button" onClick={() => setDraftIds([])}>清空</button>}</header>
@@ -1518,6 +1507,7 @@ function DeleteConversationDialog({
 }
 
 function GenerationPlanPreview({
+  acceptedWarningCodes, onWarningsChange, blockerMessage,
   draft,
   assets,
   confirmChecked,
@@ -1527,6 +1517,9 @@ function GenerationPlanPreview({
   onConfirm,
   onClose,
 }: {
+  acceptedWarningCodes: string[];
+  onWarningsChange: (codes:string[])=>void;
+  blockerMessage: string;
   draft: GenerationPlanningDraft;
   assets: GameAsset[];
   confirmChecked: boolean;
@@ -1536,9 +1529,14 @@ function GenerationPlanPreview({
   onConfirm: () => void;
   onClose: () => void;
 }) {
+  const [referencePreview,setReferencePreview]=useState<GameAsset|null>(null);
+  const [referenceRevision,setReferenceRevision]=useState<string|null>(null);
+  const previewDialogRef=useRef<HTMLElement>(null);
+  useModalFocus({open:true,dialogRef:previewDialogRef,initialFocusRef:previewDialogRef,onClose});
   return (
     <div className="generation-preview-backdrop" role="presentation">
-      <section className="generation-preview-dialog" role="dialog" aria-modal="true" aria-labelledby="generation-preview-title">
+      {referencePreview && <GenerationAssetPreview asset={referencePreview} revisionId={referenceRevision} onClose={()=>setReferencePreview(null)}/>}
+      <section ref={previewDialogRef} tabIndex={-1} className="generation-preview-dialog" role="dialog" aria-modal="true" aria-labelledby="generation-preview-title">
         <header className="generation-preview-header">
           <div>
             <span className="generation-kicker">FINAL REVIEW / 草案快照</span>
@@ -1550,7 +1548,7 @@ function GenerationPlanPreview({
         <div className="generation-preview-scroll">
           <div className="generation-preview-ledger">
             <span>任务</span><strong>{draft.tasks.length}</strong>
-            <span>基础调用</span><strong>{numberValue(draft.settings.extra_call_budget, 2)}</strong>
+            <span>基础调用</span><strong>{draft.tasks.length}</strong><span>额外调用上限</span><strong>{numberValue(draft.settings.extra_call_budget, 2)}</strong><span>预估费用</span><strong>未知</strong>
             <span>并发</span><strong>{numberValue(draft.settings.max_concurrency, 3)}</strong>
           </div>
           <ol className="generation-preview-tasks">
@@ -1567,17 +1565,18 @@ function GenerationPlanPreview({
                   </div>
                   <code>{task.target_path || "尚未设置批准后路径"}</code>
                   <MarkdownPreview content={task.prompt || "未填写 Prompt"} className="generation-preview-prompt" />
-                  {task.references.length > 0 && <div className="generation-preview-references"><span>参考资源</span>{task.references.map((reference, referenceIndex) => <small key={`${reference.asset_id}-${referenceIndex}`}><b>{reference.role === "primary" ? "主" : "辅"}</b> {assets.find((asset) => asset.id === reference.asset_id)?.name || reference.asset_id}{reference.reason ? ` · ${reference.reason}` : ""}</small>)}</div>}
+                  {task.references.length > 0 && <div className="generation-preview-references"><span>参考资源</span>{task.references.map((reference, referenceIndex) => <small key={`${reference.asset_id}-${referenceIndex}`}><button type="button" onClick={()=>{const asset=assets.find(a=>a.id===reference.asset_id);if(asset){setReferenceRevision(reference.revision_id??null);setReferencePreview(asset);}}}>预览</button><b>{reference.role === "primary" ? "主" : "辅"}</b> {assets.find((asset) => asset.id === reference.asset_id)?.name || reference.asset_id}{reference.reason ? ` · ${reference.reason}` : ""}</small>)}</div>}
                 </li>
               );
             })}
           </ol>
           {(draft.questions.length > 0 || draft.warnings.length > 0) && <div className="generation-preview-blockers">
             {draft.questions.map((question) => <p key={question}><Question size={14} />{question.replace(/^schema:/, "请补充 JSON Schema：")}</p>)}
-            {draft.warnings.map((warning, index) => <p key={`${textValue(warning.code, "warning")}-${index}`}><ShieldWarning size={14} />{textValue(warning.message, "方案包含需要确认的警告")}</p>)}
+            {draft.warnings.map((warning,index)=>{const code=textValue(warning.code);return <label key={`${code}-${index}`}><input type="checkbox" checked={acceptedWarningCodes.includes(code)} onChange={e=>onWarningsChange(e.target.checked ? [...new Set([...acceptedWarningCodes,code])] : acceptedWarningCodes.filter(x=>x!==code))}/><span>{textValue(warning.message,"方案包含需要确认的警告")}</span></label>;})}
           </div>}
         </div>
         <footer className="generation-preview-footer">
+          {blockerMessage && <p className="generation-preview-error" role="status">{blockerMessage}</p>}
           <label className="generation-confirm-check"><input type="checkbox" checked={confirmChecked} onChange={(event) => onConfirmChecked(event.target.checked)} /><span>我已检查资源、参考图、路径、模型和预算，允许创建资产并进入执行队列。</span></label>
           <div className="generation-preview-actions"><button className="button secondary" type="button" onClick={onClose}>返回编辑</button><button className="button primary" type="button" onClick={onConfirm} disabled={!canConfirm}>{confirmBusy ? <><CircleNotch size={16} className="spin" /> 正在确认…</> : <><Check size={16} weight="bold" /> 确认并执行</>}</button></div>
         </footer>

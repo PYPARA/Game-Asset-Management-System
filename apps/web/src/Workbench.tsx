@@ -357,10 +357,21 @@ export function Workbench() {
   const [systemSettingsOpen, setSystemSettingsOpen] = useState(false);
   const [deliveryOpen, setDeliveryOpen] = useState(false);
   const [versionControlOpen, setVersionControlOpen] = useState(false);
-  const [generationCenterOpen, setGenerationCenterOpen] = useState(false);
-  const [generationSessionId, setGenerationSessionId] = useState<string | null>(null);
+  const [generationCenterOpen, setGenerationCenterOpen] = useState(()=>window.location.pathname.startsWith("/generation"));
+  const [generationSessionId, setGenerationSessionId] = useState<string | null>(()=>decodeURIComponent(window.location.pathname.split("/")[2]??"")||null);
   const [generationSeedAssetIds, setGenerationSeedAssetIds] = useState<string[]>([]);
   const [generationCreateOnMount, setGenerationCreateOnMount] = useState(false);
+  const navigateGeneration = (sessionId: string|null, opened=true) => {
+    const path=opened ? `/generation${sessionId?`/${encodeURIComponent(sessionId)}`:""}` : "/";
+    if (window.location.pathname!==path) window.history.pushState({},"",path);
+    setGenerationCenterOpen(opened);
+    if(opened)setGenerationSessionId(sessionId);
+  };
+  useEffect(()=>{
+    const restore=()=>{setGenerationCenterOpen(window.location.pathname.startsWith("/generation"));setGenerationSessionId(decodeURIComponent(window.location.pathname.split("/")[2]??"")||null);setGenerationCreateOnMount(false);};
+    window.addEventListener("popstate",restore);
+    return ()=>window.removeEventListener("popstate",restore);
+  },[]);
   const generationCenterTriggerRef = useRef<HTMLButtonElement | null>(null);
   const generationCenterWasOpen = useRef(false);
   const [projectDialogOpen, setProjectDialogOpen] = useState(false);
@@ -387,7 +398,7 @@ export function Workbench() {
 
   const generationActivityCount = useMemo(() => {
     return (generationConversationsQuery.data ?? [])
-      .filter((item) => item.status === "running" || item.status === "awaiting_user" || item.status === "unavailable")
+      .filter((item) => item.status === "running" || item.status === "awaiting_input" || item.status === "awaiting_user" || item.status === "unavailable" || item.status === "completed")
       .length;
   }, [generationConversationsQuery.data]);
 
@@ -819,32 +830,24 @@ export function Workbench() {
     setGenerationSessionId(null);
     setGenerationSeedAssetIds([...new Set(seedAssetIds)]);
     setGenerationCreateOnMount(true);
-    setGenerationCenterOpen(true);
+    navigateGeneration(null);
   };
 
   const openGenerationSession = (sessionId: string) => {
     setGenerationSessionId(sessionId);
     setGenerationSeedAssetIds([]);
     setGenerationCreateOnMount(false);
-    setGenerationCenterOpen(true);
+    navigateGeneration(sessionId);
   };
 
   const openGenerationCenter = () => {
-    if (!generationSessionId && !generationCreateOnMount) {
-      const sessions = generationConversationsQuery.data ?? [];
-      const preferred = sessions.find((item) => item.status === "running") ?? sessions[0];
-      if (preferred) setGenerationSessionId(preferred.id);
-    }
-    setGenerationCenterOpen(true);
+    const sessions=generationConversationsQuery.data??[];
+    const preferred=generationSessionId ?? sessions.find(item=>item.status==="running")?.id ?? sessions[0]?.id ?? null;
+    navigateGeneration(preferred);
   };
-
-  const confirmGenerationSurface = (planId: string) => {
-    setGenerationCenterOpen(false);
-    setRunFocusAssetIds([]);
-    setRunInspectorPlanId(planId);
-    setToast("生成计划已确认并进入持久队列。");
-    void refetch();
-    void generationConversationsQuery.refetch();
+  const confirmGenerationSurface = (_planId: string) => {
+    setToast("生成批次已确认，进度和结果保留在当前会话。");
+    void refetch(); void generationConversationsQuery.refetch();
   };
 
   const generationSessionRemoved = (sessionId: string) => {
@@ -926,7 +929,7 @@ export function Workbench() {
           : null;
 
   return (
-    <div className={`workbench-shell ${workspaceMode === "narrative" ? "narrative-mode" : "asset-mode"}`}>
+    <div className={`workbench-shell ${generationCenterOpen ? "generation-mode" : ""} ${workspaceMode === "narrative" ? "narrative-mode" : "asset-mode"}`}>
       <header className="topbar">
         <div className="brand">
           <span className="brand-mark"><CrownSimple size={23} weight="duotone" /></span>
@@ -936,8 +939,8 @@ export function Workbench() {
           {isError ? "项目状态不可用" : data.project.name} <CaretDown size={14} />
         </button>
         <nav className="workspace-mode-switch" aria-label="工作台视图">
-          <button type="button" className={workspaceMode === "assets" ? "active" : ""} aria-pressed={workspaceMode === "assets"} onClick={() => { setNarrativeFocusSceneId(null); setWorkspaceMode("assets"); }}><SquaresFour size={16} /> 资产制作台</button>
-          <button type="button" className={workspaceMode === "narrative" ? "active" : ""} aria-pressed={workspaceMode === "narrative"} onClick={() => setWorkspaceMode("narrative")}><TreeStructure size={16} /> 叙事地图</button>
+          <button type="button" className={!generationCenterOpen && workspaceMode === "assets" ? "active" : ""} aria-pressed={!generationCenterOpen && workspaceMode === "assets"} onClick={() => {navigateGeneration(null,false); setNarrativeFocusSceneId(null); setWorkspaceMode("assets"); }}><SquaresFour size={16} /> 资产制作台</button>
+          <button type="button" className={!generationCenterOpen && workspaceMode === "narrative" ? "active" : ""} aria-pressed={!generationCenterOpen && workspaceMode === "narrative"} onClick={() => {navigateGeneration(null,false);setWorkspaceMode("narrative");}}><TreeStructure size={16} /> 叙事地图</button>
         </nav>
         <button ref={generationCenterTriggerRef} className="topbar-action generation-center-action" type="button" onClick={openGenerationCenter} aria-label="生成中心" disabled={!data.project.id || isError}>
           <Sparkle size={17} weight="fill" /><span>生成中心</span>{generationActivityCount > 0 && <b>{generationActivityCount}</b>}
@@ -967,7 +970,7 @@ export function Workbench() {
         <div className="local-user"><span>本</span><strong>本机用户</strong></div>
       </header>
 
-      <div className="workbench-main">
+      <div className="workbench-main" style={generationCenterOpen ? { display: "none" } : undefined}>
         {workspaceMode === "narrative" ? (
           <NarrativeAtlas project={data.project} onOpenProduction={openNarrativeProduction} focusSceneId={narrativeFocusSceneId} onOpenAsset={openNarrativeAsset} />
         ) : <>
@@ -1277,15 +1280,16 @@ export function Workbench() {
             seedAssetIds={generationSeedAssetIds}
             createOnMount={generationCreateOnMount}
             open
-            onClose={() => setGenerationCenterOpen(false)}
+            onClose={() => navigateGeneration(null,false)}
             onNewSession={() => startGenerationSession()}
             onSelectSession={openGenerationSession}
             onSessionCreated={(sessionId) => {
-              setGenerationSessionId(sessionId);
+              navigateGeneration(sessionId);
               setGenerationCreateOnMount(false);
               setGenerationSeedAssetIds([]);
               void generationConversationsQuery.refetch();
             }}
+            onOpenAsset={(assetId)=>{navigateGeneration(null,false);setWorkspaceMode("assets");navigateToAsset(assetId);}}
             onConfirmed={confirmGenerationSurface}
             onSessionRemoved={generationSessionRemoved}
             workbenchData={data}
@@ -1293,7 +1297,7 @@ export function Workbench() {
         </Suspense>
       ) : null}
 
-      <footer className="task-strip" aria-label="后台任务">
+      {!generationCenterOpen && <footer className="task-strip" aria-label="后台任务">
         <div className="task-label"><strong>近期任务</strong><span /></div>
         <div className="task-copy">
           <strong>{isError ? "后台任务服务不可用" : job.name}</strong>
@@ -1304,7 +1308,7 @@ export function Workbench() {
         <div className="job-metrics"><span>{isError ? "任务数据不可用" : `共生成 ${job.total} 项`}</span><strong>{isError ? "—" : `通过 QA ${job.passed} 项`}</strong></div>
         <div className="job-output"><small>输出位置</small><span title={job.outputPath}>{isError ? "—" : job.outputPath}</span></div>
         <button className="button secondary" type="button" disabled={!job.planId || isError} onClick={() => { if (job.planId) { setRunFocusAssetIds([]); setRunInspectorPlanId(job.planId); } }}><ListBullets size={17} /> 检查运行</button>
-      </footer>
+      </footer>}
 
       {runInspectorPlanId ? (
         <Suspense fallback={<div className="drawer-backdrop production-loading" role="status">正在载入运行检查器…</div>}>

@@ -4,6 +4,9 @@ import argparse
 import asyncio
 import json
 import os
+import subprocess
+import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +27,7 @@ from .settings import Settings
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="gams", description="Game Asset Management System")
     subcommands = parser.add_subparsers(dest="command")
+    subcommands.add_parser("planning-worker", help="run the durable planning worker")
     serve = subcommands.add_parser("serve", help="start the local API and workbench")
     serve.add_argument(
         "--reload",
@@ -35,6 +39,9 @@ def _parser() -> argparse.ArgumentParser:
     inspect = run_commands.add_parser("inspect", help="show persisted run state and evidence")
     inspect.add_argument("plan_id")
     inspect.add_argument("--json", action="store_true", dest="as_json")
+    reconcile = run_commands.add_parser("reconcile-local-failures", help="repair proven pre-send DNS failures without executing jobs")
+    reconcile.add_argument("plan_id")
+    reconcile.add_argument("--json", action="store_true", dest="as_json")
     resume = run_commands.add_parser("resume", help="resume only jobs with persisted safe state")
     resume.add_argument("plan_id")
     resume.add_argument("--json", action="store_true", dest="as_json")
@@ -199,14 +206,41 @@ def _diagnose(settings: Settings, job_id: str, *, as_json: bool) -> int:
 
 
 def _serve(settings: Settings, *, reload: bool = False) -> int:
-    uvicorn.run(
-        "game_assets_api.main:app",
-        host=settings.host,
-        port=settings.port,
-        log_level=settings.log_level,
-        reload=reload,
-        access_log=True,
-    )
+    # The supervisor lives outside uvicorn's reload child. API reloads never
+    # cancel planning; a dead worker is restarted and reclaims persisted leases.
+    _database(settings)  # Complete schema creation before starting sibling processes.
+    stop = threading.Event()
+    def supervise_worker() -> None:
+        while not stop.is_set():
+            child = subprocess.Popen([sys.executable, "-m", "game_assets_api.cli", "planning-worker"])
+            while child.poll() is None and not stop.wait(1):
+                pass
+            if stop.is_set() and child.poll() is None:
+                child.terminate()
+                try:
+                    child.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait()
+            stop.wait(30 if child.returncode == 75 else 1)
+    worker = None
+    if settings.planning_external_worker and os.environ.get("GAME_ASSETS_MANAGE_PLANNING_WORKER", "true").lower() != "false":
+        worker = threading.Thread(target=supervise_worker, daemon=True, name="planning-supervisor")
+        worker.start()
+    try:
+        uvicorn.run(
+            "game_assets_api.main:app",
+            host=settings.host,
+            port=settings.port,
+            log_level=settings.log_level,
+            reload=reload,
+            access_log=True,
+            timeout_graceful_shutdown=5,
+        )
+    finally:
+        stop.set()
+        if worker:
+            worker.join(timeout=12)
     return 0
 
 
@@ -361,9 +395,35 @@ def _acceptance_m6(arguments: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> None:
     arguments = _parser().parse_args(argv)
+    if arguments.command in {None, "serve"}:
+        os.environ.setdefault("GAME_ASSETS_PLANNING_EXTERNAL_WORKER", "true")
     settings = Settings()
+    if arguments.command == "planning-worker":
+        from .planning_runtime import run_worker
+        async def worker_main() -> None:
+            import signal
+            task = asyncio.create_task(run_worker(settings))
+            loop = asyncio.get_running_loop()
+            for signum in (signal.SIGTERM, signal.SIGINT):
+                loop.add_signal_handler(signum, task.cancel)
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        asyncio.run(worker_main())
+        return
     if arguments.command in {None, "serve"}:
         raise SystemExit(_serve(settings, reload=bool(getattr(arguments, "reload", False))))
+    if arguments.command == "run" and arguments.run_command == "reconcile-local-failures":
+        from .dispatch_repair import reconcile_local_failures
+        database = _database(settings)
+        with database.sessions() as session:
+            plan = session.get(GenerationPlan, arguments.plan_id)
+            if plan is None:
+                raise SystemExit("generation plan not found")
+            repaired = reconcile_local_failures(session, plan)
+        _print({"repaired_attempts": repaired}, as_json=arguments.as_json)
+        return
     if arguments.command == "run" and arguments.run_command == "inspect":
         raise SystemExit(_inspect(settings, arguments.plan_id, as_json=arguments.as_json))
     if arguments.command == "run" and arguments.run_command == "resume":

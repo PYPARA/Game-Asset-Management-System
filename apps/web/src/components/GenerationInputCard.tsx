@@ -17,6 +17,7 @@ export function GenerationInputCard({ request, onAnswer }: Props) {
   const [responseId] = useState(() => saved.responseId ?? crypto.randomUUID());
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [expanded, setExpanded] = useState(false);
   useEffect(() => {
     if (request.status !== "resolved") return;
     const persisted = Object.fromEntries(Object.entries(request.answers ?? {}).map(([id, value]) => [id, value.answers?.[0] ?? ""]));
@@ -50,8 +51,10 @@ export function GenerationInputCard({ request, onAnswer }: Props) {
     }
   };
 
+  if (request.status === "resolved" && !expanded) return <div className="generation-answered-summary"><CheckCircle size={16} /><span>{Object.values(request.answers).flatMap(x=>x.answers).join(" · ")}</span><button type="button" aria-expanded={false} onClick={()=>setExpanded(true)}>查看回答</button></div>;
   return <section id={`generation-input-${request.id}`} className="generation-input-card" aria-label="Agent 需要你的回答" tabIndex={-1}>
     <header><Question size={17} /><strong>{pending ? "Agent 需要你的回答" : request.status === "resolved" ? "已回答" : "问题已取消"}</strong>
+      {request.status === "resolved" && <button type="button" aria-expanded={true} onClick={()=>setExpanded(false)}>收起回答</button>}
       {request.response_mode === "new_turn" && pending && <small>回答后开启新回合</small>}
     </header>
     {request.questions.map((question) => <fieldset key={question.id} disabled={!pending || busy}>

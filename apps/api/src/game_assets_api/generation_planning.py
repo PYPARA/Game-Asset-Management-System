@@ -48,6 +48,9 @@ from .domain import (
 )
 from .models import (
     AgentEvent,
+    PlanningTurn,
+    PlanningAttempt,
+    ConversationBatch,
     AgentInputRequest,
     AgentSession,
     Asset,
@@ -95,6 +98,9 @@ PLANNING_SCHEMA_VERSION = 2
 PUBLIC_EVENT_TYPES = frozenset(
     {
         "turn.started",
+        "turn.recovering",
+        "thread.rebuilt",
+        "draft.conflict",
         "assistant.delta",
         "assistant.message",
         "reasoning.summary",
@@ -250,11 +256,13 @@ def _planning_error(reason: Any, *, code: str | None = None) -> dict[str, Any]:
     lowered = detail.lower()
     error_code = code
     if error_code is None:
-        if "invalid_json_schema" in lowered or "invalid schema for response_format" in lowered:
+        if "planning_provider_" in lowered:
+            error_code = "provider_configuration"
+        elif "invalid_json_schema" in lowered or "invalid schema for response_format" in lowered:
             error_code = "output_schema_invalid"
-        elif any(token in lowered for token in ("login", "auth", "unauthorized", "401")):
+        elif any(token in lowered for token in ("login", "auth", "unauthorized", "401", "登录")):
             error_code = "auth_required"
-        elif any(token in lowered for token in ("overload", "server busy", "rate limit", "429")):
+        elif any(token in lowered for token in ("overload", "server busy", "rate limit", "429", "过载", "限流")):
             error_code = "overloaded"
         elif "draft.invalid" in lowered or "draft schema" in lowered:
             error_code = "draft_invalid"
@@ -262,19 +270,29 @@ def _planning_error(reason: Any, *, code: str | None = None) -> dict[str, Any]:
             error_code = "context_invalid"
         elif any(token in lowered for token in ("user.cancelled", "interrupted", "cancelled")):
             error_code = "interrupted"
-        elif any(token in lowered for token in ("runtime", "executable", "app server", "transport")):
+        elif "timed out" in lowered or "timeout" in lowered:
+            error_code = "planning_timeout"
+        elif "transport" in lowered or "connection" in lowered:
+            error_code = "connection_lost"
+        elif "paginated_threads" in lowered or "unknown thread" in lowered or "thread/resume" in lowered:
+            error_code = "resume_incompatible"
+        elif any(token in lowered for token in ("unable to start", "无法启动", "executable", "固定运行时")):
             error_code = "runtime_unavailable"
         else:
             error_code = "turn_failed"
     messages = {
-        "auth_required": "Codex 登录已失效，请在本机重新登录后重试。",
+        "planning_timeout": "规划服务长时间没有返回事件，已保存现场；请检查供应商响应后继续。",
+        "provider_configuration": detail.split(":", 1)[-1].strip(),
+        "auth_required": "规划供应商认证失败，请检查供应商凭据后重试。",
         "runtime_unavailable": "Codex 固定运行时当前不可用，请检查安装后重试。",
         "overloaded": "Codex 当前过载，本次内容已保留，可以直接重试。",
         "context_invalid": "规划上下文无效或已变化，请刷新上下文后重试。",
         "draft_invalid": "Codex 返回的方案未通过校验，可重试或转为人工编辑。",
         "output_schema_invalid": "Codex 结构化输出配置无效，请更新服务后重试。",
         "interrupted": "本轮已由用户停止，已有消息和草案仍然保留。",
-        "process_restarted": "API 重启中断了正在运行的回合，请重新发送。",
+        "process_restarted": "服务已重启，正在恢复刚才的规划；你的回答已保存。",
+        "connection_lost": "规划连接中断，已保存现场并等待恢复。",
+        "resume_incompatible": "原会话恢复协议不兼容，可以保留上下文继续规划。",
         "turn_failed": "规划回合未完成，可以重试或继续人工编辑。",
     }
     return {
@@ -807,6 +825,13 @@ def _reference_rows(session: Session, project_id: str, reference: GenerationRefe
     if expected_hash is not None and not re.fullmatch(r"[0-9a-fA-F]{64}", expected_hash):
         raise ServiceError(422, f"reference hash is invalid for {asset.key}")
     actual_hash = rendition.sha256 if rendition else revision.content_hash
+    # Legacy model output sometimes copied the source/input hash from the
+    # same immutable document revision. Resolve only that provable alias;
+    # never accept an arbitrary mismatching hash or switch revision IDs.
+    if (reference.revision_id and rendition is None and expected_hash
+            and expected_hash.lower() == str(revision.input_hash or "").lower()):
+        reference.sha256 = actual_hash
+        expected_hash = actual_hash
     if expected_hash and expected_hash.lower() != str(actual_hash or "").lower():
         raise ServiceError(409, f"reference hash is stale for {asset.key}")
     return asset, revision, rendition
@@ -839,6 +864,10 @@ def _validate_dependencies(tasks: list[GenerationTaskProposal]) -> None:
 def _validate_draft_settings(settings: dict[str, Any]) -> None:
     """Apply the same bounds as ``GenerationPlanCreate`` during every edit."""
 
+    route = (settings.get("route_defaults") or {}).get("text") or {}
+    effort = route.get("reasoning_effort")
+    if effort is not None and effort not in {"none", "minimal", "low", "medium", "high", "xhigh"}:
+        raise ServiceError(422, "unsupported reasoning effort")
     bounds = {
         "extra_call_budget": (0, 10_000),
         "max_paid_remediation_rounds": (0, 20),
@@ -980,6 +1009,11 @@ def validate_planning_draft(
                 raise ServiceError(422, f"task {task.id} requires a provider model")
         elif for_confirm:
             raise ServiceError(422, f"task {task.id} requires a provider route")
+        effort = session_route.get("reasoning_effort") if isinstance(session_route, dict) and modality == "text" else None
+        if effort is not None:
+            if effort not in {"none", "minimal", "low", "medium", "high", "xhigh"}:
+                raise ServiceError(422, "unsupported reasoning effort")
+            task.metadata = {**task.metadata, "reasoning_effort": effort}
         if provider_id and not task.provider_profile_id:
             task.provider_profile_id = provider_id
         if model and not task.model:
@@ -1258,36 +1292,26 @@ class GenerationPlanningRunner:
         self._turn_ids: dict[str, str] = {}
 
     async def start(self) -> None:
-        # A process restart must never leave a turn looking runnable forever.
+        from .planning_runtime import backfill_planning, recover_turn
+        resume = []
         with self.session_factory() as session:
-            running = list(
-                session.scalars(
-                    select(AgentSession).where(
-                        AgentSession.purpose == PLANNING_PURPOSE,
-                        AgentSession.status.in_(ACTIVE_PLANNING_STATUSES),
-                    )
-                ).all()
-            )
-            for item in running:
-                item.status = AgentSessionStatus.AWAITING_USER.value
-                item.stop_reason = "process.restarted"
-                item.updated_at = utcnow()
-                error = _planning_error("process.restarted", code="process_restarted")
-                item.result_json = {**dict(item.result_json or {}), "last_error": error}
-                record_agent_event(session, item, "turn.failed", data=error)
-            for item in session.scalars(select(AgentInputRequest).where(AgentInputRequest.status == "pending")).all():
-                if item.response_mode == "resume_turn":
-                    item.response_mode = "new_turn"
-                    item.fallback_reason = "process_restarted"
-                    row = session.get(AgentSession, item.session_id)
-                    if row:
-                        record_agent_event(session, row, "user_input.fallback", data=public_input_request(item), turn_id=item.turn_id)
-            for item in session.scalars(select(AgentSession).where(
-                AgentSession.purpose == PLANNING_PURPOSE,
-                AgentSession.status == AgentSessionStatus.AWAITING_USER.value,
-            )).all():
-                _fallback_input_request(session, item, reason="draft_questions")
+            backfill_planning(session)
+            for row in session.scalars(select(AgentSession).where(AgentSession.purpose == PLANNING_PURPOSE, AgentSession.status.in_(ACTIVE_PLANNING_STATUSES))).all():
+                pending = pending_input_request(session, row.id)
+                if pending:
+                    pending.response_mode = "new_turn"
+                    pending.fallback_reason = "process_restarted"
+                    row.status = "awaiting_user"
+                    record_agent_event(session, row, "user_input.fallback", data=public_input_request(pending), turn_id=pending.turn_id)
+                    continue
+                turn = session.scalar(select(PlanningTurn).where(PlanningTurn.session_id == row.id).order_by(PlanningTurn.created_at.desc()))
+                if turn and row.stop_reason != "user.cancelled":
+                    row.status = "awaiting_user"
+                    recover_turn(session, row, turn.id, "startup-" + new_id())
+                    resume.append((row.id, turn.id))
             session.commit()
+        for session_id, turn_id in resume:
+            self.submit(session_id, turn_id)
 
     async def stop(self) -> None:
         for event in self._cancel_events.values():
@@ -1306,6 +1330,10 @@ class GenerationPlanningRunner:
         existing = self._tasks.get(session_id)
         if existing and not existing.done():
             raise ServiceError(409, "this generation planning session already has an active turn")
+        from .planning_runtime import ensure_attempt
+        with self.session_factory() as session:
+            ensure_attempt(session, session_id, turn_id)
+            session.commit()
         cancel_event = asyncio.Event()
         self._cancel_events[session_id] = cancel_event
         self._turn_ids[session_id] = turn_id
@@ -1353,9 +1381,14 @@ class GenerationPlanningRunner:
             task.cancel()
         return True
 
-    async def steer(self, session_id: str, content: str) -> tuple[str, int]:
+    async def steer(self, session_id: str, content: str, client_message_id: str | None = None) -> tuple[str, int]:
         """Append user guidance to the currently active SDK turn."""
 
+        with self.session_factory() as session:
+            row = session.get(AgentSession, session_id)
+            prior = find_generation_message(session, row, client_message_id) if row else None
+            if prior:
+                return prior
         value = content.strip()
         if not value:
             raise ServiceError(422, "message content cannot be empty")
@@ -1390,7 +1423,7 @@ class GenerationPlanningRunner:
                 session,
                 row,
                 USER_EVENT_TYPE,
-                data={"content": _safe_text(value, 20_000), "steered": True},
+                data={"content": _safe_text(value, 20_000), "steered": True, "client_message_id": client_message_id},
                 turn_id=turn_id,
             )
             row.updated_at = utcnow()
@@ -1526,10 +1559,28 @@ class GenerationPlanningRunner:
                     ).all()
                 )
                 messages = _messages_from_events(events)
+                transcript = [{"type": e.event_type, "turn_id": e.turn_id, "data": e.data_json} for e in events if e.event_type in {"user.message", "assistant.message", "user_input.resolved", "conversation.confirmed"}]
+                recovery_turn = session.get(PlanningTurn, turn_id)
+                if recovery_turn and recovery_turn.status == "recovering":
+                    messages = [{"role": "user", "content": "继续上次中断的规划。保留已回答问题和人工修改，不重复询问已确认要求。", "turn_id": turn_id}]
                 context = dict(row.context_json or {})
                 draft = dict(row.draft_json or {})
                 work_dir = ProjectStore(project.root_path).workspace / "agent" / "sessions" / session_id
                 work_dir.mkdir(parents=True, exist_ok=True)
+                atomic_write_json(work_dir / "conversation-history.json", transcript)
+                atomic_write_json(work_dir / "planning-draft-schema.json", GenerationPlanningDraft.model_json_schema())
+                context["recovering_turn"] = bool(recovery_turn and recovery_turn.status == "recovering")
+                context["recovery_history"] = transcript[-80:]
+                context["recovery_history_file"] = "conversation-history.json"
+                context["confirmed_answers"] = [e["data"] for e in transcript if e["type"] == "user_input.resolved"]
+                context["previous_batches"] = [
+                    {"plan_id": batch.plan_id, "draft": batch.draft_json, "jobs": [
+                        {"task_id": job.task_id, "status": job.status, "asset_id": (job.request_json or {}).get("asset_id"), "result_revision_id": job.result_revision_id}
+                        for job in session.scalars(select(GenerationJob).where(GenerationJob.plan_id == batch.plan_id)).all()
+                    ]}
+                    for batch in session.scalars(select(ConversationBatch).where(ConversationBatch.session_id == row.id)).all()
+                ]
+                initial_draft_hash = row.draft_hash
                 if cancel_event.is_set():
                     return
             if not hasattr(self.adapter, "plan_turn"):
@@ -1560,7 +1611,28 @@ class GenerationPlanningRunner:
             result = self.adapter.plan_turn(context, **plan_kwargs)
             saw_terminal = False
             saw_failure = False
-            async for raw in _iter_adapter_result(result):
+            iterator = _iter_adapter_result(result).__aiter__()
+            async def watched_events():
+                while True:
+                    next_event = asyncio.create_task(anext(iterator))
+                    try:
+                        while True:
+                            done, _ = await asyncio.wait({next_event}, timeout=max(60, self.settings.codex_timeout_seconds * 4))
+                            if done:
+                                yield next_event.result()
+                                break
+                            with self.session_factory() as check:
+                                current = check.get(AgentSession, session_id)
+                                if current and pending_input_request(check, session_id):
+                                    continue
+                            raise CodexAdapterError("transport stalled: 规划长时间无响应，现场已保留")
+                    except StopAsyncIteration:
+                        return
+                    finally:
+                        if not next_event.done():
+                            next_event.cancel()
+                            await asyncio.gather(next_event, return_exceptions=True)
+            async for raw in watched_events():
                 if cancel_event.is_set():
                     return
                 with self.session_factory() as session:
@@ -1622,6 +1694,11 @@ class GenerationPlanningRunner:
                                 project_row = session.get(Project, row.project_id)
                                 if project_row is None:
                                     raise ServiceError(404, "project is missing")
+                                # Staging locations are owned by the runner, not
+                                # model-authored project delivery paths.
+                                candidate = dict(candidate)
+                                candidate["tasks"] = [{**task, "candidate_path": None} if isinstance(task, dict) else task for task in candidate.get("tasks", [])]
+                                candidate["settings"] = dict(draft.get("settings") or {})
                                 validated = validate_planning_draft(
                                     session,
                                     project_row,
@@ -1629,6 +1706,7 @@ class GenerationPlanningRunner:
                                     context_hash=row.context_hash,
                                 )
                             except (ServiceError, ValidationError) as exc:
+                                row.result_json = {**dict(row.result_json or {}), "rejected_proposal": candidate}
                                 row.status = AgentSessionStatus.AWAITING_USER.value
                                 row.stop_reason = "draft.invalid"
                                 row.budget_used = min(int(row.budget_limit or 0), int(row.budget_used or 0) + 1)
@@ -1652,6 +1730,11 @@ class GenerationPlanningRunner:
                                 _persist_agent_audit(session, row)
                                 session.commit()
                                 return
+                            if row.draft_hash != initial_draft_hash:
+                                row.result_json = {**dict(row.result_json or {}), "pending_proposal": validated}
+                                record_agent_event(session, row, "draft.conflict", data={"message": "你编辑了方案，Agent 新提案等待合并。", "draft": validated}, turn_id=turn_id)
+                                session.commit()
+                                continue
                             row.draft_json = validated
                             row.draft_hash = draft_hash(validated)
                             row.draft_version = int(row.draft_version or 0) + 1
@@ -1684,7 +1767,10 @@ class GenerationPlanningRunner:
                     elif event_type == "agent.unavailable":
                         row.status = AgentSessionStatus.UNAVAILABLE.value
                         row.stop_reason = _safe_text(payload.get("reason") or "agent unavailable", 500)
-                    _persist_agent_audit(session, row)
+                    # Raw deltas are already durable in SQLite. Do not rewrite the
+                    # complete audit transcript on every token (quadratic IO).
+                    if event_type not in {"assistant.delta", "reasoning.summary", "tool.progress"}:
+                        _persist_agent_audit(session, row)
                     session.commit()
             with self.session_factory() as session:
                 row = session.get(AgentSession, session_id)
@@ -1717,6 +1803,10 @@ class GenerationPlanningRunner:
         except Exception as exc:  # adapter failures must leave a manual path
             self._finish_failed(session_id, turn_id, f"{type(exc).__name__}: planning turn failed")
         finally:
+            from .planning_runtime import finish_attempt
+            with self.session_factory() as session:
+                finish_attempt(session, session_id, turn_id)
+                session.commit()
             self._tasks.pop(session_id, None)
             self._cancel_events.pop(session_id, None)
             self._turn_ids.pop(session_id, None)
@@ -1842,8 +1932,6 @@ def update_generation_conversation_settings(
 ) -> AgentSession:
     if row.purpose != PLANNING_PURPOSE:
         raise ServiceError(409, "agent session is not a generation planning conversation")
-    if row.plan_id:
-        raise ServiceError(409, "confirmed generation conversations cannot be edited")
     if row.status in ACTIVE_PLANNING_STATUSES:
         raise ServiceError(409, "wait for the current planning turn to finish before changing the Agent model")
     row.agent_model = agent_model.strip() if agent_model and agent_model.strip() else None
@@ -1867,8 +1955,6 @@ def replace_generation_conversation_context(
 ) -> AgentSession:
     if row.purpose != PLANNING_PURPOSE:
         raise ServiceError(409, "agent session is not a generation planning conversation")
-    if row.plan_id:
-        raise ServiceError(409, "confirmed generation conversations cannot be edited")
     if row.status in ACTIVE_PLANNING_STATUSES:
         raise ServiceError(409, "wait for the current planning turn to finish before changing references")
     project = require(session, Project, row.project_id, "project")
@@ -2014,7 +2100,6 @@ def find_generation_message(
             select(AgentEvent)
             .where(AgentEvent.session_id == row.id, AgentEvent.event_type == USER_EVENT_TYPE)
             .order_by(AgentEvent.sequence.desc())
-            .limit(100)
         ).all()
     )
     for event in events:
@@ -2033,10 +2118,13 @@ def append_generation_message(
 ) -> tuple[str, int]:
     if row.purpose != PLANNING_PURPOSE:
         raise ServiceError(409, "agent session is not a generation planning conversation")
-    if row.plan_id:
-        raise ServiceError(409, "generation conversation is already confirmed")
     if row.status in ACTIVE_PLANNING_STATUSES:
         raise ServiceError(409, "generation planning session already has an active turn")
+    if row.plan_id and row.status == AgentSessionStatus.COMPLETED.value:
+        row.draft_json = {**dict(row.draft_json or {}), "tasks": [], "summary": "基于上一批结果继续规划", "questions": []}
+        row.draft_hash = draft_hash(row.draft_json)
+        row.draft_version += 1
+        row.budget_used = 0
     if int(row.budget_used or 0) >= int(row.budget_limit or 0):
         raise ServiceError(429, "planning agent budget is exhausted; continue with manual editing or raise the limit")
     content = content.strip()
@@ -2051,6 +2139,9 @@ def append_generation_message(
     seed = set((row.context_json or {}).get("seed_asset_ids", [])) | set(requested)
     _refresh_session_context(session, row, project, seed_asset_ids=seed)
     turn_id = new_id()
+    session.add(PlanningTurn(id=turn_id, session_id=row.id, input_json={"content": content}, context_hash=row.context_hash, draft_hash=row.draft_hash))
+    if not row.turn_count and (not row.title or row.title == "新资产生成任务"):
+        row.title = content[:60]
     record_agent_event(
         session,
         row,
@@ -2058,6 +2149,9 @@ def append_generation_message(
         data={"content": _safe_text(content, 20_000), "context_asset_ids": requested, "client_message_id": client_message_id},
         turn_id=turn_id,
     )
+    from .planning_runtime import ensure_attempt
+    session.flush()
+    ensure_attempt(session, row.id, turn_id)
     row.turn_count = int(row.turn_count or 0) + 1
     row.status = AgentSessionStatus.RUNNING.value
     row.stop_reason = None
@@ -2077,21 +2171,13 @@ def update_generation_draft(
 ) -> AgentSession:
     if row.purpose != PLANNING_PURPOSE:
         raise ServiceError(409, "agent session is not a generation planning conversation")
-    if row.plan_id:
-        raise ServiceError(409, "confirmed generation conversations cannot be edited")
-    if row.status in ACTIVE_PLANNING_STATUSES:
-        raise ServiceError(409, "wait for the current planning turn to finish before editing the draft")
     if payload.base_hash != (row.draft_hash or draft_hash(row.draft_json or {})):
         raise ServiceError(409, "draft changed in another tab; reload the current plan")
     project = require(session, Project, row.project_id, "project")
-    context, context_hash = build_planning_context(
-        session,
-        project,
-        seed_asset_ids=(row.context_json or {}).get("seed_asset_ids", []),
-    )
-    if context_hash != row.context_hash:
-        raise ServiceError(409, "project context changed; refresh the conversation before editing")
-    normalized = validate_planning_draft(session, project, payload.draft, context_hash=context_hash)
+    # Editing a draft does not regenerate its planning context. Provider catalog
+    # refreshes and unrelated asset scans must not invalidate ordinary controls.
+    # Validate live references/paths below; base_hash still protects concurrent edits.
+    normalized = validate_planning_draft(session, project, payload.draft, context_hash=row.context_hash)
     row.draft_json = normalized
     row.draft_hash = draft_hash(normalized)
     row.draft_version = int(row.draft_version or 0) + 1
@@ -2274,12 +2360,14 @@ def confirm_generation_conversation(
 ) -> dict[str, Any]:
     if row.purpose != PLANNING_PURPOSE:
         raise ServiceError(409, "agent session is not a generation planning conversation")
-    if row.plan_id:
-        plan = session.get(GenerationPlan, row.plan_id)
+    previous = session.scalar(select(ConversationBatch).where(ConversationBatch.session_id == row.id, ConversationBatch.draft_hash == payload.draft_hash))
+    if previous or (row.plan_id and row.status == AgentSessionStatus.COMPLETED.value and payload.draft_hash == row.draft_hash):
+        plan = session.get(GenerationPlan, previous.plan_id if previous else row.plan_id)
         if plan is None:
             raise ServiceError(409, "conversation points to a missing plan")
         jobs = list(session.scalars(select(GenerationJob).where(GenerationJob.plan_id == plan.id)).all())
-        created_ids = list((row.result_json or {}).get("created_asset_ids", []))
+        batch_events = session.scalars(select(AgentEvent).where(AgentEvent.session_id == row.id, AgentEvent.event_type == "conversation.confirmed")).all()
+        created_ids = next((list((event.data_json or {}).get("created_asset_ids", [])) for event in batch_events if (event.data_json or {}).get("plan_id") == plan.id), [])
         created = [asset for asset in (session.get(Asset, item) for item in created_ids) if asset is not None]
         return {"conversation": row, "plan": plan, "jobs": jobs, "created_assets": _asset_read_list(created)}
     if row.status in ACTIVE_PLANNING_STATUSES:
@@ -2327,6 +2415,7 @@ def confirm_generation_conversation(
             available_provider_ids=available_provider_ids,
             commit=False,
         )
+        session.add(ConversationBatch(session_id=row.id, plan_id=plan.id, draft_hash=payload.draft_hash, draft_version=row.draft_version, draft_json=normalized))
         row.plan_id = plan.id
         row.draft_json = normalized
         row.draft_hash = draft_hash(normalized)

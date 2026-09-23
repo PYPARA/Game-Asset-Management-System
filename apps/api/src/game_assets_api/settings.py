@@ -53,6 +53,7 @@ class Settings(BaseSettings):
     codex_bin: str | None = None
     codex_timeout_seconds: float = Field(default=45.0, ge=1.0, le=600.0)
     agent_budget: int = Field(default=1, ge=1, le=20)
+    planning_external_worker: bool = False  # CLI enables the separate worker; embedded mode is for tests/integrations.
     planning_agent_budget: int = Field(default=8, ge=1, le=20)
 
     @field_validator("job_lease_seconds")

@@ -1,9 +1,11 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { render, screen, waitFor, within, fireEvent } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
+  recoverGenerationTurn: vi.fn(),
+  fetchAssetDetails: vi.fn(),
   answerGenerationInput: vi.fn(),
   fetchWorkbench: vi.fn(),
   fetchGenerationConversation: vi.fn(),
@@ -28,6 +30,8 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("../lib/api", () => ({
+  recoverGenerationTurn: mocks.recoverGenerationTurn,
+  fetchAssetDetails: mocks.fetchAssetDetails,
   answerGenerationInput: mocks.answerGenerationInput,
   ApiError: class ApiError extends Error {
     status: number;
@@ -50,6 +54,7 @@ vi.mock("../lib/api", () => ({
 }));
 
 import { GenerationChatPage } from "../components/GenerationChatPage";
+import { resetGenerationStores } from "../lib/generationStore";
 import { ApiError } from "../lib/api";
 
 const asset = {
@@ -240,8 +245,53 @@ async function chooseMenuOption(
 
 describe("GenerationChatPage", () => {
   beforeEach(() => {
+    resetGenerationStores();
     vi.clearAllMocks();
+    sessionStorage.clear();
+    Object.defineProperty(window,"innerWidth",{value:1440,writable:true});
+    mocks.recoverGenerationTurn.mockResolvedValue({attempt_id:"attempt-2"});
     localStorage.removeItem("gams.openRunInspector");
+  });
+
+  it("Escape 只关闭资产预览并返回触发器，不退出会话", async () => {
+    setup();mocks.fetchAssetDetails.mockResolvedValue(asset);
+    const user=userEvent.setup();
+    const trigger=await screen.findByRole("button",{name:"预览 夜雨参考图"});
+    await user.click(trigger);
+    await screen.findByRole("dialog",{name:"预览 夜雨参考图"});
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog",{name:"预览 夜雨参考图"})).not.toBeInTheDocument();
+    expect(mocks.onClose).not.toHaveBeenCalled();
+    expect(trigger).toHaveFocus();
+  });
+
+  it("中文输入法确认候选不会发送，并保存输入草稿", async () => {
+    setup();
+    const input=await screen.findByPlaceholderText("描述你想生成的资源、用途、风格或需要参考的资产…");
+    fireEvent.change(input,{target:{value:"文官立绘"}});
+    fireEvent.keyDown(input,{key:"Enter",isComposing:true,keyCode:229});
+    expect(mocks.sendGenerationConversationMessage).not.toHaveBeenCalled();
+    expect(sessionStorage.getItem("gams.composer.session-1")).toBe("文官立绘");
+  });
+  it("千级资产选择器限制渲染数量并支持定向搜索", async () => {
+    mocks.fetchWorkbench.mockResolvedValueOnce({project:{id:"project-1",name:"示例项目"},assets:Array.from({length:1000},(_,i)=>({...asset,id:`asset-${i}`,name:`测试参考 ${i}`,key:`media.test-${i}`})),job:{},relations:[]});
+    const view=setup();const user=userEvent.setup();
+    await user.click(await screen.findByRole("button",{name:"添加参考资产"}));
+    const dialog=await screen.findByRole("dialog",{name:"选择 Agent 要读取的参考"});
+    expect(within(dialog).getByText(/找到 1000 项/)).toBeInTheDocument();
+    expect(view.container.querySelectorAll(".generation-reference-choice")).toHaveLength(120);
+    await user.type(within(dialog).getByPlaceholderText(/搜索/),"测试参考 999");
+    expect(view.container.querySelectorAll(".generation-reference-choice")).toHaveLength(1);
+  });
+
+  it("一万条历史消息保持时间线渲染有界", async () => {
+    const events=Array.from({length:10000},(_,i)=>({id:`history-${i}`,sequence:i+1,session_id:"session-1",turn_id:`turn-${i}`,thread_id:null,event_type:"user.message",data:{content:`历史需求 ${i}`},created_at:"2026-09-22"}));
+    const view=setup({events});
+    await screen.findByText("历史需求 9999");
+    expect(view.container.querySelectorAll(".generation-message").length).toBeLessThanOrEqual(60);
+    await userEvent.setup().click(screen.getByRole("button",{name:"加载更早的对话"}));
+    await screen.findByText("历史需求 9939");
+    expect(view.container.querySelectorAll(".generation-message").length).toBeLessThanOrEqual(60);
   });
 
   it("渲染可见 Agent 消息与可展开工具事件", async () => {
@@ -287,6 +337,19 @@ describe("GenerationChatPage", () => {
     expect(await screen.findByText(/"tool": "read_project_specs"/)).toBeInTheDocument();
   });
 
+  it("预览内可以接受全部警告并执行，无需回右栏勾选",async()=>{
+    setup({conversation:{draft:draft({warnings:[{code:"identity",message:"请确认原创人物设定"},{code:"route",message:"请确认生成路由"}]})}});
+    const user=userEvent.setup();
+    await user.click(await screen.findByRole("button",{name:"检查并生成"}));
+    const dialog=screen.getByRole("dialog",{name:"确认前预览"});
+    await user.click(within(dialog).getByRole("checkbox",{name:/我已检查资源/}));
+    expect(within(dialog).getByRole("button",{name:"确认并执行"})).toBeDisabled();
+    await user.click(within(dialog).getByRole("checkbox",{name:"请确认原创人物设定"}));
+    await user.click(within(dialog).getByRole("checkbox",{name:"请确认生成路由"}));
+    await user.click(within(dialog).getByRole("button",{name:"确认并执行"}));
+    await waitFor(()=>expect(mocks.confirmGenerationConversation).toHaveBeenCalledWith("session-1",expect.any(String),["identity","route"],"context-hash-1"));
+  });
+
   it("编辑草案后可预览，并且只有确认动作调用 confirm 接口", async () => {
     setup();
     const user = userEvent.setup();
@@ -295,7 +358,7 @@ describe("GenerationChatPage", () => {
     await user.type(target, "approved/assets/backgrounds/edited-rain.png");
     await waitFor(() => expect(mocks.updateGenerationConversationDraft).toHaveBeenCalled());
 
-    await user.click(screen.getByRole("button", { name: "预览确认" }));
+    await user.click(screen.getByRole("button", { name: "检查并生成" }));
     const dialog = await screen.findByRole("dialog", { name: "确认前预览" });
     expect(within(dialog).getByText(/edited-rain\.png/)).toBeInTheDocument();
     const checks = screen.getAllByRole("checkbox", { name: /我已检查资源/ });
@@ -325,7 +388,7 @@ describe("GenerationChatPage", () => {
   it("收起生成中心时响应 Escape，并把关闭动作交给宿主", async () => {
     setup();
     const user = userEvent.setup();
-    await screen.findByText("序章夜雨背景生成");
+    await screen.findByRole("heading", { name: "序章夜雨背景生成" });
     await user.keyboard("{Escape}");
     expect(mocks.onClose).toHaveBeenCalledTimes(1);
   });
@@ -355,6 +418,9 @@ describe("GenerationChatPage", () => {
     expect(mocks.updateGenerationConversationDraft.mock.calls.at(-1)?.[2]).toMatchObject({
       settings: { route_defaults: { text: { provider_profile_id: "provider-ready", model: "text-fast" } } },
     });
+    await user.click(within(dialog).getByRole("combobox", {name:"文字模型思考等级"}));
+    await user.click(screen.getByRole("option", {name:/^高$/}));
+    await waitFor(()=>expect(mocks.updateGenerationConversationDraft.mock.calls.at(-1)?.[2].settings.route_defaults.text.reasoning_effort).toBe("high"));
   });
 
   it("已保存模型不可用时明确提示，并允许切换到可用模型", async () => {
@@ -396,6 +462,7 @@ describe("GenerationChatPage", () => {
     await waitFor(() => expect(mocks.steerGenerationConversationTurn).toHaveBeenCalledWith(
       "session-1",
       "优先沿用已批准的夜雨参考图",
+      expect.any(String),
     ));
     expect(mocks.sendGenerationConversationMessage).not.toHaveBeenCalled();
     expect(screen.getByRole("button", { name: "生成路由" })).toBeDisabled();
@@ -423,7 +490,7 @@ describe("GenerationChatPage", () => {
     expect(mocks.steerGenerationConversationTurn).not.toHaveBeenCalled();
   });
 
-  it("失败回合的重试始终开启新回合并合并重复终态错误", async () => {
+  it("恢复绑定失败回合且不重复发送用户消息", async () => {
     setup({
       conversation: { status: "running" },
       events: [
@@ -437,14 +504,11 @@ describe("GenerationChatPage", () => {
     expect(await screen.findByText("方案未通过校验")).toBeInTheDocument();
     expect(screen.queryByText("Codex 暂不可用")).not.toBeInTheDocument();
     expect(screen.getByText("warnings[0]")).toBeInTheDocument();
-    expect(screen.getByText(/必须是包含有效 code/)).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "重试本轮" }));
+    expect(screen.getByText(/必须是包含有效 code/, {selector:"p"})).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "继续本轮" }));
 
-    await waitFor(() => expect(mocks.sendGenerationConversationMessage).toHaveBeenCalledWith(
-      "session-1",
-      "生成新角色",
-      [asset.id],
-    ));
+    await waitFor(() => expect(mocks.recoverGenerationTurn).toHaveBeenCalledWith("session-1","turn-1",expect.any(String)));
+    expect(mocks.sendGenerationConversationMessage).not.toHaveBeenCalled();
     expect(mocks.steerGenerationConversationTurn).not.toHaveBeenCalled();
   });
 
@@ -456,26 +520,29 @@ describe("GenerationChatPage", () => {
       ],
     });
     const user = userEvent.setup();
-    await user.click(await screen.findByRole("button", { name: "刷新上下文并重试" }));
+    await user.click(await screen.findByRole("button", { name: "继续本轮" }));
 
-    await waitFor(() => expect(mocks.updateGenerationConversationContext).toHaveBeenCalledWith("session-1", [asset.id]));
-    expect(mocks.sendGenerationConversationMessage).toHaveBeenCalledWith("session-1", "生成序章夜雨背景", [asset.id]);
+    await waitFor(() => expect(mocks.recoverGenerationTurn).toHaveBeenCalledWith("session-1","turn-1",expect.any(String)));
+    expect(mocks.sendGenerationConversationMessage).not.toHaveBeenCalled();
   });
 
-  it("确认时项目上下文刚好变化会自动刷新并再确认一次", async () => {
+  it("确认时上下文变化保留编辑并要求重新核对", async () => {
     setup();
     mocks.confirmGenerationConversation
       .mockRejectedValueOnce(new ApiError("project context changed while planning", 409));
     const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", {name:"检查并生成"}));
     await user.click(await screen.findByRole("checkbox", { name: /我已检查资源/ }));
     await user.click(screen.getByRole("button", { name: "确认并执行" }));
 
     await waitFor(() => expect(mocks.updateGenerationConversationContext).toHaveBeenCalledWith("session-1", [asset.id]));
-    await waitFor(() => expect(mocks.confirmGenerationConversation).toHaveBeenCalledTimes(2));
-    expect(mocks.onConfirmed).toHaveBeenCalledWith("plan-1");
+    await waitFor(() => expect(within(screen.getByRole("dialog",{name:"确认前预览"})).getByText(/项目快照已刷新，编辑内容已保留/)).toBeInTheDocument());
+    expect(mocks.confirmGenerationConversation).toHaveBeenCalledTimes(1);
+    expect(mocks.onConfirmed).not.toHaveBeenCalled();
   });
 
   it("Agent 不可用时保留人工编排入口", async () => {
+    mocks.fetchGenerationAgentCapabilities.mockResolvedValueOnce({ available: false, diagnostic: { hint: "请登录 Codex" } });
     setup({ conversation: { status: "unavailable" } });
     expect(await screen.findByText("Agent 暂不可用，方案编辑仍可继续。"))
       .toBeInTheDocument();
@@ -493,14 +560,13 @@ describe("GenerationChatPage", () => {
 
     expect(await screen.findByText("草案版本冲突")).toBeInTheDocument();
     expect(screen.getByText("草案尚未保存，预览与确认已暂停。")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "预览确认" })).toBeDisabled();
-    await user.click(screen.getByRole("checkbox", { name: /我已检查资源/ }));
-    expect(screen.getByRole("button", { name: "确认并执行" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "检查并生成" })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "确认并执行" })).not.toBeInTheDocument();
     expect(mocks.confirmGenerationConversation).not.toHaveBeenCalled();
 
     await user.click(screen.getByRole("button", { name: "重试保存" }));
     await waitFor(() => expect(mocks.updateGenerationConversationDraft).toHaveBeenCalledTimes(2));
-    await waitFor(() => expect(screen.getByRole("button", { name: "预览确认" })).toBeEnabled());
+    await waitFor(() => expect(screen.getByRole("button", { name: "检查并生成" })).toBeEnabled());
   });
 
   it("Generation 规划和参考筛选使用可访问的 SelectMenu", async () => {
@@ -525,6 +591,7 @@ describe("GenerationChatPage", () => {
     expect(await screen.findByRole("combobox", { name: "上游参考任务" })).toBeInTheDocument();
 
     // Adding a task reference reveals the reference asset and role menus.
+    await chooseMenuOption(user, screen.getByRole("combobox", { name: "选择任务参考" }), /夜雨参考图/);
     await user.click(screen.getByRole("button", { name: "添加参考资源" }));
     const referenceAsset = await screen.findByRole("combobox", { name: "参考资产" });
     expect(screen.getByRole("combobox", { name: "角色" })).toBeInTheDocument();

@@ -246,6 +246,9 @@ class _ProviderFixtureHandler(BaseHTTPRequestHandler):
 
 
 class _ProviderFixtureServer(ThreadingHTTPServer):
+    # The acceptance case opens eight connections together; the stdlib default
+    # backlog of five can reject loopback requests before handlers start.
+    request_queue_size = 32
     daemon_threads = True
 
     def __init__(self, state: _FixtureState):

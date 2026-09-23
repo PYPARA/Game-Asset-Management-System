@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Workbench } from "../Workbench";
 import { deleteCredential, saveCredential } from "../lib/credentials";
+import "../styles.css";
 
 function json(payload: unknown, status = 200) {
   return Promise.resolve(
@@ -617,6 +618,30 @@ describe("制作台", () => {
     await user.click(screen.getByRole("checkbox", { name: "选择 沈渊（文官）· 中立姿态" }));
     expect(screen.getByRole("button", { name: "需要重做" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "检查运行" })).toBeEnabled();
+  });
+
+  it("生成中心打开时，供应商渠道弹窗显示在生成工作台上方", async () => {
+    mockAssetApi();
+    const user = userEvent.setup();
+    renderWorkbench();
+
+    const centerButton = await screen.findByRole("button", { name: "生成中心" });
+    await waitFor(() => expect(centerButton).toBeEnabled());
+    await user.click(centerButton);
+
+    const generationSurface = await waitFor(() => {
+      const element = document.querySelector<HTMLElement>(".generation-drawer-page");
+      expect(element).not.toBeNull();
+      return element as HTMLElement;
+    });
+
+    await user.click(screen.getByRole("button", { name: "供应商渠道" }));
+    const providerDialog = await screen.findByRole("dialog", { name: "供应商渠道" });
+    const providerBackdrop = providerDialog.closest<HTMLElement>(".provider-channel-backdrop");
+
+    expect(providerBackdrop).not.toBeNull();
+    expect(Number(getComputedStyle(providerBackdrop as HTMLElement).zIndex))
+      .toBeGreaterThan(Number(getComputedStyle(generationSurface).zIndex));
   });
 
   it("新建会话只创建一次，并允许第二个会话继续独立运行", async () => {

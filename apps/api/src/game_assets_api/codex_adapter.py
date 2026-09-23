@@ -414,12 +414,15 @@ class AppServerCodexAdapter:
     timeout_seconds: float = 45.0
     name: str = "codex-app-server"
     version: str = "app-server-jsonl-v1"
+    isolated_home: Path | None = None
+    provider_env: dict[str, str] = field(default_factory=dict, repr=False)
     _active: dict[str, _ActiveAppServerTurn] = field(init=False, default_factory=dict)
     _request_id: int = field(init=False, default=0)
     interactive_user_input: bool = True
+    _stderr_tasks: dict[int, asyncio.Task] = field(init=False, default_factory=dict)
+    _stderr_tail: dict[int, bytes] = field(init=False, default_factory=dict)
 
-    @staticmethod
-    def _environment() -> dict[str, str]:
+    def _environment(self) -> dict[str, str]:
         # Codex uses its local login/configuration, but the planning Agent must
         # never inherit application/provider secrets from the API process.
         env = {
@@ -428,6 +431,10 @@ class AppServerCodexAdapter:
             if key in {"PATH", "HOME", "CODEX_HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TERM", "SSL_CERT_FILE", "SSL_CERT_DIR"}
             and not any(token in key.upper() for token in ("KEY", "TOKEN", "SECRET"))
         }
+        if self.isolated_home is not None:
+            self.isolated_home.mkdir(parents=True, exist_ok=True, mode=0o700)
+            env["CODEX_HOME"] = str(self.isolated_home)
+        env.update(self.provider_env)
         env["GAMS_AGENT_READ_ONLY"] = "1"
         return env
 
@@ -438,29 +445,40 @@ class AppServerCodexAdapter:
     async def _spawn(self, work_dir: Path | None = None) -> asyncio.subprocess.Process:
         cwd = work_dir if work_dir and work_dir.is_dir() else None
         try:
-            return await asyncio.create_subprocess_exec(
+            process = await asyncio.create_subprocess_exec(
                 *self.command,
                 cwd=str(cwd) if cwd else None,
                 env=self._environment(),
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                limit=4 * 1024 * 1024,
             )
+            async def drain_stderr():
+                while chunk := await process.stderr.read(4096):
+                    self._stderr_tail[process.pid] = (self._stderr_tail.get(process.pid, b"") + chunk)[-2048:]
+            self._stderr_tasks[process.pid] = asyncio.create_task(drain_stderr())
+            return process
         except (OSError, ValueError) as exc:
             raise CodexUnavailable(
                 f"无法启动 Codex App Server：{exc}。请检查 Codex 安装或 GAME_ASSETS_CODEX_BIN。"
             ) from exc
 
-    @staticmethod
-    async def _stop_process(process: asyncio.subprocess.Process) -> None:
-        if process.returncode is not None:
-            return
-        process.terminate()
+    async def _stop_process(self, process: asyncio.subprocess.Process) -> None:
         try:
-            await asyncio.wait_for(process.wait(), timeout=1.5)
-        except TimeoutError:
-            process.kill()
-            await process.wait()
+            if process.returncode is None:
+                process.terminate()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=1.5)
+                except TimeoutError:
+                    process.kill()
+                    await process.wait()
+        finally:
+            task = self._stderr_tasks.pop(process.pid, None)
+            if task:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            self._stderr_tail.pop(process.pid, None)
 
     async def _send(
         self,
@@ -506,12 +524,10 @@ class AppServerCodexAdapter:
             raise CodexProtocolError("Codex App Server stdout is unavailable")
         raw = await asyncio.wait_for(process.stdout.readline(), timeout=timeout)
         if not raw:
-            detail = ""
-            if process.stderr is not None:
-                try:
-                    detail = (await asyncio.wait_for(process.stderr.read(), timeout=0.2)).decode("utf-8", "replace").strip()
-                except (TimeoutError, OSError):
-                    detail = ""
+            detail = self._stderr_tail.get(process.pid, b"").decode("utf-8", "replace").strip()
+            for secret in self.provider_env.values():
+                if secret:
+                    detail = detail.replace(secret, "[redacted]")
             raise CodexUnavailable(
                 "Codex App Server exited before responding"
                 + (f": {detail[:500]}" if detail else "")
@@ -595,12 +611,12 @@ class AppServerCodexAdapter:
                 params["cwd"] = cwd
             if model:
                 params["model"] = model
-            result = await self._request(
-                process,
-                "thread/resume",
-                params,
-            )
-            return self._thread_id(result) or thread_id
+            try:
+                result = await self._request(process, "thread/resume", params)
+                return self._thread_id(result) or thread_id
+            except CodexUnavailable as exc:
+                if not any(token in str(exc).lower() for token in ("not found", "unknown thread", "paginated_threads", "not supported", "no rollout")):
+                    raise
         params = {
             "approvalPolicy": "never",
             "sandbox": sandbox,
@@ -675,7 +691,7 @@ class AppServerCodexAdapter:
             if not delta:
                 return None
             final_text.append(delta)
-            return {"type": "assistant.delta", "data": {"content": delta, **common}}
+            return {"type": "assistant.delta", "data": {"content": delta, "item_id": params.get("itemId") or params.get("item_id"), **common}}
         if method in {"item/started", "item/started/commandExecution"}:
             if item.get("type") in {"agentMessage", "text"}:
                 return None
@@ -688,7 +704,7 @@ class AppServerCodexAdapter:
                 if content:
                     phase = item.get("phase")
                     visible, draft = OfficialCodexAdapter._structured_response(content)
-                    event = {"type": "assistant.message", "data": {"content": visible, "phase": phase, **common}}
+                    event = {"type": "assistant.message", "data": {"content": visible, "phase": phase, "item_id": item.get("id"), **common}}
                     if draft is not None:
                         event["data"]["draft"] = draft
                     return event
@@ -731,6 +747,10 @@ class AppServerCodexAdapter:
                 model=model,
                 work_dir=work_dir,
             )
+            if active.thread_id != thread_id:
+                context = {**context, "rebuild_conversation": True}
+                if thread_id:
+                    yield {"type": "thread.rebuilt", "data": {"message": "已保留上下文继续规划。", "thread_id": active.thread_id}}
             prompt = OfficialCodexAdapter._prompt(context, messages, draft, work_dir)
             prompt += ("\n\n若缺少可在本次对话立即回答的关键信息，优先调用 request_user_input，"
                        "一次最多三个问题；在得到回答前不要提交最终草案。开放设定可不提供选项。"
@@ -935,14 +955,16 @@ class OfficialCodexAdapter:
     timeout_seconds: float = 45.0
     name: str = "openai-codex"
     version: str = "0.144.4"
+    isolated_home: Path | None = None
+    provider_env: dict[str, str] = field(default_factory=dict, repr=False)
+    config_overrides: tuple[str, ...] = ()
     _client: Any = field(init=False, default=None)
     _client_lock: asyncio.Lock = field(init=False, default_factory=asyncio.Lock)
     _active: dict[str, Any] = field(init=False, default_factory=dict)
     _startup_error: str | None = field(init=False, default=None)
     _startup_task: asyncio.Task[Any] | None = field(init=False, default=None)
 
-    @staticmethod
-    def _environment() -> dict[str, str]:
+    def _environment(self) -> dict[str, str]:
         """Keep local Codex auth while excluding application/provider secrets."""
 
         allowed = {
@@ -958,6 +980,10 @@ class OfficialCodexAdapter:
             "SSL_CERT_DIR",
         }
         env = {key: value for key, value in os.environ.items() if key in allowed}
+        if self.isolated_home is not None:
+            self.isolated_home.mkdir(parents=True, exist_ok=True, mode=0o700)
+            env["CODEX_HOME"] = str(self.isolated_home)
+        env.update(self.provider_env)
         env["GAMS_AGENT_READ_ONLY"] = "1"
         return env
 
@@ -974,6 +1000,7 @@ class OfficialCodexAdapter:
                     CodexConfig(
                         codex_bin=self.codex_bin,
                         env=self._environment(),
+                        config_overrides=self.config_overrides,
                         client_name="game_asset_management_system",
                         client_title="Game Asset Generation Center",
                         client_version="0.1.0",
@@ -1129,12 +1156,28 @@ class OfficialCodexAdapter:
             "你只负责规划：不得修改文件、创建计划/资产/任务、调用生成供应商或请求写权限。\n"
             "返回符合输出 schema 的 JSON，其中 message 是给用户的简洁中文说明，draft_json 是更新后完整草案的 JSON 字符串。"
             "draft_json 必须能解析成一个 JSON 对象，并保留当前草案中仍然有效的设置和元数据。"
+            "先读取 ./planning-draft-schema.json，严格遵守任务、asset 与 references 的字段结构，不自行发明 title、output_spec 等任务字段。"
+            "只输出必要方案，不复制索引或规范全文；说明和假设保持简短。"
+            "引用必须固定 revision_id。文档 sha256 使用该修订 content_hash，不能使用 input_hash；图片使用 rendition.sha256。"
+            "candidate_path 留空，由系统分配候选暂存目录；target_path 才是批准后的交付路径。"
             "warnings 必须是对象数组，例如 [{\"code\":\"character_spec_incomplete\","
             "\"message\":\"角色身份和交付规格尚未明确。\"}]，不得使用字符串数组。\n\n"
             f"LATEST_USER_INSTRUCTION:\n{instruction}\n\n"
             f"CURRENT_DRAFT:\n{draft_section}\n\n"
             f"CONTEXT_HASH:\n{context.get('context_hash') or context.get('_context_hash') or '见上下文文件'}"
         )
+        if context.get("previous_batches"):
+            batches = json.dumps(context["previous_batches"], ensure_ascii=False)
+            if work_dir is not None:
+                (work_dir / "previous-batches.json").write_text(batches, encoding="utf-8")
+                batches = "读取 ./previous-batches.json，使用已生成的资产与修订作为下一版的明确参考；不能修改已确认批次。"
+            prompt += "\n\nPREVIOUS_BATCHES:\n" + batches
+        if context.get("rebuild_conversation") or context.get("recovering_turn"):
+            recovery = json.dumps({"confirmed_answers": context.get("confirmed_answers", []), "recent_dialogue": context.get("recovery_history", [])}, ensure_ascii=False)
+            if work_dir is not None:
+                (work_dir / "recovery-summary.json").write_text(recovery, encoding="utf-8")
+                recovery = "先读取 ./recovery-summary.json，保留全部已确认要求与回答。完整历史位于 ./conversation-history.json，可按需读取。"
+            prompt += "\n\nRECOVERY_CONTEXT（继续已保存回合，以下记录是必须保留的用户上下文）:\n" + recovery
         if len(prompt.encode("utf-8")) >= 100_000:
             raise CodexProtocolError("Codex planning prompt exceeds the 100KB safety limit")
         return prompt
@@ -1170,7 +1213,7 @@ class OfficialCodexAdapter:
                     lambda: client.thread_resume(thread_id, **values)
                 )
             except Exception as exc:
-                if not any(token in str(exc).lower() for token in ("not found", "unknown thread")):
+                if not any(token in str(exc).lower() for token in ("not found", "unknown thread", "paginated_threads", "not supported")):
                     raise
         return await self._retry_overload(lambda: client.thread_start(**values))
 
@@ -1211,10 +1254,10 @@ class OfficialCodexAdapter:
             }]
         if method == "item/agentMessage/delta":
             delta = str(getattr(payload, "delta", ""))
-            return [{"type": "assistant.delta", "data": {**common, "content": delta}}] if delta else []
+            return [{"type": "assistant.delta", "data": {**common, "item_id": getattr(payload, "item_id", None), "content": delta}}] if delta else []
         if method == "item/reasoning/summaryTextDelta":
             delta = str(getattr(payload, "delta", ""))
-            return [{"type": "reasoning.summary", "data": {**common, "content": delta}}] if delta else []
+            return [{"type": "reasoning.summary", "data": {**common, "item_id": getattr(payload, "item_id", None), "content": delta}}] if delta else []
         if method in {"item/commandExecution/outputDelta", "item/mcpToolCall/progress"}:
             data = self._model_json(payload)
             data.update(common)
@@ -1244,7 +1287,7 @@ class OfficialCodexAdapter:
                 if content:
                     events.append({
                         "type": "assistant.message",
-                        "data": {**common, "content": content, "phase": phase},
+                        "data": {**common, "item_id": getattr(root, "id", None), "content": content, "phase": phase},
                     })
                 if draft is not None and phase != "commentary":
                     events.append({
@@ -1321,6 +1364,12 @@ class OfficialCodexAdapter:
                 model=model,
                 work_dir=work_dir,
             )
+            rebuilt = bool(thread_id and thread.id != thread_id)
+            context = {**context, "rebuild_conversation": rebuilt or not thread_id}
+            if rebuilt or not thread_id:
+                messages = [{"role": "user", "content": "这是已保存的会话记录。保留已确认要求，继续最新目标。\n" + json.dumps(context.get("recovery_history", []), ensure_ascii=False) + "\n已回答问题：" + json.dumps(context.get("confirmed_answers", []), ensure_ascii=False)}] + messages
+            if rebuilt:
+                yield {"type": "thread.rebuilt", "thread_id": thread.id, "data": {"message": "已保留上下文继续规划。", "previous_thread_id": thread_id}}
             from openai_codex import ApprovalMode, Sandbox
             from openai_codex.generated.v2_all import ReasoningSummary
 
@@ -1434,6 +1483,7 @@ class OfficialCodexAdapter:
             for item in response.data
         ]
         return {
+            "can_connect": True, "can_start": logged_in, "can_resume": None,
             "available": logged_in,
             "adapter": self.name,
             "version": self.version,

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from PIL import Image
-from sqlalchemy import func, select, update
+from sqlalchemy import case, func, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from .domain import (
@@ -154,6 +154,7 @@ class JobRunner:
         if (
             attempt is None
             or attempt.phase != "failed"
+            or attempt.dispatch_state in {"dispatch_started", "not_sent"}
             or attempt.error_category not in RETRYABLE_ERROR_CATEGORIES
             or not attempt.request_hash
         ):
@@ -188,7 +189,8 @@ class JobRunner:
         tool_repair = bool(
             action and action.action == RemediationKind.TOOL_REPAIR.value
         )
-        safe_before_dispatch = bool(action and not action_attempted)
+        safe_before_dispatch = bool(action and not action_attempted
+                                    and (latest is None or latest.started_at < action.created_at))
         known_retry = self._known_retry_available(session, job, latest)
 
         if latest and latest.phase == "succeeded" and latest.result_revision_id and not action:
@@ -200,7 +202,7 @@ class JobRunner:
             )
         if (
             latest is None
-            or latest.phase == "created"
+            or (latest.phase == "created" and latest.dispatch_state != "dispatch_started")
             or recoverable_output
             or tool_repair
             or safe_before_dispatch
@@ -531,8 +533,6 @@ class JobRunner:
                         lease_expires_at=expires,
                         heartbeat_at=now,
                         progress=max(job.progress, 0.03),
-                        error_category=None,
-                        error_message=None,
                         updated_at=now,
                     )
                 )
@@ -778,19 +778,17 @@ class JobRunner:
                 job_id=job.id,
                 number=number,
                 status=GenerationStatus.RUNNING.value,
-                phase="dispatched",
+                phase="created",
+                dispatch_state="not_sent",
                 purpose=purpose,
                 idempotency_key=idempotency_key,
                 request_hash=request_hash,
                 request_json=request,
-                billable=True,
-                estimated_cost=price,
+                billable=False,
+                estimated_cost=None,
             )
             job.attempt_count = number
             job.updated_at = utcnow()
-            plan.actual_calls += 1
-            if price is not None:
-                plan.actual_cost += price
             session.add(attempt)
             session.flush()
             record_run_event(
@@ -800,7 +798,7 @@ class JobRunner:
                 job_id=job.id,
                 asset_id=str(job.request_json.get("asset_id")),
                 attempt_id=attempt.id,
-                event_type="provider.call_started",
+                event_type="provider.preparing",
                 stage=job.stage,
                 data={
                     "idempotency_key": idempotency_key,
@@ -813,6 +811,57 @@ class JobRunner:
             )
             session.commit()
             return attempt.id, number, price
+
+    def _mark_dispatch(self, attempt_id: str, lease_token: str, policy: str) -> None:
+        with self.sessions() as session:
+            # Acquire the SQLite writer lock before reading counters/lease state.
+            attempt = session.get(GenerationAttempt, attempt_id)
+            if attempt is None:
+                raise ProviderError("attempt is missing", ErrorCategory.CANCELLED)
+            changed = session.execute(update(GenerationJob).where(
+                GenerationJob.id == attempt.job_id, GenerationJob.lease_token == lease_token,
+                GenerationJob.lease_expires_at > utcnow(),
+                GenerationJob.cancel_requested.is_(False),
+            ).values(updated_at=utcnow()))
+            if changed.rowcount != 1:
+                raise ProviderError("job lease was lost", ErrorCategory.CANCELLED)
+            job = session.get(GenerationJob, attempt.job_id)
+            plan = session.get(GenerationPlan, job.plan_id)
+            profile = session.get(ProviderProfile, job.provider_profile_id)
+            calls = session.scalar(select(func.sum(case(
+                (GenerationAttempt.dispatch_state == "legacy_unknown", 1),
+                else_=GenerationAttempt.dispatch_count))).where(
+                GenerationAttempt.job_id == job.id,
+                GenerationAttempt.request_hash == attempt.request_hash,
+                GenerationAttempt.billable.is_(True),
+            )) or 0
+            if calls >= plan.max_transport_retries + 1:
+                raise ProviderError("本请求的调用上限已用完", ErrorCategory.QUOTA,
+                                    error_code="provider_call_limit")
+            price = self._call_price(profile, str(attempt.request_json["kind"]), job.provider_snapshot_json)
+            attempt.dispatch_state = "dispatch_started"
+            attempt.dispatched_at = utcnow()
+            attempt.dispatch_count += 1
+            attempt.phase = "dispatched"
+            attempt.network_policy = policy
+            attempt.billable = True
+            attempt.estimated_cost = ((attempt.estimated_cost or 0) + price) if price is not None else None
+            plan.actual_calls += 1
+            if price is not None:
+                plan.actual_cost += price
+            record_run_event(session, plan_id=job.plan_id, project_id=job.project_id,
+                             job_id=job.id, attempt_id=attempt.id, event_type="provider.call_started",
+                             stage=job.stage, data={"actual_calls": plan.actual_calls,
+                             "network_policy": policy, "dispatch_state": attempt.dispatch_state,
+                             "idempotency_key": attempt.idempotency_key, "estimated_cost": price})
+            session.commit()
+
+    def _mark_response(self, attempt_id: str) -> None:
+        with self.sessions() as session:
+            attempt = session.get(GenerationAttempt, attempt_id)
+            if attempt:
+                attempt.dispatch_state = "response_received"
+                session.commit()
 
     def _recoverable_attempt(
         self,
@@ -864,7 +913,11 @@ class JobRunner:
                 job.pending_action_id = None
                 session.commit()
                 raise ServiceError(409, "remediation input changed after the action was accepted")
-            request = self._resolve_request(session, job, action)
+            previous = session.scalar(select(GenerationAttempt).where(
+                GenerationAttempt.job_id == job.id).order_by(GenerationAttempt.number.desc()).limit(1))
+            exact_retry = bool(action and action.action == RemediationKind.RETRY.value and previous
+                               and previous.request_json and previous.request_hash)
+            request = dict(previous.request_json) if exact_retry else self._resolve_request(session, job, action)
             if not request.get("model"):
                 request["model"] = str(
                     job.provider_snapshot_json.get("model")
@@ -881,6 +934,9 @@ class JobRunner:
             purpose = action.action if action else "base"
             logical_id = action.id if action else "base"
             idempotency_key = stable_id("call", job.id, logical_id, request_hash)
+            if exact_retry:
+                request_hash = previous.request_hash
+                idempotency_key = previous.idempotency_key
             recoverable = self._recoverable_attempt(
                 session,
                 job=job,
@@ -888,7 +944,9 @@ class JobRunner:
                 request_hash=request_hash,
             )
             prior_calls = session.scalar(
-                select(func.count(GenerationAttempt.id)).where(
+                select(func.coalesce(func.sum(case(
+                    (GenerationAttempt.dispatch_state == "legacy_unknown", 1),
+                    else_=GenerationAttempt.dispatch_count)), 0)).where(
                     GenerationAttempt.job_id == job.id,
                     GenerationAttempt.request_hash == request_hash,
                     GenerationAttempt.billable.is_(True),
@@ -951,6 +1009,8 @@ class JobRunner:
                         ),
                         self.vault,
                     )
+                provider.on_dispatch = lambda policy: self._mark_dispatch(attempt_id, lease_token, policy)
+                provider.on_response = lambda: self._mark_response(attempt_id)
                 result = await self._invoke(
                     provider,
                     job_id=job_id,
@@ -1005,6 +1065,11 @@ class JobRunner:
                             session.commit()
                     self._set_awaiting_user(job_id, str(exc), category=exc.category)
                     return
+                with self.sessions() as session:
+                    failed_attempt = session.get(GenerationAttempt, attempt_id)
+                    if failed_attempt.dispatch_state in {"not_sent", "dispatch_started"}:
+                        self._set_awaiting_user(job_id, str(exc), category=exc.category)
+                        return
                 if not exc.retryable or retry_index >= remaining_calls - 1:
                     break
                 stable_jitter = int(request_hash[:2], 16) / 2550
@@ -1032,12 +1097,20 @@ class JobRunner:
         if request["kind"] == TaskKind.TEXT.value:
             if not schema:
                 raise ProviderError("text task has no schema", ErrorCategory.VALIDATION)
-            return await provider.structured_text(
+            effort = (request.get("metadata") or {}).get("reasoning_effort")
+            if effort is not None and hasattr(provider, "reasoning_effort"):
+                provider.reasoning_effort = effort
+            if not hasattr(provider, "_request"):
+                provider.on_dispatch("simulated_provider")
+            result = await provider.structured_text(
                 prompt=str(request["prompt"]),
                 schema=schema,
                 model=str(request["model"]),
                 idempotency_key=idempotency_key,
             )
+            if not hasattr(provider, "_request"):
+                provider.on_response()
+            return result
         reference = None
         if request["kind"] == TaskKind.IMAGE_EDIT.value:
             reference_path = request.get("reference_path")
@@ -1052,7 +1125,9 @@ class JobRunner:
                 if not path.is_file():
                     raise ProviderError("reference image does not exist", ErrorCategory.VALIDATION)
                 reference = path.read_bytes()
-        return await provider.image(
+        if not hasattr(provider, "_request"):
+            provider.on_dispatch("simulated_provider")
+        result = await provider.image(
             prompt=str(request["prompt"]),
             width=request.get("width"),
             height=request.get("height"),
@@ -1060,6 +1135,10 @@ class JobRunner:
             reference=reference,
             idempotency_key=idempotency_key,
         )
+
+        if not hasattr(provider, "_request"):
+            provider.on_response()
+        return result
 
     def _persist_provider_result(self, attempt_id: str, result: ProviderResult) -> None:
         with self.sessions() as session:
@@ -1146,6 +1225,8 @@ class JobRunner:
             attempt.request_id = error.request_id
             attempt.error_category = error.category.value
             attempt.error_message = str(error)
+            attempt.error_code = error.error_code or "provider_request_failed"
+            attempt.error_hint = error.hint
             attempt.completed_at = utcnow()
             if job:
                 record_run_event(
@@ -1157,7 +1238,9 @@ class JobRunner:
                     attempt_id=attempt.id,
                     event_type="provider.call_failed",
                     stage=job.stage,
-                    data={"category": error.category.value, "message": str(error)},
+                    data={"category": error.category.value, "message": str(error),
+                          "error_code": attempt.error_code, "hint": error.hint,
+                          "dispatch_state": attempt.dispatch_state},
                 )
             session.commit()
 

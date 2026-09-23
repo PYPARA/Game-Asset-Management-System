@@ -30,6 +30,7 @@ class ProviderError(RuntimeError):
         request_id: str | None = None,
         endpoint: str | None = None,
         hint: str | None = None,
+        error_code: str | None = None,
     ) -> None:
         super().__init__(message)
         self.category = category
@@ -38,6 +39,7 @@ class ProviderError(RuntimeError):
         self.request_id = request_id
         self.endpoint = endpoint
         self.hint = hint
+        self.error_code = error_code
 
     @property
     def retryable(self) -> bool:
@@ -204,24 +206,32 @@ def validate_models_path(models_path: str | None) -> str:
     return "/".join(parts)
 
 
-def guard_resolved_host(base_url: str, *, allow_private_network: bool) -> None:
+def guard_resolved_host(base_url: str, *, allow_private_network: bool) -> str:
     if allow_private_network:
-        return
+        return "private_network_explicit"
     hostname = urlparse(base_url).hostname
     if not hostname or hostname in {"localhost", "127.0.0.1", "::1"}:
-        return
+        return "local_provider"
     try:
         addresses = {entry[4][0] for entry in socket.getaddrinfo(hostname, None)}
     except socket.gaierror as exc:
         raise ProviderError(
             f"provider hostname could not be resolved: {hostname}",
             ErrorCategory.NETWORK,
+            error_code="provider_dns_failed",
             hint="检查供应商域名、DNS 或本机代理配置。",
         ) from exc
 
-    blocked = sorted(
-        value for value in addresses if not ipaddress.ip_address(value).is_global
-    )
+    try:
+        ipaddress.ip_address(hostname)
+        domain_https = False
+    except ValueError:
+        domain_https = urlparse(base_url).scheme == "https"
+    fake_network = ipaddress.ip_network("198.18.0.0/15")
+    fake_addresses = {value for value in addresses
+                      if domain_https and ipaddress.ip_address(value) in fake_network}
+    blocked = sorted(value for value in addresses
+                     if not ipaddress.ip_address(value).is_global and value not in fake_addresses)
     if blocked:
         displayed = ", ".join(blocked[:4])
         if len(blocked) > 4:
@@ -230,12 +240,27 @@ def guard_resolved_host(base_url: str, *, allow_private_network: bool) -> None:
             f"provider hostname resolves to a private or reserved address ({displayed}); "
             "enable private network access explicitly",
             ErrorCategory.VALIDATION,
+            error_code="provider_address_blocked",
             hint=(
                 f"供应商域名 {hostname} 解析到了非公网地址 {displayed}。请确认域名和本机 DNS/代理配置；"
                 "如果这是你信任的局域网或本机服务，请在供应商渠道的“高级设置”中开启“允许访问局域网或私有地址”，"
                 "保存后再拉取模型。"
             ),
         )
+
+    return "fake_ip_compatible" if fake_addresses else "public_network"
+
+
+async def check_provider_network(base_url: str, *, allow_private_network: bool,
+                                 timeout: float = 5.0) -> str:
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(
+            guard_resolved_host, base_url, allow_private_network=allow_private_network,
+        ), timeout=timeout)
+    except TimeoutError as exc:
+        raise ProviderError("供应商地址解析超时", ErrorCategory.NETWORK,
+                            error_code="provider_dns_timeout",
+                            hint="检查 DNS 或代理连接后继续执行。") from exc
 
 
 class CredentialVault:
@@ -419,6 +444,7 @@ class OpenAICompatibleProvider:
 
     def __init__(self, profile: ProviderProfile | ProviderRuntimeConfig, api_key: str | None):
         self.profile = profile
+        self.reasoning_effort: str | None = None
         self.requires_credentials = (
             getattr(profile, "credential_mode", "required") == "required"
         )
@@ -439,24 +465,33 @@ class OpenAICompatibleProvider:
     ) -> httpx.Response:
         endpoint = f"{self.base_url}/{path.lstrip('/')}"
         headers = dict(self._headers)
-        headers.update(kwargs.pop("headers", {}) or {})
+        for key, value in (kwargs.pop("headers", {}) or {}).items():
+            if value is None:
+                headers.pop(key, None)
+            else:
+                headers[key] = value
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key
         try:
-            guard_resolved_host(
+            self.network_policy = await check_provider_network(
                 self.base_url,
                 allow_private_network=self.profile.allow_private_network,
             )
-            async with httpx.AsyncClient(timeout=90.0, follow_redirects=False) as client:
-                response = await client.request(
-                    method, endpoint, headers=headers, **kwargs
-                )
+            timeout = kwargs.pop("timeout", 90.0)
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+                prepared = client.build_request(method, endpoint, headers=headers, **kwargs)
+                if callback := getattr(self, "on_dispatch", None):
+                    callback(self.network_policy)
+                response = await client.send(prepared)
+                if callback := getattr(self, "on_response", None):
+                    callback()
         except ProviderError as exc:
             if exc.endpoint:
                 raise
             raise ProviderError(
                 str(exc),
                 exc.category,
+                error_code=exc.error_code,
                 status_code=exc.status_code,
                 retry_after=exc.retry_after,
                 request_id=exc.request_id,
@@ -527,6 +562,7 @@ class OpenAICompatibleProvider:
                 "model": model,
                 "messages": messages,
                 "response_format": response_format,
+                **({"reasoning_effort": self.reasoning_effort} if self.reasoning_effort else {}),
             },
         )
         content, request_id = self._content(response)
@@ -570,6 +606,7 @@ class OpenAICompatibleProvider:
                     ErrorCategory.NETWORK,
                     ErrorCategory.CONTENT_POLICY,
                 }
+                or exc.error_code is not None
                 or str(exc) == "provider model is unavailable"
             ):
                 raise
@@ -618,71 +655,13 @@ class OpenAICompatibleProvider:
         idempotency_key: str | None = None,
     ) -> ProviderResult:
         if reference is not None:
-            endpoint = f"{self.base_url}/images/edits"
-            try:
-                guard_resolved_host(
-                    self.base_url,
-                    allow_private_network=self.profile.allow_private_network,
-                )
-                async with httpx.AsyncClient(timeout=180.0, follow_redirects=False) as client:
-                    response = await client.post(
-                        endpoint,
-                        headers={
-                            **{
-                                key: value
-                                for key, value in self._headers.items()
-                                if key.lower() != "content-type"
-                            },
-                            **({"Idempotency-Key": idempotency_key} if idempotency_key else {}),
-                        },
-                        data={
-                            "model": model,
-                            "prompt": prompt,
-                            "quality": self.profile.quality,
-                            "size": f"{width}x{height}" if width and height else "auto",
-                        },
-                        files={"image": ("reference.png", reference, "image/png")},
-                    )
-            except ProviderError as exc:
-                if exc.endpoint:
-                    raise
-                raise ProviderError(
-                    str(exc),
-                    exc.category,
-                    status_code=exc.status_code,
-                    retry_after=exc.retry_after,
-                    request_id=exc.request_id,
-                    endpoint=endpoint,
-                    hint=exc.hint or "检查 Base URL、本机网络连通性和局域网访问开关。",
-                ) from exc
-            except (httpx.TimeoutException, httpx.NetworkError) as exc:
-                raise ProviderError(
-                    "provider network request failed",
-                    ErrorCategory.NETWORK,
-                    endpoint=endpoint,
-                    hint="检查 Base URL、模型列表路径和本机网络连通性。",
-                ) from exc
-            if response.status_code >= 400:
-                response_body = response.text[:1000]
-                category = classify_http_error(response.status_code, response_body)
-                raise ProviderError(
-                    "provider model is unavailable"
-                    if category == ErrorCategory.VALIDATION and "model" in response_body.lower()
-                    else f"provider returned HTTP {response.status_code}",
-                    category,
-                    status_code=response.status_code,
-                    retry_after=_retry_after(response.headers),
-                    request_id=(
-                        response.headers.get("x-request-id")
-                        or response.headers.get("request-id")
-                        or response.headers.get("cf-ray")
-                    ),
-                    endpoint=endpoint,
-                    hint=_response_hint(
-                        response,
-                        secrets=(self._headers.get("Authorization", "").removeprefix("Bearer "),),
-                    ),
-                )
+            response = await self._request(
+                "POST", "images/edits", idempotency_key=idempotency_key,
+                headers={"Content-Type": None}, timeout=180.0,
+                data={"model": model, "prompt": prompt, "quality": self.profile.quality,
+                      "size": f"{width}x{height}" if width and height else "auto"},
+                files={"image": ("reference.png", reference, "image/png")},
+            )
         else:
             response = await self._request(
                 "POST",
