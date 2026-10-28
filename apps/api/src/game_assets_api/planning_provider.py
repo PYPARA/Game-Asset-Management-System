@@ -83,7 +83,10 @@ class ProviderPlanningAdapter:
         key = self.vault.get(provider_id) if self.vault is not None else await read_credential(self.settings.state_dir, provider_id)
         if credential_mode == 'required' and not key:
             raise CodexUnavailable('planning_provider_locked: 请在供应商渠道解锁所选供应商；不会改用个人 Codex 登录。')
-        home = self.settings.state_dir / 'planning-codex' / hashlib.sha256(provider_id.encode()).hexdigest()[:20]
+        project_id = str((context.get('project') or {}).get('id') or 'unscoped')
+        project_key = hashlib.sha256(project_id.encode()).hexdigest()[:20]
+        provider_key = hashlib.sha256(provider_id.encode()).hexdigest()[:20]
+        home = self.settings.state_dir / 'planning-codex' / project_key / provider_key
         overrides = {
             'model_provider': 'gams',
             'model': chosen_model,
@@ -104,7 +107,7 @@ class ProviderPlanningAdapter:
         self.active[turn_id] = adapter
         try:
             yield {'type': 'planning.route', 'data': {'provider_profile_id': provider_id, 'provider_name': provider_name, 'model': chosen_model, 'isolated': True, 'reasoning_effort': effort}}
-            async for event in adapter.plan_turn(context, messages=messages, draft=draft, budget=budget, turn_id=turn_id, model=chosen_model, thread_id=thread_id, work_dir=work_dir):
+            async for event in adapter.plan_turn(context, messages=messages, draft=draft, budget=budget, turn_id=turn_id, model=chosen_model, thread_id=None, work_dir=work_dir):
                 yield event
         finally:
             self.active.pop(turn_id, None)

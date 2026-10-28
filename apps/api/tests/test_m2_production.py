@@ -376,6 +376,40 @@ def test_dag_injects_real_upstream_output_and_run_apis_are_cursor_based(
     assert [event["event_type"] for event in new_events] == ["budget.changed"]
 
 
+def test_image_revision_keeps_upstream_context_out_of_display_prompt(
+    client: TestClient,
+    project_root: Path,
+) -> None:
+    project = create_project(client, project_root)
+    character = create_asset(client, project["id"], key="entity.character.artisan", subtype="character")
+    portrait = create_asset(
+        client, project["id"], key="portrait.artisan.neutral", kind="media", subtype="portrait",
+    )
+    provider = create_provider(client)
+    plan = client.post("/api/generation-plans", json={
+        "project_id": project["id"], "provider_profile_id": provider["id"],
+        "tasks": [
+            text_task("character", character["id"], prompt="生成角色设定"),
+            {
+                "id": "portrait", "kind": "image", "asset_id": portrait["id"],
+                "prompt": "绘制角色肖像", "depends_on": ["character"],
+                "width": 64, "height": 64,
+            },
+        ],
+    })
+    assert plan.status_code == 201, plan.text
+    jobs = client.post(f"/api/generation-plans/{plan.json()['id']}/confirm").json()
+    finished = {job["task_id"]: wait_for_job(client, job["id"]) for job in jobs}
+    assert finished["portrait"]["status"] == "candidate_ready"
+    resolved = finished["portrait"]["resolved_request"]
+    revision = client.get(f"/api/revisions/{finished['portrait']['result_revision_id']}").json()
+
+    assert resolved["source_prompt"] == "绘制角色肖像"
+    assert "[UPSTREAM_OUTPUTS]" in resolved["prompt"]
+    assert revision["content"]["prompt"] == "绘制角色肖像"
+    assert revision["content"]["upstream_outputs"] == resolved["upstream_outputs"]
+
+
 def test_image_evidence_includes_contact_sheets_and_comparisons(
     client: TestClient,
     project_root: Path,

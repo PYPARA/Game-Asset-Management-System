@@ -63,6 +63,7 @@ const emptyJob: JobSummary = {
 
 export const emptyWorkbenchPayload: WorkbenchPayload = {
   project: emptyProject,
+  projects: [],
   assets: [],
   job: emptyJob,
 };
@@ -548,6 +549,14 @@ function textField(value: unknown, ...keys: string[]): string {
   return "";
 }
 
+function displayPrompt(content: unknown): string {
+  const prompt = textField(content, "prompt", "positivePrompt", "positive_prompt");
+  if (!isRecord(content) || !Array.isArray(content.upstream_outputs) || content.upstream_outputs.length === 0) return prompt;
+  const marker = "\n\n[UPSTREAM_OUTPUTS]\n";
+  const markerAt = prompt.indexOf(marker);
+  return markerAt < 0 ? prompt : prompt.slice(0, markerAt);
+}
+
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return "—";
   if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
@@ -705,6 +714,10 @@ export async function fetchAssetDetails(asset: GameAsset, requestedRevisionId?: 
   const thumbnails = [candidateRendition, approvedRendition]
     .filter((rendition): rendition is RenditionApiRecord => Boolean(rendition))
     .map((rendition) => renditionUrl(rendition.id));
+  const latestUpdatedAt = [asset.updatedAt, candidate?.created_at, approved?.created_at]
+    .filter((value): value is string => Boolean(value))
+    .sort()
+    .at(-1) ?? "";
 
   return {
     ...asset,
@@ -727,13 +740,14 @@ export async function fetchAssetDetails(asset: GameAsset, requestedRevisionId?: 
     qa: checks,
     qaPassed: checks.filter((check) => check.passed).length,
     qaTotal: checks.length,
-    prompt: textField(content, "prompt", "positivePrompt", "positive_prompt"),
+    prompt: displayPrompt(content),
+    upstreamOutputCount: isRecord(content) && Array.isArray(content.upstream_outputs) ? content.upstream_outputs.length : 0,
     negativePrompt: textField(content, "negativePrompt", "negative_prompt"),
     model: String(provider.model ?? provider.image_model ?? "unknown"),
     recipe: String(candidate?.prompt_recipe ?? approved?.prompt_recipe ?? "unknown"),
     seed: String(provider.seed ?? "unknown"),
-    updatedAt: asset.timeAccuracy === "unknown" ? "" : candidate?.created_at ?? approved?.created_at ?? asset.updatedAt,
-    updatedLabel: asset.timeAccuracy === "unknown" ? "历史时间未知" : candidate?.created_at ?? approved?.created_at ?? asset.updatedLabel,
+    updatedAt: asset.timeAccuracy === "unknown" ? "" : latestUpdatedAt,
+    updatedLabel: asset.timeAccuracy === "unknown" ? "历史时间未知" : latestUpdatedAt || asset.updatedLabel,
   };
 }
 
@@ -761,13 +775,14 @@ interface RelationApiRecord {
   relation_type: string;
 }
 
-export async function fetchWorkbench(): Promise<WorkbenchPayload> {
+export async function fetchWorkbench(projectId?: string): Promise<WorkbenchPayload> {
   const projectResult = await request<ProjectSummary[] | ApiList<ProjectSummary>>("/projects");
   const projects = unpackList(projectResult);
   if (projects.length === 0) {
     return emptyWorkbenchPayload;
   }
-  const project = normalizeProject(projects[0]);
+  const normalizedProjects = projects.map(normalizeProject);
+  const project = normalizedProjects.find((item) => item.id === projectId) ?? normalizedProjects[0];
   // The API indexes discovered Projects during startup. Reading the workbench
   // must not launch another full iCloud scan on every mount or query refetch.
   const [assetResult, jobResult, relations] = await Promise.all([
@@ -856,6 +871,7 @@ export async function fetchWorkbench(): Promise<WorkbenchPayload> {
 
   return {
     project: { ...project, assetCount: assetsWithLinkedPreviews.length },
+    projects: normalizedProjects,
     assets: assetsWithLinkedPreviews,
     job: jobs.length > 0 ? normalizeJob(jobs[0]) : normalizeJob(undefined),
   };
@@ -1494,11 +1510,11 @@ export async function createGenerationConversation(
 }
 
 export async function fetchGenerationConversations(
-  projectId?: string,
+  projectId: string,
   includeArchived = false,
 ): Promise<GenerationConversationSummary[]> {
   const params = new URLSearchParams();
-  if (projectId) params.set("project_id", projectId);
+  params.set("project_id", projectId);
   if (includeArchived) params.set("include_archived", "true");
   const query = params.toString() ? `?${params.toString()}` : "";
   return request<GenerationConversationSummary[]>(`/generation-conversations${query}`, {

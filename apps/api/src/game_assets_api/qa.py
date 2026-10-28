@@ -31,7 +31,22 @@ def remove_corner_color_key(image: Image.Image) -> tuple[Image.Image, str | None
     ]
     green_votes = sum(_near_key_color(pixel, "green") for pixel in corners)
     magenta_votes = sum(_near_key_color(pixel, "magenta") for pixel in corners)
-    key = "green" if green_votes >= 3 else "magenta" if magenta_votes >= 3 else None
+    border_step = max(1, min(width, height) // 64)
+    top = [rgba.getpixel((x, 0)) for x in range(0, width, border_step)]
+    sides = [rgba.getpixel((0, y)) for y in range(0, height, border_step)] + [
+        rgba.getpixel((width - 1, y)) for y in range(0, height, border_step)
+    ]
+    def border_matches(color: str) -> bool:
+        return (
+            sum(_near_key_color(pixel, color) for pixel in top) / len(top) >= 0.8
+            and sum(_near_key_color(pixel, color) for pixel in sides) / len(sides) >= 0.5
+        )
+
+    key = (
+        "green" if green_votes >= 3 or border_matches("green")
+        else "magenta" if magenta_votes >= 3 or border_matches("magenta")
+        else None
+    )
     if key is None:
         return rgba, None
 
@@ -119,7 +134,7 @@ def inspect_image(
                 checks.append({"name": "height", "passed": height == expected_height, "value": height, "expected": expected_height})
             if require_alpha:
                 extrema = image.getchannel("A").getextrema() if alpha else (255, 255)
-                checks.append({"name": "alpha", "passed": alpha and extrema[0] < 255, "value": extrema})
+                checks.append({"name": "alpha", "passed": alpha and extrema[0] < 255 and extrema[1] > 0, "value": extrema})
             if alpha:
                 alpha_channel = image.getchannel("A")
                 bbox = alpha_channel.getbbox()
@@ -127,11 +142,11 @@ def inspect_image(
                 corners = [alpha_channel.getpixel(point) for point in ((0, 0), (width - 1, 0), (0, height - 1), (width - 1, height - 1))]
                 checks.append({"name": "transparentCorners", "passed": min(corners) < 32, "value": corners})
                 checks.append({"name": "subjectCoverage", "passed": 0.02 <= coverage <= 1.0, "value": round(coverage, 4)})
-            rgb = image.convert("RGB")
-            sampled = list(rgb.resize((min(64, width), min(64, height))).getdata())
+            sampled = list(image.convert("RGBA").resize((min(64, width), min(64, height))).getdata())
+            visible = [pixel for pixel in sampled if pixel[3] >= 64]
             residual = sum(
-                1 for pixel in sampled if _near_key_color(pixel, "green") or _near_key_color(pixel, "magenta")
-            ) / max(1, len(sampled))
+                1 for pixel in visible if _near_key_color(pixel, "green") or _near_key_color(pixel, "magenta")
+            ) / max(1, len(visible))
             checks.append({"name": "residualColorKey", "passed": residual < 0.03, "value": round(residual, 4)})
     except (UnidentifiedImageError, OSError) as exc:
         return "fail", [{"name": "decodable", "passed": False, "message": str(exc)}]

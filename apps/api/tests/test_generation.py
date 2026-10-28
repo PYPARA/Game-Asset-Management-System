@@ -73,6 +73,120 @@ def generate_and_approve_image(
     return approval.json()
 
 
+def test_linked_icon_approval_survives_entity_first_approval_only(
+    client: TestClient, project_root: Path,
+) -> None:
+    project = create_project(client, project_root)
+    item = create_asset(client, project["id"], key="entity.item.edict", subtype="item")
+    icon = create_asset(client, project["id"], key="icon.edict", kind="media", subtype="icon")
+    relation = client.post("/api/relations", json={
+        "project_id": project["id"], "source_asset_id": icon["id"],
+        "target_asset_id": item["id"], "relation_type": "represents",
+    })
+    assert relation.status_code == 201, relation.text
+    provider = create_fake_provider(client)
+    approved = generate_and_approve_image(
+        client, project_id=project["id"], provider_id=provider["id"],
+        asset_id=icon["id"], task_id="draw-edict", target_path="public/assets/icons/edict.webp",
+    )
+    first = client.post("/api/revisions", json={"asset_id": item["id"], "content": {"name": "圣旨"}}).json()
+    response = client.post("/api/reviews", json={"revision_id": first["id"], "verdict": "approve"})
+    assert response.status_code == 201, response.text
+    reviews = client.get("/api/reviews", params={"asset_id": icon["id"]}).json()
+    assert len(reviews) == 2
+    assert sum(review["is_valid"] for review in reviews) == 1
+    assert next(review for review in reviews if review["is_valid"])["revision_id"] == approved["revision_id"]
+    assert client.get(f"/api/assets/{icon['id']}").json()["publication_status"] == "ready"
+    assert client.post("/api/releases", json={"project_id": project["id"], "name": "linked"}).status_code == 201
+
+    later = client.post("/api/revisions", json={"asset_id": item["id"], "content": {"name": "新圣旨"}}).json()
+    response = client.post("/api/reviews", json={"revision_id": later["id"], "verdict": "approve"})
+    assert response.status_code == 201, response.text
+    reviews = client.get("/api/reviews", params={"asset_id": icon["id"]}).json()
+    assert all(not review["is_valid"] for review in reviews)
+    assert client.get(f"/api/assets/{icon['id']}").json()["publication_status"] == "blocked"
+
+
+def test_linked_icon_approval_is_valid_when_entity_was_approved_first(
+    client: TestClient, project_root: Path,
+) -> None:
+    project = create_project(client, project_root)
+    item = create_asset(client, project["id"], key="entity.item.edict", subtype="item")
+    icon = create_asset(client, project["id"], key="icon.edict", kind="media", subtype="icon")
+    relation = client.post("/api/relations", json={
+        "project_id": project["id"], "source_asset_id": icon["id"],
+        "target_asset_id": item["id"], "relation_type": "represents",
+    })
+    assert relation.status_code == 201, relation.text
+    revision = client.post("/api/revisions", json={"asset_id": item["id"], "content": {"name": "圣旨"}}).json()
+    assert client.post("/api/reviews", json={"revision_id": revision["id"], "verdict": "approve"}).status_code == 201
+    provider = create_fake_provider(client)
+    generate_and_approve_image(
+        client, project_id=project["id"], provider_id=provider["id"],
+        asset_id=icon["id"], task_id="draw-edict", target_path="public/assets/icons/edict.webp",
+    )
+    reviews = client.get("/api/reviews", params={"asset_id": icon["id"]}).json()
+    assert len(reviews) == 1 and reviews[0]["is_valid"]
+    assert client.post("/api/releases", json={"project_id": project["id"], "name": "linked"}).status_code == 201
+
+
+def test_linking_two_approved_assets_refreshes_icon_approval_once(
+    client: TestClient, project_root: Path,
+) -> None:
+    project = create_project(client, project_root)
+    item = create_asset(client, project["id"], key="entity.item.edict", subtype="item")
+    icon = create_asset(client, project["id"], key="icon.edict", kind="media", subtype="icon")
+    revision = client.post("/api/revisions", json={"asset_id": item["id"], "content": {"name": "圣旨"}}).json()
+    assert client.post("/api/reviews", json={"revision_id": revision["id"], "verdict": "approve"}).status_code == 201
+    provider = create_fake_provider(client)
+    approved = generate_and_approve_image(
+        client, project_id=project["id"], provider_id=provider["id"],
+        asset_id=icon["id"], task_id="draw-edict", target_path="public/assets/icons/edict.webp",
+    )
+    payload = {
+        "project_id": project["id"], "source_asset_id": icon["id"],
+        "target_asset_id": item["id"], "relation_type": "represents",
+    }
+    linked = client.post("/api/relations", json=payload)
+    assert linked.status_code == 201, linked.text
+    reviews = client.get("/api/reviews", params={"asset_id": icon["id"]}).json()
+    assert len(reviews) == 2
+    current = next(review for review in reviews if review["is_valid"])
+    assert current["revision_id"] == approved["revision_id"]
+    assert {artifact["role"] for artifact in current["artifacts"]} == {"source", "runtime"}
+    assert client.post("/api/relations", json=payload).status_code == 409
+    assert len(client.get("/api/reviews", params={"asset_id": icon["id"]}).json()) == 2
+    assert client.post("/api/releases", json={"project_id": project["id"], "name": "linked"}).status_code == 201
+
+
+def test_linking_does_not_refresh_an_already_stale_media_approval(
+    client: TestClient, project_root: Path,
+) -> None:
+    project = create_project(client, project_root)
+    item = create_asset(client, project["id"], key="entity.item.edict", subtype="item")
+    unrelated = create_asset(client, project["id"], key="entity.item.other", subtype="item")
+    icon = create_asset(client, project["id"], key="icon.edict", kind="media", subtype="icon")
+    revision = client.post("/api/revisions", json={"asset_id": item["id"], "content": {"name": "圣旨"}}).json()
+    assert client.post("/api/reviews", json={"revision_id": revision["id"], "verdict": "approve"}).status_code == 201
+    provider = create_fake_provider(client)
+    generate_and_approve_image(
+        client, project_id=project["id"], provider_id=provider["id"],
+        asset_id=icon["id"], task_id="draw-edict", target_path="public/assets/icons/edict.webp",
+    )
+    unrelated_link = client.post("/api/relations", json={
+        "project_id": project["id"], "source_asset_id": icon["id"],
+        "target_asset_id": unrelated["id"], "relation_type": "references",
+    })
+    assert unrelated_link.status_code == 201, unrelated_link.text
+    linked = client.post("/api/relations", json={
+        "project_id": project["id"], "source_asset_id": icon["id"],
+        "target_asset_id": item["id"], "relation_type": "represents",
+    })
+    assert linked.status_code == 201, linked.text
+    assert len(client.get("/api/reviews", params={"asset_id": icon["id"]}).json()) == 1
+    assert client.post("/api/releases", json={"project_id": project["id"], "name": "stale"}).status_code == 409
+
+
 def test_structured_text_job_creates_schema_valid_candidate(client: TestClient, project_root: Path) -> None:
     project = create_project(client, project_root)
     asset = create_asset(client, project["id"], key="item.jade-seal", subtype="item", title="玉玺")

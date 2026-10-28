@@ -188,7 +188,7 @@ function conversation(overrides: Record<string, unknown> = {}) {
   };
 }
 
-function setup(overrides: { events?: unknown[]; conversation?: Record<string, unknown>; providers?: unknown[]; sessionId?: string | null; createOnMount?: boolean } = {}) {
+function setup(overrides: { events?: unknown[]; conversation?: Record<string, unknown>; providers?: unknown[]; sessionId?: string | null; createOnMount?: boolean; updateDraft?: (id: string, hash: string, nextDraft: unknown) => Promise<unknown> } = {}) {
   const currentConversation = conversation(overrides.conversation);
   mocks.fetchWorkbench.mockResolvedValue({
     project: { id: "project-1", name: "示例项目" },
@@ -207,12 +207,12 @@ function setup(overrides: { events?: unknown[]; conversation?: Record<string, un
   });
   mocks.fetchGenerationProviders.mockResolvedValue(overrides.providers ?? []);
   mocks.fetchGenerationConversationEvents.mockResolvedValue(overrides.events ?? []);
-  mocks.updateGenerationConversationDraft.mockImplementation(async (_id: string, _hash: string, nextDraft: unknown) => ({
+  mocks.updateGenerationConversationDraft.mockImplementation(overrides.updateDraft ?? (async (_id: string, _hash: string, nextDraft: unknown) => ({
     ...currentConversation,
     draft: nextDraft,
     draft_hash: "draft-hash-edited",
     draft_version: 3,
-  }));
+  })));
   mocks.updateGenerationConversationContext.mockResolvedValue(currentConversation);
   mocks.confirmGenerationConversation.mockResolvedValue({
     conversation: conversation({ plan_id: "plan-1", status: "completed" }),
@@ -373,6 +373,190 @@ describe("GenerationChatPage", () => {
     ));
     expect(mocks.onConfirmed).toHaveBeenCalledWith("plan-1");
     expect(localStorage.getItem("gams.openRunInspector")).toBeNull();
+  });
+
+  it("重新打开两任务旧方案时只修复一次，并展示结构来源和 JSON 路径", async () => {
+    const base = draft();
+    const characterTask = {
+      ...base.tasks[0],
+      id: "character-xu-qingzhi",
+      kind: "text",
+      asset: { ...base.tasks[0].asset, kind: "character", subtype: "profile", title: "许青枝" },
+      target_path: "approved/assets/characters/xu-qingzhi.md",
+    };
+    const oldDraft = draft({ tasks: [characterTask, { ...base.tasks[0], id: "portrait-xu-qingzhi-neutral", depends_on: [characterTask.id] }], questions: ["schema:character-xu-qingzhi"] });
+    const repairedDraft = draft({
+      tasks: [{
+        ...characterTask,
+        target_path: "approved/assets/characters/xu-qingzhi.json",
+        schema: { type: "object", properties: { name: { type: "string" } }, required: ["name"], additionalProperties: false },
+        metadata: { schema_autofill: { kind: "character", subtype: "profile", sample_count: 24, source_revision_ids: ["revision-1"] } },
+      }, { ...base.tasks[0], id: "portrait-xu-qingzhi-neutral", depends_on: [characterTask.id] }],
+      questions: [],
+    });
+    setup({
+      conversation: { draft: oldDraft },
+      updateDraft: async (_id, _hash, nextDraft) => ({ ...conversation({ draft: oldDraft }), draft: repairedDraft, draft_hash: "draft-hash-repaired", draft_version: 3, submitted_draft: nextDraft }),
+    });
+
+    await waitFor(() => expect(mocks.updateGenerationConversationDraft).toHaveBeenCalledWith("session-1", "draft-hash-1", oldDraft));
+    expect(await screen.findByText(/当前项目 24 个同类已批准资产自动补全/)).toBeInTheDocument();
+    expect(screen.queryByText(/请补充 JSON Schema/)).not.toBeInTheDocument();
+    await userEvent.setup().click(screen.getByRole("button", { name: "检查并生成" }));
+    expect(within(screen.getByRole("dialog", { name: "确认前预览" })).getByText(/xu-qingzhi\.json/)).toBeInTheDocument();
+    expect(mocks.updateGenerationConversationDraft).toHaveBeenCalledTimes(1);
+    expect(mocks.confirmGenerationConversation).not.toHaveBeenCalled();
+  });
+
+  it("重新打开缺少落地路径的物品方案时自动补全并保留人工可编辑性", async () => {
+    const base = draft();
+    const item = {
+      ...base.tasks[0],
+      id: "item_edict",
+      kind: "text",
+      asset: { ...base.tasks[0].asset, key: "entity.item.artifact-51", kind: "entity", subtype: "item", title: "圣旨" },
+      schema: { type: "object", properties: { name: { type: "string" } }, required: ["name"], additionalProperties: false },
+      target_path: null,
+    };
+    const icon = {
+      ...base.tasks[0],
+      id: "icon_edict",
+      asset: { ...base.tasks[0].asset, key: "icon.artifact-51", subtype: "icon", title: "圣旨图标" },
+      target_path: "approved/assets/icons/artifact-51.webp",
+    };
+    const oldDraft = draft({ tasks: [item, icon] });
+    const repairedDraft = draft({ tasks: [{
+      ...item,
+      target_path: "production/items/artifact-51.json",
+      metadata: { target_path_autofill: { asset_key: "entity.item.artifact-51", path: "production/items/artifact-51.json" } },
+    }, icon] });
+    setup({
+      conversation: { draft: oldDraft },
+      updateDraft: async () => ({ ...conversation({ draft: oldDraft }), draft: repairedDraft, draft_hash: "draft-hash-repaired" }),
+    });
+
+    await waitFor(() => expect(mocks.updateGenerationConversationDraft).toHaveBeenCalledWith("session-1", "draft-hash-1", oldDraft));
+    expect(await screen.findByText("已按资源 Key 自动填写，可修改。")).toBeInTheDocument();
+    expect(screen.queryByText(/缺少批准后落地路径/)).not.toBeInTheDocument();
+    await userEvent.setup().click(screen.getByRole("button", { name: "检查并生成" }));
+    expect(within(screen.getByRole("dialog", { name: "确认前预览" })).getByText("production/items/artifact-51.json")).toBeInTheDocument();
+    expect(mocks.updateGenerationConversationDraft).toHaveBeenCalledTimes(1);
+    expect(mocks.confirmGenerationConversation).not.toHaveBeenCalled();
+  });
+
+  it("图标关联目标可手选、改名同步，并在预览中显示", async () => {
+    const base = draft();
+    const item = {
+      ...base.tasks[0], id: "item_edict", kind: "text",
+      asset: { ...base.tasks[0].asset, key: "entity.item.artifact-51", kind: "entity", subtype: "item", title: "圣旨" },
+      schema: { type: "object", properties: { name: { type: "string" } }, required: ["name"], additionalProperties: false },
+      target_path: "production/items/artifact-51.json",
+    };
+    const icon = {
+      ...base.tasks[0], id: "icon_edict",
+      asset: { ...base.tasks[0].asset, key: "icon.artifact-51", subtype: "icon", title: "圣旨图标" },
+      target_path: "approved/assets/icons/artifact-51.webp",
+      relation_target_mode: "auto", relation_target_task_id: "item_edict", relation_target_asset_id: null,
+    };
+    setup({ conversation: { draft: draft({ tasks: [item, icon] }) } });
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: /02 圣旨图标/ }));
+    await chooseMenuOption(user, screen.getByRole("combobox", { name: "关联目标 icon_edict" }), /圣旨 · 方案任务/);
+    await waitFor(() => expect(mocks.updateGenerationConversationDraft).toHaveBeenCalled());
+    const selected = mocks.updateGenerationConversationDraft.mock.lastCall?.[2] as {
+      tasks: Array<{ relation_target_mode?: string; relation_target_task_id?: string | null }>;
+    };
+    expect(selected.tasks[1].relation_target_mode).toBe("task");
+    expect(selected.tasks[1].relation_target_task_id).toBe("item_edict");
+
+    const entityId = screen.getAllByRole("textbox", { name: "任务 ID" })[0];
+    await user.clear(entityId);
+    await user.type(entityId, "item_edict_new");
+    await waitFor(() => expect(mocks.updateGenerationConversationDraft.mock.lastCall?.[2].tasks[1].relation_target_task_id).toBe("item_edict_new"));
+    await user.click(screen.getByRole("button", { name: "检查并生成" }));
+    const preview = screen.getByRole("dialog", { name: "确认前预览" });
+    expect(within(preview).getByText("资产关联：圣旨")).toBeInTheDocument();
+    expect(mocks.confirmGenerationConversation).not.toHaveBeenCalled();
+  });
+
+  it("多物品无法自动配对时预览显示未关联，仍能检查方案", async () => {
+    const base = draft();
+    const item = (id: string) => ({
+      ...base.tasks[0], id, kind: "text",
+      asset: { ...base.tasks[0].asset, key: `entity.item.${id}`, kind: "entity", subtype: "item", title: id },
+      schema: { type: "object", properties: { name: { type: "string" } }, required: ["name"], additionalProperties: false },
+      target_path: `production/items/${id}.json`,
+    });
+    const icon = {
+      ...base.tasks[0], id: "icon-unknown",
+      asset: { ...base.tasks[0].asset, key: "icon.unknown", subtype: "icon", title: "未知图标" },
+      target_path: "approved/assets/icons/unknown.webp",
+      relation_target_mode: "auto", relation_target_task_id: null, relation_target_asset_id: null,
+    };
+    setup({ conversation: { draft: draft({ tasks: [item("first"), item("second"), icon] }) } });
+    await userEvent.setup().click(await screen.findByRole("button", { name: "检查并生成" }));
+    expect(within(screen.getByRole("dialog", { name: "确认前预览" })).getByText("资产关联：未关联")).toBeInTheDocument();
+  });
+
+  it("删除手选实体任务后清除图标关联选择", async () => {
+    const base = draft();
+    const item = {
+      ...base.tasks[0], id: "item_edict", kind: "text",
+      asset: { ...base.tasks[0].asset, key: "entity.item.artifact-51", kind: "entity", subtype: "item", title: "圣旨" },
+      schema: { type: "object", properties: { name: { type: "string" } }, required: ["name"], additionalProperties: false },
+      target_path: "production/items/artifact-51.json",
+    };
+    const icon = {
+      ...base.tasks[0], id: "icon_edict",
+      asset: { ...base.tasks[0].asset, key: "icon.artifact-51", subtype: "icon", title: "圣旨图标" },
+      target_path: "approved/assets/icons/artifact-51.webp",
+      relation_target_mode: "task", relation_target_task_id: "item_edict", relation_target_asset_id: null,
+    };
+    setup({ conversation: { draft: draft({ tasks: [item, icon] }) } });
+    await userEvent.setup().click(await screen.findByRole("button", { name: "删除 圣旨" }));
+    await waitFor(() => {
+      const saved = mocks.updateGenerationConversationDraft.mock.lastCall?.[2] as {
+        tasks: Array<{ relation_target_mode?: string; relation_target_task_id?: string | null }>;
+      };
+      expect(saved.tasks).toHaveLength(1);
+      expect(saved.tasks[0].relation_target_mode).toBe("auto");
+      expect(saved.tasks[0].relation_target_task_id).toBeNull();
+    });
+  });
+
+  it("自动修复期间的人工编辑不会被修复响应覆盖", async () => {
+    const base = draft();
+    const textTask = { ...base.tasks[0], kind: "text", target_path: "approved/assets/characters/old.md" };
+    const oldDraft = draft({ tasks: [textTask] });
+    let resolveRepair!: (value: unknown) => void;
+    setup({
+      conversation: { draft: oldDraft },
+      updateDraft: (_id, _hash, nextDraft) => {
+        if (mocks.updateGenerationConversationDraft.mock.calls.length === 1) return new Promise((resolve) => { resolveRepair = resolve; });
+        return Promise.resolve({ ...conversation(), draft: nextDraft, draft_hash: "draft-hash-manual" });
+      },
+    });
+    await waitFor(() => expect(mocks.updateGenerationConversationDraft).toHaveBeenCalledTimes(1));
+    const target = screen.getByRole("textbox", { name: "批准后落地路径" });
+    await userEvent.setup().clear(target);
+    await userEvent.setup().type(target, "approved/assets/characters/manual.json");
+    resolveRepair({ ...conversation(), draft: draft({ tasks: [{ ...textTask, target_path: "approved/assets/characters/old.json" }] }), draft_hash: "draft-hash-repaired" });
+    expect(target).toHaveValue("approved/assets/characters/manual.json");
+    await waitFor(() => expect(mocks.updateGenerationConversationDraft).toHaveBeenCalledTimes(2));
+    expect(mocks.updateGenerationConversationDraft.mock.calls[1][1]).toBe("draft-hash-repaired");
+    expect(target).toHaveValue("approved/assets/characters/manual.json");
+  });
+
+  it("没有可靠同类样本时保留阻塞并提示编辑输出结构", async () => {
+    const base = draft();
+    const textTask = { ...base.tasks[0], kind: "text", target_path: "approved/assets/characters/old.md" };
+    const oldDraft = draft({ tasks: [textTask], questions: ["schema:make-rain"] });
+    setup({ conversation: { draft: oldDraft } });
+
+    expect((await screen.findAllByText(/尚无可用的内容结构/)).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/在高级设置中编辑输出结构/).length).toBeGreaterThan(0);
+    await waitFor(() => expect(mocks.updateGenerationConversationDraft).toHaveBeenCalledTimes(1));
+    expect(mocks.confirmGenerationConversation).not.toHaveBeenCalled();
   });
 
   it("没有选中会话时展示生成中心空状态，并从会话列表新建", async () => {

@@ -260,7 +260,10 @@ describe("真实 API 契约", () => {
               asset_id: "asset-1",
               sequence: 2,
               format: "markdown",
-              content: { prompt: "真实候选" },
+              content: {
+                prompt: "真实候选\n\n[UPSTREAM_OUTPUTS]\n[{\"task_id\":\"character\"}]",
+                upstream_outputs: [{ task_id: "character", content: { name: "许青枝" } }],
+              },
               review_status: "pending",
               created_at: "2026-07-19T12:00:00Z",
             },
@@ -291,6 +294,7 @@ describe("真实 API 契约", () => {
       reviewReady: true,
       reviewBlockReason: undefined,
       prompt: "真实候选",
+      upstreamOutputCount: 1,
     });
     expect(details.revisions.map((revision) => revision.label)).toEqual([
       "r02（候选）",

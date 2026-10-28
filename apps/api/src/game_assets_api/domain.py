@@ -855,6 +855,9 @@ class GenerationTaskProposal(BaseModel):
     transparent: bool = False
     reference_task_id: str | None = None
     references: list[GenerationReferenceProposal] = Field(default_factory=list, max_length=20)
+    relation_target_mode: Literal["auto", "none", "task", "asset"] = "auto"
+    relation_target_task_id: str | None = None
+    relation_target_asset_id: str | None = None
     target_path: str | None = Field(default=None, max_length=1_000)
     candidate_path: str | None = Field(default=None, max_length=1_000)
     locked_fields: list[str] = Field(default_factory=list, max_length=100)

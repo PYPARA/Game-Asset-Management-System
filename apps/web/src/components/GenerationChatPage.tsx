@@ -196,6 +196,12 @@ function cloneDraft(draft: GenerationPlanningDraft): GenerationPlanningDraft {
   return JSON.parse(JSON.stringify(draft)) as GenerationPlanningDraft;
 }
 
+function planningQuestionLabel(question: string): string {
+  return question.startsWith("schema:")
+    ? `任务 ${question.slice(7)} 尚无可用的内容结构，请选择同类型参考资产，或在高级设置中编辑输出结构。`
+    : question;
+}
+
 function defaultAssetProposal(asset: GameAsset): GenerationAssetProposal {
   return {
     mode: "existing",
@@ -212,6 +218,30 @@ function defaultAssetProposal(asset: GameAsset): GenerationAssetProposal {
 
 function makeTaskId(index: number) {
   return `produce-asset-${index + 1}`;
+}
+
+function relationEntitySubtype(task: GenerationTaskProposal, assets: GameAsset[]): "character" | "item" | null {
+  if (task.kind !== "image" && task.kind !== "image_edit") return null;
+  const asset = task.asset.mode === "existing" ? assets.find((item) => item.id === task.asset.asset_id) : null;
+  const kind = asset?.kind ?? task.asset.kind;
+  const subtype = asset?.subtype ?? task.asset.subtype;
+  return kind === "media" && subtype === "portrait" ? "character"
+    : kind === "media" && subtype === "icon" ? "item" : null;
+}
+
+function isEntityTarget(task: GenerationTaskProposal, subtype: "character" | "item", assets: GameAsset[]): boolean {
+  const asset = task.asset.mode === "existing" ? assets.find((item) => item.id === task.asset.asset_id) : null;
+  return (asset?.kind ?? task.asset.kind) === "entity" && (asset?.subtype ?? task.asset.subtype) === subtype;
+}
+
+function relationTargetLabel(task: GenerationTaskProposal, tasks: GenerationTaskProposal[], assets: GameAsset[]): string {
+  if (task.relation_target_mode === "none") return "未关联";
+  if (task.relation_target_task_id) {
+    const target = tasks.find((item) => item.id === task.relation_target_task_id);
+    return target ? target.asset.title || target.asset.key || target.id : "未关联";
+  }
+  if (task.relation_target_asset_id) return assets.find((item) => item.id === task.relation_target_asset_id)?.name || "未关联";
+  return "未关联";
 }
 
 function draftTaskForAsset(asset: GameAsset, index: number): GenerationTaskProposal {
@@ -231,6 +261,9 @@ function draftTaskForAsset(asset: GameAsset, index: number): GenerationTaskPropo
     transparent: image,
     reference_task_id: null,
     references: [],
+    relation_target_mode: "auto",
+    relation_target_task_id: null,
+    relation_target_asset_id: null,
     target_path: null,
     candidate_path: null,
     locked_fields: [],
@@ -264,6 +297,9 @@ function draftTaskForNewAsset(index: number): GenerationTaskProposal {
     transparent: false,
     reference_task_id: null,
     references: [],
+    relation_target_mode: "auto",
+    relation_target_task_id: null,
+    relation_target_asset_id: null,
     target_path: null,
     candidate_path: null,
     locked_fields: [],
@@ -345,8 +381,8 @@ export function GenerationChatPage({
   const activeSessionId = suppliedSessionId;
   const seedAssetIds = suppliedSeedIds ?? EMPTY_ASSET_IDS;
   const workbenchQuery = useQuery<WorkbenchPayload>({
-    queryKey: ["workbench"],
-    queryFn: fetchWorkbench,
+    queryKey: ["workbench", workbenchData?.project.id ?? "default"],
+    queryFn: () => fetchWorkbench(workbenchData?.project.id),
     enabled: !workbenchData,
     initialData: workbenchData,
   });
@@ -424,6 +460,8 @@ export function GenerationChatPage({
   const saveTimerRef = useRef<number | null>(null);
   const saveInFlightRef = useRef<Promise<void> | null>(null);
   const flushRunningRef = useRef<Promise<void> | null>(null);
+  const autoRepairInFlightRef = useRef<Promise<void> | null>(null);
+  const autoRepairAttempted = useRef<Set<string>>(new Set());
   const workbench = workbenchQuery.data;
   const assets = workbench?.assets ?? [];
 
@@ -454,7 +492,7 @@ export function GenerationChatPage({
 
   const recentQuery = useQuery<GenerationConversationSummary[]>({
     queryKey: ["generation-conversations", workbench?.project.id],
-    queryFn: () => fetchGenerationConversations(workbench?.project.id),
+    queryFn: () => fetchGenerationConversations(workbench?.project.id ?? ""),
     enabled: Boolean(workbench?.project.id),
     staleTime: 10_000,
     refetchInterval: 5000,
@@ -482,7 +520,7 @@ export function GenerationChatPage({
   const closeButtonRef = useRef<HTMLButtonElement | null>(null);
   const archivedQuery = useQuery<GenerationConversationSummary[]>({
     queryKey: ["generation-conversations-archived", workbench?.project.id],
-    queryFn: () => fetchGenerationConversations(workbench?.project.id, true),
+    queryFn: () => fetchGenerationConversations(workbench?.project.id ?? "", true),
     enabled: Boolean(workbench?.project.id && archivedOpen),
     staleTime: 5_000,
   });
@@ -518,6 +556,50 @@ export function GenerationChatPage({
     setManualMode(value.status === "unavailable" || value.status === "failed");
     setSelectedContextIds(value.seed_asset_ids ?? (value.context.seed_asset_ids as string[] | undefined) ?? seedAssetIds);
   }, [existingConversationQuery.data, seedAssetIds]);
+
+  useEffect(() => {
+    const value = existingConversationQuery.data;
+    if (!value || value.id !== activeSessionId || !value.draft_hash || value.status === "running" || value.status === "awaiting_input" || value.status === "completed") return;
+    if (!value.draft.tasks.some((task) => (
+      task.kind === "text" && (
+        (!task.schema && !task.asset.schema_ref) ||
+        task.target_path?.toLowerCase().endsWith(".md") ||
+        (task.asset.mode === "new" && !task.target_path)
+      )
+    ) || (relationEntitySubtype(task, assets) !== null && task.relation_target_mode === undefined))) return;
+    if (pendingDraftRef.current || saveInFlightRef.current || flushRunningRef.current) return;
+    if (autoRepairAttempted.current.has(value.id)) return;
+    autoRepairAttempted.current.add(value.id);
+    setSaving(true);
+    const repair = updateGenerationConversationDraft(value.id, value.draft_hash, value.draft)
+      .then((saved) => {
+        if ((conversationRef.current && conversationRef.current.id !== saved.id) || saveInFlightRef.current) return;
+        conversationRef.current = saved;
+        setConversation(saved);
+        if (!pendingDraftRef.current) setDraft(saved.draft);
+      })
+      .catch(async (reason: unknown) => {
+        if (reason instanceof ApiError && reason.status === 409) {
+          try {
+            const refreshed = await existingConversationQuery.refetch();
+            if (refreshed.data?.id === value.id) {
+              conversationRef.current = refreshed.data;
+              setConversation(refreshed.data);
+              if (!pendingDraftRef.current) setDraft(refreshed.data.draft);
+            }
+          } catch (refreshError: unknown) {
+            setError(refreshError instanceof Error ? refreshError.message : "方案已更新，但重新读取失败，请刷新页面。");
+          }
+          return;
+        }
+        setError(reason instanceof Error ? reason.message : "自动整理方案失败，请重试保存。");
+      })
+      .finally(() => {
+        autoRepairInFlightRef.current = null;
+        if (!pendingDraftRef.current && !saveInFlightRef.current && !flushRunningRef.current) setSaving(false);
+      });
+    autoRepairInFlightRef.current = repair;
+  }, [activeSessionId, assets, existingConversationQuery.data]);
 
   useEffect(() => {
     const value = capabilitiesQuery.data;
@@ -630,7 +712,7 @@ export function GenerationChatPage({
       }
       const selectedAsset = assets.find((asset) => asset.id === task.asset.asset_id);
       if (task.kind === "text" && !task.schema && !task.asset.schema_ref && !selectedAsset?.schemaRef) {
-        errors.push(`任务 ${task.id || "未命名"} 缺少项目 JSON Schema。`);
+        errors.push(`任务 ${task.id || "未命名"} 尚无可用的内容结构；请选择同类型参考资产，或在高级设置中编辑输出结构。`);
       }
       if (task.kind !== "text" && (!task.width || !task.height)) errors.push(`任务 ${task.id || "未命名"} 需要尺寸。`);
       if (task.kind === "image_edit" && !task.reference_task_id && task.references.filter((reference) => reference.role === "primary").length !== 1) {
@@ -646,6 +728,19 @@ export function GenerationChatPage({
       }
       for (const dependency of task.depends_on) {
         if (!currentDraft.tasks.some((candidate) => candidate.id === dependency)) errors.push(`任务 ${task.id || "未命名"} 的依赖 ${dependency} 不存在。`);
+      }
+      const relationSubtype = relationEntitySubtype(task, assets);
+      if (relationSubtype && task.relation_target_mode === "task") {
+        const target = currentDraft.tasks.find((candidate) => candidate.id === task.relation_target_task_id);
+        if (!target || !isEntityTarget(target, relationSubtype, assets)) {
+          errors.push(`任务 ${task.id || "未命名"} 的关联目标任务无效。`);
+        }
+      }
+      if (relationSubtype && task.relation_target_mode === "asset") {
+        const target = assets.find((candidate) => candidate.id === task.relation_target_asset_id);
+        if (!target || target.kind !== "entity" || target.subtype !== relationSubtype) {
+          errors.push(`任务 ${task.id || "未命名"} 的关联目标资产无效。`);
+        }
       }
     }
     return errors;
@@ -672,6 +767,7 @@ export function GenerationChatPage({
   const flushDraftSave = useCallback(() => {
     if (flushRunningRef.current) return flushRunningRef.current;
     const run = (async () => {
+      if (autoRepairInFlightRef.current) await autoRepairInFlightRef.current;
       while (true) {
         if (saveTimerRef.current !== null) {
           window.clearTimeout(saveTimerRef.current);
@@ -1093,9 +1189,9 @@ export function GenerationChatPage({
           {workTab === "plan" && (currentDraft ? <div className="generation-plan-scroll">
             <div className="generation-plan-summary"><div className="plan-summary-mark"><ListChecks size={20} /></div><div><strong>{currentDraft.tasks.length ? `${currentDraft.tasks.length} 项产物` : "当前目标"}</strong><span>{currentDraft.summary || events.find(e=>e.event_type==="user.message")?.data.content as string || "描述你的目标，我们一起确定产物和参考。"}</span></div></div>
             <details className="generation-advanced"><summary>模型与生成路由</summary><section className="generation-plan-section"><div className="generation-section-title"><span>会话模型路由</span><Funnel size={15} /></div><p className="generation-field-help generation-route-help">规划使用文字路由。在聊天输入框的“生成路由”中修改；任务内明确指定的渠道仍然优先。</p><div className="generation-route-summary"><div><span>文字</span><strong>{routeLabel(routeDefaults.text, providers)}</strong></div><div><span>图片</span><strong>{routeLabel(routeDefaults.image, providers)}</strong></div></div></section></details>
-            <section className="generation-plan-section"><div className="generation-section-title"><span>资源清单</span><span className="generation-count">{currentDraft.tasks.length}</span></div>{currentDraft.tasks.map((task, index) => <TaskProposalEditor key={`${task.id || "task"}-${index}`} task={task} index={index} assets={assets} allTasks={currentDraft.tasks} providers={providers} sessionRoute={routeDefaults[task.kind === "text" ? "text" : "image"] ?? null} onChange={(updater) => editAndSave((value) => { const target = value.tasks[index]; if (target) updater(target); })} onRemove={() => editAndSave((value) => { value.tasks.splice(index, 1); })} />)}<div className="generation-add-task-row"><button className="generation-add-task" type="button" onClick={() => setTaskPickerOpen(true)} disabled={!assets.some((asset) => !currentDraft.tasks.some((task) => task.asset.asset_id === asset.id))}><Plus size={15} /> 从项目资产添加任务</button><button className="generation-add-task" type="button" onClick={() => editAndSave((value) => { value.tasks.push(draftTaskForNewAsset(value.tasks.length)); })}><Plus size={15} /> 手动新建资源</button></div></section>
+            <section className="generation-plan-section"><div className="generation-section-title"><span>资源清单</span><span className="generation-count">{currentDraft.tasks.length}</span></div>{currentDraft.tasks.map((task, index) => <TaskProposalEditor key={index} task={task} index={index} assets={assets} allTasks={currentDraft.tasks} providers={providers} sessionRoute={routeDefaults[task.kind === "text" ? "text" : "image"] ?? null} onChange={(updater) => editAndSave((value) => { const target = value.tasks[index]; if (!target) return; const previousId = target.id; updater(target); if (!relationEntitySubtype(target, assets)) { target.relation_target_mode = "auto"; target.relation_target_task_id = null; target.relation_target_asset_id = null; } if (target.id !== previousId) for (const other of value.tasks) { other.depends_on = other.depends_on.map((id) => id === previousId ? target.id : id); if (other.reference_task_id === previousId) other.reference_task_id = target.id; if (other.relation_target_task_id === previousId) other.relation_target_task_id = target.id; } })} onRemove={() => editAndSave((value) => { const removed = value.tasks.splice(index, 1)[0]; if (!removed) return; for (const other of value.tasks) { other.depends_on = other.depends_on.filter((id) => id !== removed.id); if (other.reference_task_id === removed.id) other.reference_task_id = null; if (other.relation_target_task_id === removed.id) { other.relation_target_mode = "auto"; other.relation_target_task_id = null; other.relation_target_asset_id = null; } } })} />)}<div className="generation-add-task-row"><button className="generation-add-task" type="button" onClick={() => setTaskPickerOpen(true)} disabled={!assets.some((asset) => !currentDraft.tasks.some((task) => task.asset.asset_id === asset.id))}><Plus size={15} /> 从项目资产添加任务</button><button className="generation-add-task" type="button" onClick={() => editAndSave((value) => { value.tasks.push(draftTaskForNewAsset(value.tasks.length)); })}><Plus size={15} /> 手动新建资源</button></div></section>
             {currentDraft.tasks.length > 0 && <details className="generation-advanced"><summary>高级执行设置</summary><section className="generation-plan-section"><div className="generation-section-title"><span>预算与执行</span><SlidersHorizontal size={15} /></div><div className="generation-settings-grid"><NumberField label="额外调用上限" value={numberValue(currentDraft.settings.extra_call_budget, 2)} onChange={(value) => editAndSave((draftValue) => { draftValue.settings.extra_call_budget = value; })} /><NumberField label="并发" value={numberValue(currentDraft.settings.max_concurrency, 3)} onChange={(value) => editAndSave((draftValue) => { draftValue.settings.max_concurrency = value; })} /><NumberField label="重试" value={numberValue(currentDraft.settings.max_transport_retries, 2)} onChange={(value) => editAndSave((draftValue) => { draftValue.settings.max_transport_retries = value; })} /><NumberField label="付费返工" value={numberValue(currentDraft.settings.max_paid_remediation_rounds, 2)} onChange={(value) => editAndSave((draftValue) => { draftValue.settings.max_paid_remediation_rounds = value; })} /></div><div className="generation-path-legend"><span><i className="candidate-dot" />候选暂存</span><code>workspace/candidates/&lt;job&gt;</code><span><i className="target-dot" />批准后落地</span></div></section></details>}
-            {(unresolvedQuestions.length > 0 || warnings.length > 0 || currentDraft.assumptions.length > 0 || hasPendingInput) && <section className="generation-plan-section"><div className="generation-section-title"><span>需要你的判断</span><Question size={15} /></div>{hasPendingInput && <button type="button" className="generation-answer-link" onClick={() => { document.getElementById(`generation-input-${pendingInput!.id}`)?.scrollIntoView({ behavior: "smooth", block: "center" }); document.getElementById(`generation-input-${pendingInput!.id}`)?.focus(); }}>在对话中回答</button>}{!hasPendingInput && unresolvedQuestions.map((question) => <div className="generation-question" key={question}><Question size={14} /><span>{question.replace(/^schema:/, "请补充 JSON Schema：")}</span></div>)}{currentDraft.assumptions.map((assumption) => <div className="generation-assumption" key={assumption}><CheckCircle size={14} /><span>{assumption}</span></div>)}{warnings.map((warning, index) => { const code = textValue(warning.code); return <label className="generation-warning generation-warning-check" key={`${code}-${index}`}><input type="checkbox" checked={Boolean(code && acceptedWarningCodes.includes(code))} onChange={(event) => { if (!code) return; setAcceptedWarningCodes((current) => event.target.checked ? [...new Set([...current, code])] : current.filter((item) => item !== code)); }} /><ShieldWarning size={14} /><span>{textValue(warning.message, "方案包含需要确认的警告")}</span></label>; })}</section>}
+            {(unresolvedQuestions.length > 0 || warnings.length > 0 || currentDraft.assumptions.length > 0 || hasPendingInput) && <section className="generation-plan-section"><div className="generation-section-title"><span>需要你的判断</span><Question size={15} /></div>{hasPendingInput && <button type="button" className="generation-answer-link" onClick={() => { document.getElementById(`generation-input-${pendingInput!.id}`)?.scrollIntoView({ behavior: "smooth", block: "center" }); document.getElementById(`generation-input-${pendingInput!.id}`)?.focus(); }}>在对话中回答</button>}{!hasPendingInput && unresolvedQuestions.map((question) => <div className="generation-question" key={question}><Question size={14} /><span>{planningQuestionLabel(question)}</span></div>)}{currentDraft.assumptions.map((assumption) => <div className="generation-assumption" key={assumption}><CheckCircle size={14} /><span>{assumption}</span></div>)}{warnings.map((warning, index) => { const code = textValue(warning.code); return <label className="generation-warning generation-warning-check" key={`${code}-${index}`}><input type="checkbox" checked={Boolean(code && acceptedWarningCodes.includes(code))} onChange={(event) => { if (!code) return; setAcceptedWarningCodes((current) => event.target.checked ? [...new Set([...current, code])] : current.filter((item) => item !== code)); }} /><ShieldWarning size={14} /><span>{textValue(warning.message, "方案包含需要确认的警告")}</span></label>; })}</section>}
             {taskErrors.length > 0 && <section className="generation-plan-section generation-errors" role="alert"><div className="generation-section-title"><span>字段校验</span><WarningCircle size={15} /></div>{taskErrors.map((item) => <div className="generation-error-row" key={item}><WarningCircle size={13} />{item}</div>)}</section>}
           </div> : <div className="generation-plan-empty">{conversation ? <><CircleNotch size={22} className="spin" /> 正在准备方案…</> : <><ListChecks size={22} /> 选择会话后查看生成方案</>}</div>)}
           {conversation && workTab === "plan" && <div className="generation-confirm-area">
@@ -1315,11 +1411,24 @@ function TaskProposalEditor({
   const [referencePreview,setReferencePreview]=useState<GameAsset|null>(null);
   const [referenceRevision,setReferenceRevision]=useState<string|null>(null);
   const [referenceChoice,setReferenceChoice]=useState("");
+  const [schemaEditError, setSchemaEditError] = useState("");
   const assetLabel = task.asset.mode === "new"
     ? task.asset.title || task.asset.key || "待创建资源"
     : assets.find((asset) => asset.id === task.asset.asset_id)?.name ?? task.asset.key ?? "未选择资源";
   const taskKindLabel = task.kind === "image_edit" ? "图像编辑" : task.kind === "image" ? "图像生成" : "结构化文字";
   const referenceCandidates = assets.filter((asset) => !task.references.some((reference) => reference.asset_id === asset.id));
+  const relationSubtype = relationEntitySubtype(task, assets);
+  const relationValue = task.relation_target_mode === "none" ? "none"
+    : task.relation_target_mode === "task" ? `task:${task.relation_target_task_id ?? ""}`
+    : task.relation_target_mode === "asset" ? `asset:${task.relation_target_asset_id ?? ""}` : "auto";
+  const relationOptions = relationSubtype ? [
+    { value: "auto", label: "自动关联" },
+    { value: "none", label: "不关联" },
+    ...allTasks.filter((candidate) => candidate.id !== task.id && isEntityTarget(candidate, relationSubtype, assets))
+      .map((candidate) => ({ value: `task:${candidate.id}`, label: `${candidate.asset.title || candidate.id} · 方案任务` })),
+    ...assets.filter((candidate) => candidate.kind === "entity" && candidate.subtype === relationSubtype)
+      .map((candidate) => ({ value: `asset:${candidate.id}`, label: `${candidate.name} · 项目资产` })),
+  ] : [];
   return (
     <div className={`generation-task-editor ${open ? "open" : ""}`}>
       <div className="generation-task-summary">
@@ -1375,18 +1484,44 @@ function TaskProposalEditor({
             <div className="generation-select-field"><span>资产类型</span><SelectMenu ariaLabel="资产类型" value={task.asset.kind ?? "media"} options={[{ value: "content", label: "内容" }, { value: "design", label: "设计" }, { value: "entity", label: "实体" }, { value: "media", label: "媒体" }, { value: "production", label: "制作" }]} onChange={(kind) => onChange((value) => { value.asset.kind = kind as GenerationAssetProposal["kind"]; })} /></div>
             <label>Subtype<input value={task.asset.subtype ?? ""} onChange={(event) => onChange((value) => { value.asset.subtype = event.target.value || null; })} placeholder="例如 background" /></label>
           </div>
-          {task.kind === "text" && <label>项目 JSON Schema 路径<input value={task.asset.schema_ref ?? ""} onChange={(event) => onChange((value) => { value.asset.schema_ref = event.target.value || null; })} placeholder="例如 schemas/dialogue.schema.json" /></label>}
+          {task.kind === "text" && <details className="generation-advanced"><summary>项目结构文件</summary><label>Schema 路径<input value={task.asset.schema_ref ?? ""} onChange={(event) => onChange((value) => { value.asset.schema_ref = event.target.value || null; })} placeholder="例如 character.schema.json" /></label></details>}
         </>}
         <div className="generation-field-row">
           <div className="generation-select-field"><span>任务类型</span><SelectMenu ariaLabel="任务类型" value={task.kind} options={[{ value: "text", label: "结构化文字" }, { value: "image", label: "图像生成" }, { value: "image_edit", label: "图像编辑" }]} onChange={(kind) => onChange((value) => { value.kind = kind as GenerationTaskProposal["kind"]; })} /></div>
           <div className="generation-route-field"><span>任务渠道 / 模型</span><RoutePicker modality={task.kind === "text" ? "text" : "image"} value={task.provider_profile_id && task.model ? { provider_profile_id: task.provider_profile_id, model: task.model } : null} providers={providers} fallbackLabel={sessionRoute ? routeLabel(sessionRoute, providers, "沿用会话默认") : "沿用会话默认"} onChange={(route) => onChange((value) => { value.provider_profile_id = route?.provider_profile_id ?? null; value.model = route?.model ?? null; })} /></div>
         </div>
         <details className="generation-advanced"><summary>Prompt</summary><label>Prompt<textarea value={task.prompt} rows={3} onChange={(event) => onChange((value) => { value.prompt = event.target.value; })} /></label></details>
+        {task.kind === "text" && <>
+          {task.metadata.schema_autofill && <small className="generation-field-help">内容结构已按当前项目 {String((task.metadata.schema_autofill as Record<string, unknown>).sample_count ?? 0)} 个同类已批准资产自动补全，可在下方审查。</small>}
+          <details className="generation-advanced"><summary>输出结构 · JSON Schema</summary>
+            <label>内联 Schema<textarea key={JSON.stringify(task.schema)} defaultValue={task.schema ? JSON.stringify(task.schema, null, 2) : ""} rows={9} onBlur={(event) => {
+              const raw = event.target.value.trim();
+              try {
+                const parsed: unknown = raw ? JSON.parse(raw) : null;
+                if (parsed !== null && (typeof parsed !== "object" || Array.isArray(parsed))) throw new Error("输出结构必须是 JSON 对象。");
+                setSchemaEditError("");
+                if (JSON.stringify(parsed) !== JSON.stringify(task.schema)) onChange((value) => { value.schema = parsed as Record<string, unknown> | null; delete value.metadata.schema_autofill; });
+              } catch { setSchemaEditError("输出结构不是有效的 JSON 对象，请修正后再离开输入框。"); }
+            }} /></label>
+            {schemaEditError && <small className="generation-field-help" role="alert">{schemaEditError}</small>}
+          </details>
+        </>}
         {task.kind !== "text" && <>
           <div className="generation-field-row"><label>宽<input type="number" min={1} max={8192} value={task.width ?? ""} onChange={(event) => onChange((value) => { value.width = Number(event.target.value) || null; })} /></label><label>高<input type="number" min={1} max={8192} value={task.height ?? ""} onChange={(event) => onChange((value) => { value.height = Number(event.target.value) || null; })} /></label></div>
           <label className="generation-checkbox-line"><input type="checkbox" checked={task.transparent} onChange={(event) => onChange((value) => { value.transparent = event.target.checked; })} /> 保留透明通道</label>
         </>}
-        <label>批准后落地路径<input value={task.target_path ?? ""} onChange={(event) => onChange((value) => { value.target_path = event.target.value || null; })} placeholder="例如 approved/assets/portraits/hero.png" /></label>
+        <label>批准后落地路径<input value={task.target_path ?? ""} onChange={(event) => onChange((value) => { value.target_path = event.target.value || null; delete value.metadata.target_path_autofill; })} placeholder={task.kind === "text" ? "例如 production/items/artifact-51.json" : "例如 approved/assets/portraits/hero.png"} /></label>
+        {Boolean(task.metadata.target_path_autofill) && <small className="generation-field-help">已按资源 Key 自动填写，可修改。</small>}
+
+        {relationSubtype && <div className="generation-editor-subsection">
+          <div className="generation-subsection-title"><span>资产关联</span><small>{relationSubtype === "character" ? "立绘描绘角色" : "图标代表物品"}</small></div>
+          <div className="generation-select-field"><span>关联目标</span><SelectMenu ariaLabel={`关联目标 ${task.id}`} value={relationValue} options={relationOptions} onChange={(choice) => onChange((value) => {
+            value.relation_target_mode = choice === "none" ? "none" : choice.startsWith("task:") ? "task" : choice.startsWith("asset:") ? "asset" : "auto";
+            value.relation_target_task_id = choice.startsWith("task:") ? choice.slice(5) : null;
+            value.relation_target_asset_id = choice.startsWith("asset:") ? choice.slice(6) : null;
+          })} /></div>
+          <small className="generation-field-help">{task.relation_target_mode === "auto" || !task.relation_target_mode ? `自动结果：${relationTargetLabel(task, allTasks, assets)}` : `当前关系：${relationTargetLabel(task, allTasks, assets)}`}</small>
+        </div>}
 
         <div className="generation-editor-subsection">
           <div className="generation-subsection-title"><span>依赖与上游产物</span><small>按顺序注入任务结果</small></div>
@@ -1564,6 +1699,7 @@ function GenerationPlanPreview({
                     <div><strong>{assetName}</strong><small>{kind} · {task.id} · {task.model || "沿用默认模型"}</small></div>
                   </div>
                   <code>{task.target_path || "尚未设置批准后路径"}</code>
+                  {relationEntitySubtype(task, assets) && <small className="generation-preview-relation">资产关联：{relationTargetLabel(task, draft.tasks, assets)}</small>}
                   <MarkdownPreview content={task.prompt || "未填写 Prompt"} className="generation-preview-prompt" />
                   {task.references.length > 0 && <div className="generation-preview-references"><span>参考资源</span>{task.references.map((reference, referenceIndex) => <small key={`${reference.asset_id}-${referenceIndex}`}><button type="button" onClick={()=>{const asset=assets.find(a=>a.id===reference.asset_id);if(asset){setReferenceRevision(reference.revision_id??null);setReferencePreview(asset);}}}>预览</button><b>{reference.role === "primary" ? "主" : "辅"}</b> {assets.find((asset) => asset.id === reference.asset_id)?.name || reference.asset_id}{reference.reason ? ` · ${reference.reason}` : ""}</small>)}</div>}
                 </li>
@@ -1571,7 +1707,7 @@ function GenerationPlanPreview({
             })}
           </ol>
           {(draft.questions.length > 0 || draft.warnings.length > 0) && <div className="generation-preview-blockers">
-            {draft.questions.map((question) => <p key={question}><Question size={14} />{question.replace(/^schema:/, "请补充 JSON Schema：")}</p>)}
+            {draft.questions.map((question) => <p key={question}><Question size={14} />{planningQuestionLabel(question)}</p>)}
             {draft.warnings.map((warning,index)=>{const code=textValue(warning.code);return <label key={`${code}-${index}`}><input type="checkbox" checked={acceptedWarningCodes.includes(code)} onChange={e=>onWarningsChange(e.target.checked ? [...new Set([...acceptedWarningCodes,code])] : acceptedWarningCodes.filter(x=>x!==code))}/><span>{textValue(warning.message,"方案包含需要确认的警告")}</span></label>;})}
           </div>}
         </div>

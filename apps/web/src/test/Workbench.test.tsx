@@ -88,7 +88,7 @@ function mockAssetApi(jobs: unknown[] = [], options: MockAssetApiOptions = {}) {
             latest_candidate_revision_id: asset.latest_candidate_revision_id === undefined
               ? `revision-${asset.id}`
               : asset.latest_candidate_revision_id,
-            updated_at: "2026-07-19T12:00:00Z",
+            updated_at: asset.updated_at ?? "2026-07-19T12:00:00Z",
           })),
         );
       }
@@ -190,6 +190,36 @@ function mockAssetApi(jobs: unknown[] = [], options: MockAssetApiOptions = {}) {
   return fetchMock;
 }
 
+function mockTwoProjectApi() {
+  const sessionA = { ...generationConversationRecord("session-a"), title: "甲项目会话" };
+  const sessionB = { ...generationConversationRecord("session-b"), project_id: "project-2", title: "乙项目会话" };
+  const fetchMock = vi.fn((input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url === "/api/projects") return json([
+      { id: "project-1", name: "项目甲", root_path: "/tmp/project-1" },
+      { id: "project-2", name: "项目乙", root_path: "/tmp/project-2" },
+    ]);
+    if (url.startsWith("/api/assets?")) {
+      const projectId = new URL(url, "http://local").searchParams.get("project_id");
+      return json([{ id: `asset-${projectId}`, project_id: projectId, key: `scene.${projectId}`, title: `场景${projectId}`, kind: "content", subtype: "scene", tags: [], content_status: "draft", generation_status: "idle", updated_at: "2026-09-23T00:00:00Z" }]);
+    }
+    if (url.startsWith("/api/jobs?") || url.startsWith("/api/relations?") || url === "/api/providers") return json([]);
+    if (url.startsWith("/api/generation-conversations?")) {
+      const projectId = new URL(url, "http://local").searchParams.get("project_id");
+      return json(projectId === "project-2" ? [sessionB] : [sessionA]);
+    }
+    if (url === "/api/generation-conversations/session-a") return json(sessionA);
+    if (url === "/api/generation-conversations/session-b") return json(sessionB);
+    if (url.includes("/events?")) return json([]);
+    if (url === "/api/generation-agent/capabilities") return json({ available: false, adapter: null, version: null, models: [], diagnostic: {} });
+    if (url === "/api/provider-defaults") return json({ text: null, image: null, video: null, audio: null, max_concurrency: 3, max_transport_retries: 2, updated_at: null });
+    if (url.startsWith("/api/releases?") || url.startsWith("/api/deliveries?")) return json([]);
+    throw new Error(`unexpected request: ${url}`);
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  return fetchMock;
+}
+
 function renderWorkbench() {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -204,7 +234,46 @@ function renderWorkbench() {
 describe("制作台", () => {
   beforeEach(() => {
     window.localStorage.removeItem("gams.followedAssets.project-1");
+    window.localStorage.removeItem("gams.selectedProjectId");
+    window.history.replaceState({}, "", "/");
     vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("backend offline")));
+  });
+
+  it("切换 Project 后只加载该项目资产和生成会话", async () => {
+    const fetchMock = mockTwoProjectApi();
+    const user = userEvent.setup();
+    renderWorkbench();
+
+    expect(await screen.findByText("scene.project-1")).toBeInTheDocument();
+    await user.click(screen.getByRole("combobox", { name: "当前 Project" }));
+    await user.click(screen.getByRole("option", { name: "项目乙" }));
+    expect(await within(screen.getByRole("table")).findByText("scene.project-2")).toBeInTheDocument();
+    expect(within(screen.getByRole("table")).queryByText("scene.project-1")).not.toBeInTheDocument();
+    expect(window.localStorage.getItem("gams.selectedProjectId")).toBe("project-2");
+
+    await user.click(screen.getByRole("button", { name: "生成中心" }));
+    expect((await screen.findAllByText("乙项目会话")).length).toBeGreaterThan(0);
+    expect(screen.queryByText("甲项目会话")).not.toBeInTheDocument();
+    expect(fetchMock.mock.calls.some(([input]) => String(input) === "/api/generation-conversations?project_id=project-2")).toBe(true);
+
+    await user.click(screen.getByRole("combobox", { name: "当前 Project" }));
+    await user.click(screen.getByRole("option", { name: "项目甲" }));
+    expect((await screen.findAllByText("甲项目会话")).length).toBeGreaterThan(0);
+    expect(screen.queryByText("乙项目会话")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "收起生成中心" }));
+    expect(await within(screen.getByRole("table")).findByText("scene.project-1")).toBeInTheDocument();
+  });
+
+  it("直达生成会话时切换到其所属 Project", async () => {
+    const fetchMock = mockTwoProjectApi();
+    window.localStorage.setItem("gams.selectedProjectId", "project-1");
+    window.history.replaceState({}, "", "/generation/session-b");
+    renderWorkbench();
+
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "当前 Project" })).toHaveAttribute("value", "project-2"));
+    expect((await screen.findAllByText("乙项目会话")).length).toBeGreaterThan(0);
+    expect(fetchMock.mock.calls.some(([input]) => String(input) === "/api/assets?project_id=project-2")).toBe(true);
+    expect(window.localStorage.getItem("gams.selectedProjectId")).toBe("project-2");
   });
 
   it("在后端离线时只展示错误状态", async () => {
@@ -434,6 +503,35 @@ describe("制作台", () => {
     expect(screen.getByText("1 项结果")).toBeInTheDocument();
     expect(within(screen.getByRole("table")).getByText("media.future.one")).toBeInTheDocument();
     expect(within(screen.getByRole("table")).queryByText("media.ending.background.one")).not.toBeInTheDocument();
+  });
+
+  it("先对完整列表排序再分页，新立绘不需要加载更多", async () => {
+    const older = Array.from({ length: 60 }, (_, index) => ({
+      id: `portrait-${index}`,
+      key: `portrait.older-${String(index).padStart(2, "0")}`,
+      title: `旧立绘 ${index}`,
+      kind: "media",
+      subtype: "portrait",
+      content_status: "approved",
+      latest_candidate_revision_id: null,
+      updated_at: "2026-07-19T12:00:00Z",
+    }));
+    mockAssetApi([], { assets: [...older, {
+      id: "portrait-recent",
+      key: "portrait.recent",
+      title: "新立绘",
+      kind: "media",
+      subtype: "portrait",
+      content_status: "approved",
+      latest_candidate_revision_id: null,
+      updated_at: "2026-09-23T12:00:00Z",
+    }] });
+    renderWorkbench();
+    await userEvent.setup().click(await screen.findByRole("button", { name: "角色立绘 61" }));
+
+    const rows = within(screen.getByRole("table")).getAllByRole("row");
+    expect(within(rows[1]).getByText("portrait.recent")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /加载更多（尚有 1 项）/ })).toBeInTheDocument();
   });
 
   it("支持选择并批量批准候选版本", async () => {

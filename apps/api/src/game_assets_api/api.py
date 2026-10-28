@@ -1179,22 +1179,6 @@ async def generation_agent_capabilities(request: Request) -> dict[str, Any]:
     return {**value, "interactive_user_input": bool(value.get("available") and getattr(adapter, "interactive_user_input", False))}
 
 
-async def _best_effort_thread_action(
-    request: Request,
-    action: str,
-    thread_id: str | None,
-) -> None:
-    callback = getattr(getattr(request.app.state, "codex_adapter", None), action, None)
-    if callback is None:
-        return
-    try:
-        await asyncio.wait_for(callback(thread_id), timeout=8.0)
-    except Exception:
-        # Conversation lifecycle is local-first. A missing or unavailable
-        # App Server must not make archive/delete unusable.
-        return
-
-
 @router.post(
     "/generation-conversations",
     response_model=GenerationConversationRead,
@@ -1223,7 +1207,7 @@ def create_generation_conversation_route(
 
 @router.get("/generation-conversations", response_model=list[GenerationConversationSummary])
 def list_generation_conversations_route(
-    project_id: str | None = None,
+    project_id: str = Query(min_length=1),
     include_archived: bool = Query(default=False),
     session: Session = Depends(db),
 ) -> list[dict[str, Any]]:
@@ -1282,11 +1266,9 @@ def patch_generation_conversation_context(
 )
 async def archive_generation_conversation_route(
     session_id: str,
-    request: Request,
     session: Session = Depends(db),
 ) -> dict[str, Any]:
     row = _planning_session(session, session_id)
-    await _best_effort_thread_action(request, "archive_thread", row.thread_id)
     row = archive_generation_conversation(session, row)
     return _generation_conversation_detail(row)
 
@@ -1297,11 +1279,9 @@ async def archive_generation_conversation_route(
 )
 async def unarchive_generation_conversation_route(
     session_id: str,
-    request: Request,
     session: Session = Depends(db),
 ) -> dict[str, Any]:
     row = _planning_session(session, session_id)
-    await _best_effort_thread_action(request, "unarchive_thread", row.thread_id)
     row = unarchive_generation_conversation(session, row)
     return _generation_conversation_detail(row)
 
@@ -1309,7 +1289,6 @@ async def unarchive_generation_conversation_route(
 @router.delete("/generation-conversations/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_generation_conversation_route(
     session_id: str,
-    request: Request,
     session: Session = Depends(db),
 ) -> Response:
     row = _planning_session(session, session_id)
@@ -1317,7 +1296,6 @@ async def delete_generation_conversation_route(
         raise ServiceError(409, "stop the active planning turn before permanently deleting the conversation")
     project = require(session, Project, row.project_id, "project")
     conversation_id = row.id
-    await _best_effort_thread_action(request, "delete_thread", row.thread_id)
     # AgentSession.plan_id/job_id historically used CASCADE FKs. Null them and
     # their audit references first so deleting chat history can never delete a
     # confirmed Plan, Job, or asset.
@@ -1453,15 +1431,18 @@ async def stream_generation_conversation_events(
     session_id: str,
     request: Request,
     after: int = Query(default=0, ge=0),
-    session: Session = Depends(db),
 ) -> StreamingResponse:
-    _planning_session(session, session_id)
+    # A streaming response can remain open for hours. Close the validation
+    # session before returning it so each subscriber does not pin a pool slot.
+    database: Database = request.app.state.database
+    with database.sessions() as session:
+        _planning_session(session, session_id)
     last_event_id = request.headers.get("last-event-id")
     cursor = after
     if last_event_id and last_event_id.isdigit():
         cursor = max(cursor, int(last_event_id))
     return StreamingResponse(
-        stream_generation_events(request.app.state.database, session_id, request, after_sequence=cursor),
+        stream_generation_events(database, session_id, request, after_sequence=cursor),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -1832,13 +1813,16 @@ async def job_events(
                 if project_id:
                     statement = statement.where(GenerationJob.project_id == project_id)
                 jobs = session.scalars(statement).all()
+                frames = []
                 for job in jobs:
                     token = f"{job.status}:{job.progress}:{job.attempt_count}:{job.updated_at.isoformat()}"
                     if seen.get(job.id) == token:
                         continue
                     seen[job.id] = token
                     data = GenerationJobRead.model_validate(job).model_dump_json()
-                    yield f"id: {job.id}:{job.attempt_count}\nevent: job\ndata: {data}\n\n"
+                    frames.append(f"id: {job.id}:{job.attempt_count}\nevent: job\ndata: {data}\n\n")
+            for frame in frames:
+                yield frame
             if time.monotonic() - last_keepalive >= 15:
                 yield ": keepalive\n\n"
                 last_keepalive = time.monotonic()
@@ -1892,10 +1876,13 @@ async def run_events(
                 if plan_id:
                     statement = statement.where(RunEvent.plan_id == plan_id)
                 rows = session.scalars(statement.order_by(RunEvent.sequence).limit(500)).all()
+                frames = []
                 for row in rows:
                     cursor = row.sequence
                     data = RunEventRead.model_validate(row).model_dump_json()
-                    yield f"id: {row.sequence}\nevent: {row.event_type}\ndata: {data}\n\n"
+                    frames.append(f"id: {row.sequence}\nevent: {row.event_type}\ndata: {data}\n\n")
+            for frame in frames:
+                yield frame
             if time.monotonic() - last_keepalive >= 15:
                 yield ": keepalive\n\n"
                 last_keepalive = time.monotonic()

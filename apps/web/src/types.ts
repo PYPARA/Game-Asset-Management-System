@@ -91,6 +91,7 @@ export interface GameAsset {
   revisionContent: unknown;
   revisions: AssetRevision[];
   prompt: string;
+  upstreamOutputCount?: number;
   negativePrompt: string;
   model: string;
   recipe: string;
@@ -134,6 +135,7 @@ export interface JobSummary {
 
 export interface WorkbenchPayload {
   project: ProjectSummary;
+  projects?: ProjectSummary[];
   assets: GameAsset[];
   job: JobSummary;
 }
@@ -333,6 +335,9 @@ export interface GenerationTaskProposal {
   transparent: boolean;
   reference_task_id?: string | null;
   references: GenerationReferenceProposal[];
+  relation_target_mode?: "auto" | "none" | "task" | "asset";
+  relation_target_task_id?: string | null;
+  relation_target_asset_id?: string | null;
   target_path?: string | null;
   candidate_path?: string | null;
   locked_fields: string[];

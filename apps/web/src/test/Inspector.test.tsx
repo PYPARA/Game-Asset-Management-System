@@ -84,6 +84,26 @@ describe("类型化资产检查器", () => {
     expect(screen.getByAltText("姬宁·病重")).toHaveAttribute("src", "/ill.webp");
   });
 
+  it("立绘提示词展示原文并标注上游任务，而不是显示执行上下文标记", () => {
+    const portrait = asset({
+      kind: "media",
+      category: "portraits",
+      subtype: "portrait",
+      subtypeLabel: "角色立绘",
+      revisionFormat: "media",
+      preview: { kind: "image", images: ["/portrait.webp"], label: "媒体预览" },
+      prompt: "绘制许青枝中性立绘",
+      upstreamOutputCount: 1,
+      recipe: "unknown",
+    });
+    render(<Inspector asset={portrait} allAssets={[portrait]} onClose={noop} onEdit={noop} onNavigate={noop} onReview={noop} />);
+
+    expect(screen.getByRole("textbox", { name: "提示词" })).toHaveValue("绘制许青枝中性立绘");
+    expect(screen.getByText("已引用 1 项上游任务产物")).toBeInTheDocument();
+    expect(screen.getByText("方案内提示词")).toBeInTheDocument();
+    expect(screen.queryByText(/UPSTREAM_OUTPUTS/)).not.toBeInTheDocument();
+  });
+
   it("宽编辑抽屉校验只读 ID，并保存新的候选内容", async () => {
     const onSave = vi.fn().mockResolvedValue(undefined);
     const content = asset();

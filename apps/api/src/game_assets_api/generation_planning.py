@@ -13,6 +13,7 @@ import inspect
 import json
 import re
 import shutil
+from collections import Counter
 from collections.abc import AsyncIterable, Iterable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -258,6 +259,8 @@ def _planning_error(reason: Any, *, code: str | None = None) -> dict[str, Any]:
     if error_code is None:
         if "planning_provider_" in lowered:
             error_code = "provider_configuration"
+        elif "ephemeral_threads_unsupported" in lowered:
+            error_code = "ephemeral_unsupported"
         elif "invalid_json_schema" in lowered or "invalid schema for response_format" in lowered:
             error_code = "output_schema_invalid"
         elif any(token in lowered for token in ("login", "auth", "unauthorized", "401", "登录")):
@@ -272,7 +275,7 @@ def _planning_error(reason: Any, *, code: str | None = None) -> dict[str, Any]:
             error_code = "interrupted"
         elif "timed out" in lowered or "timeout" in lowered:
             error_code = "planning_timeout"
-        elif "transport" in lowered or "connection" in lowered:
+        elif any(token in lowered for token in ("transport", "connection", "error sending request", "network error")):
             error_code = "connection_lost"
         elif "paginated_threads" in lowered or "unknown thread" in lowered or "thread/resume" in lowered:
             error_code = "resume_incompatible"
@@ -283,6 +286,7 @@ def _planning_error(reason: Any, *, code: str | None = None) -> dict[str, Any]:
     messages = {
         "planning_timeout": "规划服务长时间没有返回事件，已保存现场；请检查供应商响应后继续。",
         "provider_configuration": detail.split(":", 1)[-1].strip(),
+        "ephemeral_unsupported": detail.split(":", 1)[-1].strip(),
         "auth_required": "规划供应商认证失败，请检查供应商凭据后重试。",
         "runtime_unavailable": "Codex 固定运行时当前不可用，请检查安装后重试。",
         "overloaded": "Codex 当前过载，本次内容已保留，可以直接重试。",
@@ -291,7 +295,7 @@ def _planning_error(reason: Any, *, code: str | None = None) -> dict[str, Any]:
         "output_schema_invalid": "Codex 结构化输出配置无效，请更新服务后重试。",
         "interrupted": "本轮已由用户停止，已有消息和草案仍然保留。",
         "process_restarted": "服务已重启，正在恢复刚才的规划；你的回答已保存。",
-        "connection_lost": "规划连接中断，已保存现场并等待恢复。",
+        "connection_lost": "规划供应商连接中断，已保存会话；请稍后重试。",
         "resume_incompatible": "原会话恢复协议不兼容，可以保留上下文继续规划。",
         "turn_failed": "规划回合未完成，可以重试或继续人工编辑。",
     }
@@ -884,6 +888,146 @@ def _validate_draft_settings(settings: dict[str, Any]) -> None:
             raise ServiceError(422, f"draft setting {key} must be between {minimum} and {maximum}")
 
 
+def _schema_from_examples(values: list[Any]) -> dict[str, Any] | None:
+    if not values:
+        return None
+    if all(isinstance(value, dict) for value in values):
+        keys = set(values[0])
+        if not keys or any(set(value) != keys for value in values):
+            return None
+        properties = {key: _schema_from_examples([value[key] for value in values]) for key in sorted(keys)}
+        if any(schema is None for schema in properties.values()):
+            return None
+        return {"type": "object", "properties": properties, "required": sorted(keys), "additionalProperties": False}
+    if all(isinstance(value, list) for value in values):
+        elements = [item for value in values for item in value]
+        items = _schema_from_examples(elements)
+        return {"type": "array", "items": items} if items is not None else None
+    for value_type, schema_type in ((bool, "boolean"), (int, "integer"), (float, "number"), (str, "string")):
+        if all(type(value) is value_type for value in values):
+            return {"type": schema_type}
+    return None
+
+
+def _infer_project_output_schema(
+    session: Session, project_id: str, kind: str, subtype: str,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    rows = session.execute(
+        select(Asset, AssetRevision)
+        .join(AssetRevision, Asset.current_revision_id == AssetRevision.id)
+        .where(
+            Asset.project_id == project_id,
+            Asset.kind == kind,
+            Asset.subtype == subtype,
+            Asset.content_status == "approved",
+            AssetRevision.review_status == "approved",
+            AssetRevision.format == "json",
+        )
+    ).all()
+    samples = [(asset, revision) for asset, revision in rows if isinstance(revision.content_json, dict)]
+    groups = Counter(tuple(sorted(revision.content_json)) for _, revision in samples)
+    if not groups:
+        return None
+    shape, count = groups.most_common(1)[0]
+    if count < 2 or list(groups.values()).count(count) != 1:
+        return None
+    cohort = sorted(
+        ((asset, revision) for asset, revision in samples if tuple(sorted(revision.content_json)) == shape),
+        key=lambda pair: pair[1].id,
+    )
+    schema = _schema_from_examples([revision.content_json for _, revision in cohort])
+    if schema is None:
+        return None
+    return schema, {
+        "kind": kind,
+        "subtype": subtype,
+        "sample_count": count,
+        "source_revision_ids": [revision.id for _, revision in cohort],
+    }
+
+
+def _default_text_target_path(proposal: GenerationAssetProposal) -> str:
+    key = proposal.key
+    assert key is not None
+    if proposal.kind == AssetKind.ENTITY and proposal.subtype in {"character", "item"}:
+        prefix = f"entity.{proposal.subtype}."
+        if key.startswith(prefix):
+            folder = "characters" if proposal.subtype == "character" else "items"
+            return f"production/{folder}/{key.removeprefix(prefix)}.json"
+    return f"production/generated/{key.replace('.', '/')}.json"
+
+
+def _relation_target_kind(task: GenerationTaskProposal, asset: Asset | None) -> str | None:
+    if task.kind not in {TaskKind.IMAGE, TaskKind.IMAGE_EDIT}:
+        return None
+    kind = asset.kind if asset is not None else task.asset.kind
+    subtype = asset.subtype if asset is not None else task.asset.subtype
+    if kind != AssetKind.MEDIA:
+        return None
+    return {"portrait": "character", "icon": "item"}.get(subtype)
+
+
+def _match_entity_key(media_key: str, media_subtype: str, entity_key: str, entity_subtype: str) -> bool:
+    media_prefix = "portrait." if media_subtype == "portrait" else "icon."
+    entity_prefix = f"entity.{entity_subtype}."
+    if not media_key.startswith(media_prefix) or not entity_key.startswith(entity_prefix):
+        return False
+    media_suffix = media_key.removeprefix(media_prefix)
+    entity_suffix = entity_key.removeprefix(entity_prefix)
+    return media_suffix == entity_suffix or (
+        media_subtype == "portrait" and media_suffix.startswith(f"{entity_suffix}.")
+    )
+
+
+def _resolve_draft_relation_targets(
+    draft: GenerationPlanningDraft, by_id: dict[str, Asset], project_id: str,
+) -> None:
+    entity_tasks: dict[str, list[GenerationTaskProposal]] = {"character": [], "item": []}
+    for task in draft.tasks:
+        asset = by_id.get(task.asset.asset_id) if task.asset.mode == "existing" else None
+        kind = asset.kind if asset is not None else task.asset.kind
+        subtype = asset.subtype if asset is not None else task.asset.subtype
+        if kind == AssetKind.ENTITY and subtype in entity_tasks:
+            entity_tasks[subtype].append(task)
+
+    for task in draft.tasks:
+        asset = by_id.get(task.asset.asset_id) if task.asset.mode == "existing" else None
+        target_kind = _relation_target_kind(task, asset)
+        mode = task.relation_target_mode
+        if target_kind is None:
+            if mode != "auto" or task.relation_target_task_id or task.relation_target_asset_id:
+                raise ServiceError(422, f"task {task.id} cannot link an entity from this asset type")
+            continue
+        if mode == "none":
+            task.relation_target_task_id = None
+            task.relation_target_asset_id = None
+        elif mode == "task":
+            target = next((candidate for candidate in entity_tasks[target_kind] if candidate.id == task.relation_target_task_id), None)
+            if target is None or target.id == task.id:
+                raise ServiceError(422, f"task {task.id} has an invalid {target_kind} relation target task")
+            task.relation_target_asset_id = None
+        elif mode == "asset":
+            target = by_id.get(task.relation_target_asset_id)
+            if target is None or target.project_id != project_id or target.kind != AssetKind.ENTITY or target.subtype != target_kind:
+                raise ServiceError(422, f"task {task.id} has an invalid project {target_kind} relation target asset")
+            task.relation_target_task_id = None
+        else:
+            candidates = entity_tasks[target_kind]
+            media_key = asset.key if asset is not None else task.asset.key or ""
+            media_subtype = asset.subtype if asset is not None else task.asset.subtype or ""
+            matches = [
+                candidate for candidate in candidates
+                if _match_entity_key(
+                    media_key, media_subtype,
+                    by_id[candidate.asset.asset_id].key if candidate.asset.mode == "existing" else candidate.asset.key or "",
+                    target_kind,
+                )
+            ]
+            target = matches[0] if len(matches) == 1 else candidates[0] if not matches and len(candidates) == 1 else None
+            task.relation_target_task_id = target.id if target is not None else None
+            task.relation_target_asset_id = None
+
+
 def validate_planning_draft(
     session: Session,
     project: Project,
@@ -906,6 +1050,7 @@ def validate_planning_draft(
     target_paths: dict[str, str] = {}
     existing_targets: dict[str, str] = {}
     unresolved_schema_questions: set[str] = set()
+    inferred_schemas: dict[tuple[str, str], tuple[dict[str, Any], dict[str, Any]] | None] = {}
     for rendition in session.scalars(select(Rendition)).all():
         if not rendition.target_path:
             continue
@@ -952,9 +1097,20 @@ def validate_planning_draft(
                     schema = store.read_schema(proposal.schema_ref)
                 except StorageError as exc:
                     raise ServiceError(422, f"task {task.id} schema is unavailable: {exc}") from exc
+            if schema is None and not (asset and asset.schema_ref) and not proposal.schema_ref:
+                kind = asset.kind if asset is not None else proposal.kind.value
+                subtype = asset.subtype if asset is not None else proposal.subtype
+                cache_key = (kind, subtype)
+                if cache_key not in inferred_schemas:
+                    inferred_schemas[cache_key] = _infer_project_output_schema(session, project.id, kind, subtype)
+                inferred = inferred_schemas[cache_key]
+                if inferred is not None:
+                    schema, provenance = inferred
+                    task.output_schema = schema
+                    task.metadata = {**task.metadata, "schema_autofill": provenance}
             if schema is None:
                 if for_confirm:
-                    raise ServiceError(422, f"task {task.id} requires a project JSON Schema before confirmation")
+                    raise ServiceError(422, f"task {task.id} needs an output structure; choose same-type reference assets or edit the structure")
                 unresolved_schema_questions.add(f"schema:{task.id}")
                 if f"schema:{task.id}" not in draft.questions:
                     draft.questions.append(f"schema:{task.id}")
@@ -966,6 +1122,19 @@ def validate_planning_draft(
                 except (TypeError, jsonschema.SchemaError) as exc:
                     raise ServiceError(422, f"task {task.id} has an invalid JSON Schema: {exc}") from exc
         else:
+            asset_kind = asset.kind if asset is not None else proposal.kind.value
+            asset_subtype = asset.subtype if asset is not None else proposal.subtype
+            prompt = task.prompt.lower()
+            asks_for_matte = any(term in prompt for term in ("抠像", "抠图", "去背", "去背景"))
+            has_key_or_alpha = any(term in prompt for term in ("绿幕", "色键", "#00ff66", "透明", "alpha"))
+            if (
+                task.kind == TaskKind.IMAGE
+                and asset_kind == AssetKind.MEDIA.value
+                and asset_subtype == "portrait"
+                and asks_for_matte
+                and has_key_or_alpha
+            ):
+                task.transparent = True
             if task.width is None or task.height is None:
                 if for_confirm:
                     raise ServiceError(422, f"task {task.id} requires width and height")
@@ -1043,9 +1212,28 @@ def validate_planning_draft(
         if task.reference_task_id and task.reference_task_id not in task.depends_on:
             raise ServiceError(422, f"image edit task {task.id} reference task must be a dependency")
 
+        autofill = task.metadata.get("target_path_autofill")
+        if task.kind == TaskKind.TEXT and asset is None and (
+            not task.target_path or (isinstance(autofill, dict) and task.target_path == autofill.get("path"))
+        ):
+            task.target_path = _default_text_target_path(proposal)
+            task.metadata = {
+                **task.metadata,
+                "target_path_autofill": {"asset_key": proposal.key, "path": task.target_path},
+            }
+        elif isinstance(autofill, dict) and task.target_path != autofill.get("path"):
+            task.metadata = {
+                key: value for key, value in task.metadata.items() if key != "target_path_autofill"
+            }
+
         if task.target_path:
             target = _ensure_relative_path(task.target_path, label=f"task {task.id} target_path", allow_empty=False)
             assert target is not None
+            if task.kind == TaskKind.TEXT:
+                if target.lower().endswith(".md"):
+                    target = f"{target[:-3]}.json"
+                elif not target.lower().endswith(".json"):
+                    raise ServiceError(422, f"text task {task.id} target_path must end in .json")
             if target.casefold().startswith("workspace/candidates/"):
                 raise ServiceError(422, f"task {task.id} target_path cannot be a candidate staging path")
             task.target_path = target
@@ -1075,6 +1263,8 @@ def validate_planning_draft(
             if not candidate.startswith("workspace/candidates/"):
                 raise ServiceError(422, f"task {task.id} candidate_path must stay under workspace/candidates")
             task.candidate_path = candidate
+
+    _resolve_draft_relation_targets(draft, by_id, project.id)
 
     # Questions generated by a previous validation pass should disappear once
     # the user supplies the missing schema.  Preserve all non-schema questions
@@ -1116,11 +1306,10 @@ def _event_payload(event: AgentEvent) -> dict[str, Any]:
 
 
 def _messages_from_events(events: Iterable[AgentEvent]) -> list[dict[str, Any]]:
-    """Return only the latest user instruction for the durable Codex thread.
+    """Return the latest user instruction for the next planning turn.
 
-    The SDK thread already owns prior model-visible history. Replaying every
-    persisted assistant message duplicated the full conversation on each turn
-    and caused prompt growth unrelated to the user's latest instruction.
+    Older dialogue is supplied through the bounded recovery summary and the
+    project-local conversation-history file, avoiding repeated prompt growth.
     """
 
     latest: dict[str, Any] | None = None
@@ -1600,10 +1789,6 @@ class GenerationPlanningRunner:
                 parameters = {}
             if "thread_id" in parameters:
                 plan_kwargs["thread_id"] = None
-                with self.session_factory() as read_session:
-                    current = read_session.get(AgentSession, session_id)
-                    if current is not None:
-                        plan_kwargs["thread_id"] = current.thread_id
             if "model" in parameters:
                 with self.session_factory() as read_session:
                     current = read_session.get(AgentSession, session_id)
@@ -1643,10 +1828,7 @@ class GenerationPlanningRunner:
                     if normalized is None:
                         continue
                     event_type, payload = normalized
-                    raw_thread_id = raw.get("thread_id") if isinstance(raw, dict) else None
-                    event_thread_id = raw_thread_id or payload.get("thread_id")
-                    if event_thread_id:
-                        row.thread_id = str(event_thread_id)
+                    # Ephemeral transport IDs are only meaningful within this turn.
                     if event_type == "user_input.requested":
                         raw_questions = payload.get("questions")
                         if not isinstance(raw_questions, list) or not 1 <= len(raw_questions) <= 3:
@@ -1908,13 +2090,14 @@ def create_generation_conversation(
 
 def list_generation_conversations(
     session: Session,
-    project_id: str | None = None,
+    project_id: str,
     *,
     include_archived: bool = False,
 ) -> list[AgentSession]:
-    statement = select(AgentSession).where(AgentSession.purpose == PLANNING_PURPOSE)
-    if project_id:
-        statement = statement.where(AgentSession.project_id == project_id)
+    statement = select(AgentSession).where(
+        AgentSession.purpose == PLANNING_PURPOSE,
+        AgentSession.project_id == project_id,
+    )
     if not include_archived:
         statement = statement.where(AgentSession.archived_at.is_(None))
     statement = statement.options(
@@ -2191,16 +2374,13 @@ def update_generation_draft(
 def _snapshot_catalog_files(store: ProjectStore) -> dict[Path, bytes]:
     """Capture catalog JSON files before a confirmation transaction.
 
-    Fresh projects contain only ``relations.json`` (which is maintained by the
-    relation index), so the snapshot must retain the catalog root separately;
-    otherwise a failed first asset registration would leave a new descriptor on
-    disk with no path to discover and remove.
+    The confirmation may register assets and portrait relations. Restore both
+    descriptors and the relation index if the database transaction fails.
     """
 
     return {
         path: path.read_bytes()
         for path in store.catalog.rglob("*.json")
-        if path.name != "relations.json"
     }
 
 
@@ -2208,7 +2388,6 @@ def _restore_catalog_files(store: ProjectStore, snapshot: dict[Path, bytes]) -> 
     current = {
         path
         for path in store.catalog.rglob("*.json")
-        if path.name != "relations.json"
     }
     # The snapshot is intentionally only used for paths that may be touched by
     # new asset registration.  Restore known files and remove newly-created
@@ -2345,6 +2524,59 @@ def _plan_payload_from_draft(
     return plan_payload, created
 
 
+def _link_planned_media(
+    session: Session, project: Project, draft: GenerationPlanningDraft, plan: GenerationPlanCreate,
+) -> None:
+    assets_by_task = {task.id: session.get(Asset, task.asset_id) for task in plan.tasks}
+    existing = {
+        (relation.source_asset_id, relation.target_asset_id, relation.relation_type)
+        for relation in session.scalars(
+            select(AssetRelation).where(AssetRelation.project_id == project.id)
+        ).all()
+    }
+    changed = False
+    for task in draft.tasks:
+        source = assets_by_task.get(task.id)
+        target_kind = _relation_target_kind(task, source)
+        if target_kind is None or source is None:
+            continue
+        target = (
+            assets_by_task.get(task.relation_target_task_id)
+            if task.relation_target_task_id else session.get(Asset, task.relation_target_asset_id)
+            if task.relation_target_asset_id else None
+        )
+        if target is None:
+            continue
+        relation_type = "depicts" if target_kind == "character" else "represents"
+        relation_key = (source.id, target.id, relation_type)
+        if relation_key in existing:
+            continue
+        session.add(AssetRelation(
+            id=new_id(), project_id=project.id, source_asset_id=source.id,
+            target_asset_id=target.id, relation_type=relation_type,
+            metadata_json={
+                "source": "generation_planning", "task_id": task.id,
+                "target_task_id": task.relation_target_task_id,
+            },
+        ))
+        existing.add(relation_key)
+        changed = True
+    if changed:
+        session.flush()
+        ProjectStore(project.root_path).write_relations([
+            {
+                "id": relation.id,
+                "source_asset_id": relation.source_asset_id,
+                "target_asset_id": relation.target_asset_id,
+                "relation_type": relation.relation_type,
+                "metadata": relation.metadata_json,
+            }
+            for relation in session.scalars(
+                select(AssetRelation).where(AssetRelation.project_id == project.id)
+            ).all()
+        ])
+
+
 def _asset_read_list(assets: Iterable[Asset]) -> list[Any]:
     from .domain import AssetRead
 
@@ -2407,6 +2639,7 @@ def confirm_generation_conversation(
         # and final commit still happen as one transaction, with the catalog
         # snapshot restored on any failure.
         plan_payload, created = _plan_payload_from_draft(session, project, draft)
+        _link_planned_media(session, project, draft, plan_payload)
         plan = create_plan(session, plan_payload, commit=False)
         session.flush()
         jobs = confirm_plan(
@@ -2470,10 +2703,14 @@ async def stream_generation_events(
             if row is None:
                 return
             events = get_generation_events(session, session_id, after_sequence=cursor)
-            for event in events:
-                cursor = max(cursor, event.sequence)
-                payload = __import__("json").dumps(_event_payload(event), ensure_ascii=False, separators=(",", ":"))
-                yield f"id: {event.sequence}\nevent: {event.event_type}\ndata: {payload}\n\n"
+            frames = [
+                (event.sequence, f"id: {event.sequence}\nevent: {event.event_type}\ndata: "
+                 + json.dumps(_event_payload(event), ensure_ascii=False, separators=(",", ":")) + "\n\n")
+                for event in events
+            ]
+        for sequence, frame in frames:
+            cursor = max(cursor, sequence)
+            yield frame
         now = asyncio.get_running_loop().time()
         if now - last_keepalive >= 15:
             yield ": keepalive\n\n"

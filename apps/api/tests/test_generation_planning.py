@@ -9,10 +9,11 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 from game_assets_api import generation_planning as planning
 from game_assets_api.codex_adapter import AppServerCodexAdapter, OfficialCodexAdapter, build_codex_adapter
-from game_assets_api.models import AgentInputRequest, AgentSession
+from game_assets_api.models import AgentInputRequest, AgentSession, Asset, AssetRelation, AssetRevision, Project
 from game_assets_api.services import ServiceError
 
 from .conftest import create_asset, create_fake_provider, create_project
@@ -79,6 +80,51 @@ def _conversation(client: TestClient, project_id: str) -> dict[str, Any]:
     )
     assert response.status_code == 201, response.text
     return response.json()
+
+
+def _approved_json_sample(client: TestClient, project_id: str, index: int, content: dict[str, Any]) -> None:
+    with client.app.state.database.sessions() as session:
+        asset_id = f"sample-asset-{project_id}-{index}"
+        revision_id = f"sample-revision-{project_id}-{index}"
+        session.add(Asset(
+            id=asset_id, project_id=project_id, key=f"entity.character.sample-{index}",
+            kind="entity", subtype="character", title=f"角色 {index}",
+            content_status="approved", current_revision_id=revision_id,
+        ))
+        session.add(AssetRevision(
+            id=revision_id, asset_id=asset_id, sequence=1, format="json",
+            content_json=content, content_hash="a" * 64, input_hash="b" * 64,
+            file_path=f"workspace/candidates/{revision_id}.json", review_status="approved",
+        ))
+        session.commit()
+
+
+def _character_text_task(provider_id: str) -> dict[str, Any]:
+    task = _image_task(provider_id=provider_id, task_id="character-xu-qingzhi")
+    task.update({
+        "kind": "text", "model": "fake-text", "schema": None,
+        "target_path": "production/characters/xu-qingzhi.md",
+        "asset": {
+            "mode": "new", "key": "entity.character.xu-qingzhi", "kind": "entity",
+            "subtype": "character", "title": "许青枝", "schema_ref": None,
+            "tags": [], "metadata": {},
+        },
+    })
+    for key in ("width", "height", "transparent", "candidate_path"):
+        task.pop(key, None)
+    return task
+
+
+def _item_text_task(provider_id: str, task_id: str, key: str) -> dict[str, Any]:
+    task = _character_text_task(provider_id)
+    task["id"] = task_id
+    task["asset"].update({"key": key, "subtype": "item", "title": task_id})
+    task["schema"] = {
+        "type": "object", "properties": {"name": {"type": "string"}},
+        "required": ["name"], "additionalProperties": False,
+    }
+    task["target_path"] = None
+    return task
 
 
 def _wait_for_status(client: TestClient, session_id: str, statuses: set[str]) -> dict[str, Any]:
@@ -732,6 +778,38 @@ def test_confirmation_rollback_removes_catalog_asset_when_plan_creation_fails(
     assert client.get(f"/api/generation-plans?project_id={project['id']}").json() == []
 
 
+def test_relation_and_assets_roll_back_when_confirmation_fails(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = create_project(client, client.app.state.settings.projects_root / "relation-rollback-game")
+    provider = create_fake_provider(client)
+    conversation = _conversation(client, project["id"])
+    item = _item_text_task(provider["id"], "item-edict", "entity.item.edict")
+    icon = _image_task(task_id="icon-edict", key="icon.edict", provider_id=provider["id"])
+    icon["asset"]["subtype"] = "icon"
+    draft = _draft(conversation, item)
+    draft["tasks"].append(icon)
+    updated = client.patch(
+        f"/api/generation-conversations/{conversation['id']}/draft",
+        json={"base_hash": conversation["draft_hash"], "draft": draft},
+    )
+    assert updated.status_code == 200, updated.text
+
+    def fail_confirm(*_args: Any, **_kwargs: Any) -> None:
+        raise ServiceError(503, "simulated controller failure")
+
+    monkeypatch.setattr(planning, "confirm_plan", fail_confirm)
+    response = client.post(
+        f"/api/generation-conversations/{conversation['id']}/confirm",
+        json={"draft_hash": updated.json()["draft_hash"]},
+    )
+    assert response.status_code == 503
+    assert client.get("/api/assets", params={"project_id": project["id"]}).json() == []
+    assert client.get("/api/relations", params={"project_id": project["id"]}).json() == []
+    relations = json.loads((Path(project["root_path"]) / "catalog/relations.json").read_text())
+    assert relations["relations"] == []
+
+
 def test_text_tasks_keep_missing_schema_as_a_question_until_confirmation(
     client: TestClient,
 ) -> None:
@@ -761,6 +839,7 @@ def test_text_tasks_keep_missing_schema_as_a_question_until_confirmation(
     }
     for key in ("width", "height", "transparent", "candidate_path"):
         task.pop(key, None)
+    task["target_path"] = "production/dialogue/chapter-01.json"
     draft = _draft(conversation, task)
     draft["settings"]["max_concurrency"] = 2
     response = client.patch(
@@ -775,7 +854,390 @@ def test_text_tasks_keep_missing_schema_as_a_question_until_confirmation(
         json={"draft_hash": updated["draft_hash"]},
     )
     assert confirmation.status_code == 422
-    assert "JSON Schema" in confirmation.text
+    assert "output structure" in confirmation.text
+
+
+def test_character_schema_is_inferred_from_project_majority_and_confirmed(client: TestClient) -> None:
+    project = create_project(client, client.app.state.settings.projects_root / "character-schema-game")
+    other = create_project(client, client.app.state.settings.projects_root / "other-schema-game")
+    provider = create_fake_provider(client)
+    for index in range(3):
+        _approved_json_sample(client, project["id"], index, {
+            "id": f"person-{index}", "name": f"人物 {index}", "age": 30 + index,
+            "tags": ["artisan"], "profile": {"craft": "pottery", "active": True},
+        })
+    for index in range(3, 5):
+        _approved_json_sample(client, project["id"], index, {"id": f"extra-{index}", "name": "简版", "role": "工匠"})
+    for index in range(4):
+        _approved_json_sample(client, other["id"], index, {"id": "foreign", "name": "外部", "foreign_field": 1})
+    conversation = _conversation(client, project["id"])
+    text_task = _character_text_task(provider["id"])
+    image_task = _image_task(provider_id=provider["id"], task_id="portrait-xu-qingzhi", key="portrait.xu-qingzhi.neutral")
+    text_task["depends_on"] = [image_task["id"]]
+    image_task["asset"]["subtype"] = "portrait"
+    image_task["asset"]["title"] = "许青枝·中性"
+    image_task["target_path"] = "public/assets/portraits/xu-qingzhi.webp"
+    image_task["prompt"] = "绘制许青枝肖像，绿幕背景；交付前抠像并导出透明 WebP。"
+    draft = _draft(conversation, text_task)
+    draft["tasks"].append(image_task)
+    draft["questions"] = ["schema:character-xu-qingzhi"]
+
+    response = client.patch(
+        f"/api/generation-conversations/{conversation['id']}/draft",
+        json={"base_hash": conversation["draft_hash"], "draft": draft},
+    )
+    assert response.status_code == 200, response.text
+    updated = response.json()
+    generated = updated["draft"]["tasks"][0]
+    assert generated["target_path"] == "production/characters/xu-qingzhi.json"
+    assert generated["schema"]["required"] == ["age", "id", "name", "profile", "tags"]
+    assert generated["schema"]["properties"]["profile"]["properties"]["active"] == {"type": "boolean"}
+    assert generated["schema"]["properties"]["tags"]["items"] == {"type": "string"}
+    assert generated["schema"]["additionalProperties"] is False
+    assert generated["metadata"]["schema_autofill"]["sample_count"] == 3
+    assert "schema:character-xu-qingzhi" not in updated["draft"]["questions"]
+    assert generated["asset"]["schema_ref"] is None
+    assert updated["draft"]["tasks"][1]["transparent"] is True
+    with client.app.state.database.sessions() as session:
+        row = session.get(AgentSession, conversation["id"])
+        project_row = session.get(Project, project["id"])
+        assert planning.validate_planning_draft(session, project_row, row.draft_json, context_hash=row.context_hash) == row.draft_json
+
+    confirmation = client.post(
+        f"/api/generation-conversations/{conversation['id']}/confirm",
+        json={"draft_hash": updated["draft_hash"]},
+    )
+    assert confirmation.status_code == 200, confirmation.text
+    assert len(confirmation.json()["jobs"]) == 2
+    with client.app.state.database.sessions() as session:
+        relation = session.scalar(select(AssetRelation).where(AssetRelation.project_id == project["id"]))
+        assert relation is not None
+        assert relation.relation_type == "depicts"
+        created_by_key = {asset.key: asset.id for asset in session.scalars(select(Asset).where(Asset.project_id == project["id"])).all()}
+        assert relation.source_asset_id == created_by_key["portrait.xu-qingzhi.neutral"]
+        assert relation.target_asset_id == created_by_key["entity.character.xu-qingzhi"]
+
+
+def test_portrait_green_screen_matte_request_enables_transparency(client: TestClient) -> None:
+    project = create_project(client, client.app.state.settings.projects_root / "green-screen-portrait-game")
+    provider = create_fake_provider(client)
+    conversation = _conversation(client, project["id"])
+    image_task = _image_task(provider_id=provider["id"], task_id="portrait-princess", key="portrait.princess.neutral")
+    image_task["asset"]["subtype"] = "portrait"
+    image_task["prompt"] = "均匀的 #00FF66 绿幕背景；输出供后续抠图与 WebP 归一化的 PNG 源图。"
+    draft = _draft(conversation, image_task)
+
+    response = client.patch(
+        f"/api/generation-conversations/{conversation['id']}/draft",
+        json={"base_hash": conversation["draft_hash"], "draft": draft},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["draft"]["tasks"][0]["transparent"] is True
+
+
+def test_new_item_text_target_is_autofilled_and_can_be_confirmed(client: TestClient) -> None:
+    project = create_project(client, client.app.state.settings.projects_root / "item-target-game")
+    provider = create_fake_provider(client)
+    conversation = _conversation(client, project["id"])
+    item = _character_text_task(provider["id"])
+    item["id"] = "item_edict"
+    item["asset"].update({"key": "entity.item.artifact-51", "subtype": "item", "title": "圣旨"})
+    item["schema"] = {
+        "type": "object", "properties": {"name": {"type": "string"}},
+        "required": ["name"], "additionalProperties": False,
+    }
+    item["target_path"] = None
+    icon = _image_task(
+        task_id="icon_edict", key="icon.artifact-51", provider_id=provider["id"],
+        target_path="approved/assets/icons/artifact-51.webp",
+    )
+    icon["asset"]["subtype"] = "icon"
+    item["depends_on"] = [icon["id"]]
+    draft = _draft(conversation, item)
+    draft["tasks"].append(icon)
+
+    response = client.patch(
+        f"/api/generation-conversations/{conversation['id']}/draft",
+        json={"base_hash": conversation["draft_hash"], "draft": draft},
+    )
+    assert response.status_code == 200, response.text
+    updated = response.json()
+    saved_item = updated["draft"]["tasks"][0]
+    assert saved_item["target_path"] == "production/items/artifact-51.json"
+    assert saved_item["metadata"]["target_path_autofill"] == {
+        "asset_key": "entity.item.artifact-51", "path": "production/items/artifact-51.json",
+    }
+    assert updated["draft"]["tasks"][1]["relation_target_task_id"] == "item_edict"
+    with client.app.state.database.sessions() as session:
+        row = session.get(AgentSession, conversation["id"])
+        project_row = session.get(Project, project["id"])
+        assert planning.validate_planning_draft(session, project_row, row.draft_json, context_hash=row.context_hash) == row.draft_json
+        renamed = deepcopy(row.draft_json)
+        renamed["tasks"][0]["asset"]["key"] = "entity.item.artifact-52"
+        refreshed = planning.validate_planning_draft(session, project_row, renamed, context_hash=row.context_hash)
+        assert refreshed["tasks"][0]["target_path"] == "production/items/artifact-52.json"
+        manual = deepcopy(row.draft_json)
+        manual["tasks"][0]["target_path"] = "production/custom/edict.json"
+        preserved = planning.validate_planning_draft(session, project_row, manual, context_hash=row.context_hash)
+        assert preserved["tasks"][0]["target_path"] == "production/custom/edict.json"
+        assert "target_path_autofill" not in preserved["tasks"][0]["metadata"]
+
+    confirmation = client.post(
+        f"/api/generation-conversations/{conversation['id']}/confirm",
+        json={"draft_hash": updated["draft_hash"]},
+    )
+    assert confirmation.status_code == 200, confirmation.text
+    assert len(confirmation.json()["jobs"]) == 2
+    created = {asset["key"]: asset["id"] for asset in confirmation.json()["created_assets"]}
+    with client.app.state.database.sessions() as session:
+        relations = session.scalars(select(AssetRelation).where(AssetRelation.project_id == project["id"])).all()
+        assert [(row.source_asset_id, row.target_asset_id, row.relation_type) for row in relations] == [
+            (created["icon.artifact-51"], created["entity.item.artifact-51"], "represents")
+        ]
+    repeated = client.post(
+        f"/api/generation-conversations/{conversation['id']}/confirm",
+        json={"draft_hash": updated["draft_hash"]},
+    )
+    assert repeated.status_code == 200, repeated.text
+    assert len(client.get("/api/relations", params={"project_id": project["id"]}).json()) == 1
+
+
+def test_media_relation_auto_matches_keys_and_leaves_ambiguous_media_unlinked(client: TestClient) -> None:
+    project = create_project(client, client.app.state.settings.projects_root / "relation-auto-game")
+    provider = create_fake_provider(client)
+    conversation = _conversation(client, project["id"])
+    first = _item_text_task(provider["id"], "item-a", "entity.item.artifact-51")
+    second = _item_text_task(provider["id"], "item-b", "entity.item.artifact-52")
+    matched = _image_task(
+        task_id="icon-a", key="icon.artifact-51", provider_id=provider["id"],
+        target_path="approved/assets/icons/artifact-51.webp",
+    )
+    ambiguous = _image_task(
+        task_id="icon-unknown", key="icon.unmatched", provider_id=provider["id"],
+        target_path="approved/assets/icons/unmatched.webp",
+    )
+    for icon in (matched, ambiguous):
+        icon["asset"]["subtype"] = "icon"
+    draft = _draft(conversation, first)
+    draft["tasks"].extend([second, matched, ambiguous])
+    updated = client.patch(
+        f"/api/generation-conversations/{conversation['id']}/draft",
+        json={"base_hash": conversation["draft_hash"], "draft": draft},
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["draft"]["tasks"][2]["relation_target_task_id"] == "item-a"
+    assert updated.json()["draft"]["tasks"][3]["relation_target_task_id"] is None
+    confirmed = client.post(
+        f"/api/generation-conversations/{conversation['id']}/confirm",
+        json={"draft_hash": updated.json()["draft_hash"]},
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    assert len(client.get("/api/relations", params={"project_id": project["id"]}).json()) == 1
+
+
+def test_media_relation_manual_task_and_none_override_auto(client: TestClient) -> None:
+    project = create_project(client, client.app.state.settings.projects_root / "relation-manual-game")
+    provider = create_fake_provider(client)
+    conversation = _conversation(client, project["id"])
+    first = _item_text_task(provider["id"], "item-a", "entity.item.artifact-51")
+    second = _item_text_task(provider["id"], "item-b", "entity.item.artifact-52")
+    manual = _image_task(task_id="icon-a", key="icon.artifact-51", provider_id=provider["id"])
+    no_link = _image_task(task_id="icon-b", key="icon.artifact-52", provider_id=provider["id"], target_path="approved/assets/icons/other.webp")
+    for icon in (manual, no_link):
+        icon["asset"]["subtype"] = "icon"
+    manual.update({"relation_target_mode": "task", "relation_target_task_id": "item-b"})
+    no_link.update({"relation_target_mode": "none", "relation_target_task_id": "item-a"})
+    draft = _draft(conversation, first)
+    draft["tasks"].extend([second, manual, no_link])
+    updated = client.patch(
+        f"/api/generation-conversations/{conversation['id']}/draft",
+        json={"base_hash": conversation["draft_hash"], "draft": draft},
+    )
+    assert updated.status_code == 200, updated.text
+    tasks = updated.json()["draft"]["tasks"]
+    assert tasks[2]["relation_target_task_id"] == "item-b"
+    assert tasks[3]["relation_target_task_id"] is None
+    confirmed = client.post(
+        f"/api/generation-conversations/{conversation['id']}/confirm",
+        json={"draft_hash": updated.json()["draft_hash"]},
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    created = {asset["key"]: asset["id"] for asset in confirmed.json()["created_assets"]}
+    relations = client.get("/api/relations", params={"project_id": project["id"]}).json()
+    assert [(row["source_asset_id"], row["target_asset_id"], row["relation_type"]) for row in relations] == [
+        (created["icon.artifact-51"], created["entity.item.artifact-52"], "represents")
+    ]
+
+
+def test_media_relation_existing_asset_is_explicit_and_project_scoped(client: TestClient) -> None:
+    project = create_project(client, client.app.state.settings.projects_root / "relation-existing-game")
+    other = create_project(client, client.app.state.settings.projects_root / "relation-foreign-game")
+    provider = create_fake_provider(client)
+    target = create_asset(client, project["id"], key="entity.item.existing", subtype="item")
+    foreign = create_asset(client, other["id"], key="entity.item.foreign", subtype="item")
+    conversation = _conversation(client, project["id"])
+    icon = _image_task(task_id="icon-new", key="icon.new", provider_id=provider["id"])
+    icon["asset"]["subtype"] = "icon"
+    icon.update({"relation_target_mode": "asset", "relation_target_asset_id": foreign["id"]})
+    rejected = client.patch(
+        f"/api/generation-conversations/{conversation['id']}/draft",
+        json={"base_hash": conversation["draft_hash"], "draft": _draft(conversation, icon)},
+    )
+    assert rejected.status_code == 422
+    icon["relation_target_asset_id"] = target["id"]
+    updated = client.patch(
+        f"/api/generation-conversations/{conversation['id']}/draft",
+        json={"base_hash": conversation["draft_hash"], "draft": _draft(conversation, icon)},
+    )
+    assert updated.status_code == 200, updated.text
+    confirmed = client.post(
+        f"/api/generation-conversations/{conversation['id']}/confirm",
+        json={"draft_hash": updated.json()["draft_hash"]},
+    )
+    assert confirmed.status_code == 200, confirmed.text
+    relations = client.get("/api/relations", params={"project_id": project["id"]}).json()
+    assert len(relations) == 1
+    assert relations[0]["target_asset_id"] == target["id"]
+
+
+def test_text_target_autofill_preserves_manual_path_and_checks_conflicts(client: TestClient) -> None:
+    project = create_project(client, client.app.state.settings.projects_root / "item-target-conflict-game")
+    provider = create_fake_provider(client)
+    conversation = _conversation(client, project["id"])
+    item = _character_text_task(provider["id"])
+    item["id"] = "item_edict"
+    item["asset"].update({"key": "entity.item.artifact-51", "subtype": "item", "title": "圣旨"})
+    item["schema"] = {
+        "type": "object", "properties": {"name": {"type": "string"}},
+        "required": ["name"], "additionalProperties": False,
+    }
+    item["target_path"] = "production/custom/edict.json"
+    response = client.patch(
+        f"/api/generation-conversations/{conversation['id']}/draft",
+        json={"base_hash": conversation["draft_hash"], "draft": _draft(conversation, item)},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["draft"]["tasks"][0]["target_path"] == "production/custom/edict.json"
+    assert "target_path_autofill" not in response.json()["draft"]["tasks"][0]["metadata"]
+
+    icon = _image_task(
+        task_id="icon_edict", key="icon.artifact-51", provider_id=provider["id"],
+        target_path="production/items/artifact-51.json",
+    )
+    item["target_path"] = None
+    conflict = _draft(conversation, icon)
+    conflict["tasks"].append(item)
+    response = client.patch(
+        f"/api/generation-conversations/{conversation['id']}/draft",
+        json={"base_hash": response.json()["draft_hash"], "draft": conflict},
+    )
+    assert response.status_code == 409
+    assert "target path is used by tasks" in response.text
+
+
+def test_schema_autofill_preserves_explicit_schema_and_rejects_ambiguous_samples(client: TestClient) -> None:
+    project = create_project(client, client.app.state.settings.projects_root / "ambiguous-schema-game")
+    provider = create_fake_provider(client)
+    for index in range(2):
+        _approved_json_sample(client, project["id"], index, {"id": "person", "name": "甲", "age": 30})
+    for index in range(2, 4):
+        _approved_json_sample(client, project["id"], index, {"id": "person", "name": "乙", "role": "工匠"})
+    conversation = _conversation(client, project["id"])
+    task = _character_text_task(provider["id"])
+    response = client.patch(
+        f"/api/generation-conversations/{conversation['id']}/draft",
+        json={"base_hash": conversation["draft_hash"], "draft": _draft(conversation, task)},
+    )
+    assert response.status_code == 200, response.text
+    unresolved = response.json()
+    assert unresolved["draft"]["tasks"][0]["schema"] is None
+    assert "schema:character-xu-qingzhi" in unresolved["draft"]["questions"]
+
+    explicit = {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"], "additionalProperties": False}
+    manual = deepcopy(unresolved["draft"])
+    manual["tasks"][0]["schema"] = explicit
+    response = client.patch(
+        f"/api/generation-conversations/{conversation['id']}/draft",
+        json={"base_hash": unresolved["draft_hash"], "draft": manual},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["draft"]["tasks"][0]["schema"] == explicit
+    assert response.json()["draft"]["tasks"][0]["metadata"].get("schema_autofill") is None
+
+
+def test_schema_autofill_needs_consistent_samples_and_checks_normalized_paths(client: TestClient) -> None:
+    project = create_project(client, client.app.state.settings.projects_root / "conflicting-schema-game")
+    provider = create_fake_provider(client)
+    _approved_json_sample(client, project["id"], 0, {"id": "person", "age": 30})
+    _approved_json_sample(client, project["id"], 1, {"id": "person", "age": "unknown"})
+    conversation = _conversation(client, project["id"])
+    task = _character_text_task(provider["id"])
+    response = client.patch(
+        f"/api/generation-conversations/{conversation['id']}/draft",
+        json={"base_hash": conversation["draft_hash"], "draft": _draft(conversation, task)},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["draft"]["tasks"][0]["schema"] is None
+
+    explicit = {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"], "additionalProperties": False}
+    task["schema"] = explicit
+    duplicate = deepcopy(task)
+    duplicate["id"] = "character-xu-qingzhi-copy"
+    duplicate["asset"]["key"] = "entity.character.xu-qingzhi-copy"
+    duplicate["target_path"] = "production/characters/xu-qingzhi.json"
+    conflict = _draft(conversation, task)
+    conflict["tasks"].append(duplicate)
+    response = client.patch(
+        f"/api/generation-conversations/{conversation['id']}/draft",
+        json={"base_hash": response.json()["draft_hash"], "draft": conflict},
+    )
+    assert response.status_code == 409
+    assert "target path" in response.text
+
+
+def test_schema_autofill_requires_two_samples_and_preserves_project_schema_ref(client: TestClient) -> None:
+    root = client.app.state.settings.projects_root / "explicit-schema-game"
+    project = create_project(client, root)
+    provider = create_fake_provider(client)
+    _approved_json_sample(client, project["id"], 0, {"name": "人物", "age": 30})
+    conversation = _conversation(client, project["id"])
+    task = _character_text_task(provider["id"])
+    response = client.patch(
+        f"/api/generation-conversations/{conversation['id']}/draft",
+        json={"base_hash": conversation["draft_hash"], "draft": _draft(conversation, task)},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["draft"]["tasks"][0]["schema"] is None
+
+    explicit = {"type": "object", "properties": {"title": {"type": "string"}}, "required": ["title"], "additionalProperties": False}
+    (root / "schemas").mkdir(exist_ok=True)
+    (root / "schemas" / "character.json").write_text(json.dumps(explicit), encoding="utf-8")
+    task["asset"]["schema_ref"] = "character.json"
+    response = client.patch(
+        f"/api/generation-conversations/{conversation['id']}/draft",
+        json={"base_hash": response.json()["draft_hash"], "draft": _draft(conversation, task)},
+    )
+    assert response.status_code == 200, response.text
+    saved_task = response.json()["draft"]["tasks"][0]
+    assert saved_task["schema"] is None
+    assert saved_task["asset"]["schema_ref"] == "character.json"
+    assert saved_task["metadata"].get("schema_autofill") is None
+
+
+def test_text_target_rejects_other_extensions(client: TestClient) -> None:
+    project = create_project(client, client.app.state.settings.projects_root / "text-extension-game")
+    provider = create_fake_provider(client)
+    conversation = _conversation(client, project["id"])
+    task = _character_text_task(provider["id"])
+    task["schema"] = {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"], "additionalProperties": False}
+    task["target_path"] = "production/characters/xu-qingzhi.txt"
+    response = client.patch(
+        f"/api/generation-conversations/{conversation['id']}/draft",
+        json={"base_hash": conversation["draft_hash"], "draft": _draft(conversation, task)},
+    )
+    assert response.status_code == 422
+    assert "must end in .json" in response.text
 
 
 def test_context_and_settings_staleness_are_rejected(client: TestClient) -> None:
@@ -955,6 +1417,66 @@ def test_generation_conversation_lifecycle_and_reference_context(client: TestCli
     rescanned = client.post(f"/api/projects/{project['id']}/scan")
     assert rescanned.status_code == 200, rescanned.text
     assert rescanned.json()["errors"] == []
+
+
+def test_generation_conversations_are_listed_per_project(client: TestClient) -> None:
+    first = create_project(client, client.app.state.settings.projects_root / "first-game")
+    second = create_project(client, client.app.state.settings.projects_root / "second-game")
+    first_chat = _conversation(client, first["id"])
+    second_chat = _conversation(client, second["id"])
+
+    assert client.get("/api/generation-conversations").status_code == 422
+    assert client.get("/api/generation-conversations?project_id=").status_code == 422
+    first_list = client.get(f"/api/generation-conversations?project_id={first['id']}")
+    second_list = client.get(f"/api/generation-conversations?project_id={second['id']}")
+    assert [item["id"] for item in first_list.json()] == [first_chat["id"]]
+    assert [item["id"] for item in second_list.json()] == [second_chat["id"]]
+
+    archived = client.post(f"/api/generation-conversations/{second_chat['id']}/archive")
+    assert archived.status_code == 200
+    assert client.get(f"/api/generation-conversations?project_id={second['id']}").json() == []
+    assert [item["id"] for item in client.get(
+        f"/api/generation-conversations?project_id={second['id']}&include_archived=true"
+    ).json()] == [second_chat["id"]]
+    assert [item["id"] for item in client.get(
+        f"/api/generation-conversations?project_id={first['id']}"
+    ).json()] == [first_chat["id"]]
+
+
+def test_legacy_thread_id_is_not_attached_to_new_planning_events(client: TestClient) -> None:
+    project = create_project(client, client.app.state.settings.projects_root / "legacy-thread-game")
+    conversation = _conversation(client, project["id"])
+    with client.app.state.database.sessions() as session:
+        row = session.get(AgentSession, conversation["id"])
+        row.thread_id = "old-persistent-thread"
+        session.commit()
+        event = planning.record_agent_event(session, row, "user.message", data={"content": "继续"})
+        assert event.thread_id is None
+        assert row.thread_id == "old-persistent-thread"
+
+
+def test_legacy_codex_thread_is_untouched_by_conversation_lifecycle(client: TestClient) -> None:
+    project = create_project(client, client.app.state.settings.projects_root / "legacy-lifecycle-game")
+    conversation = _conversation(client, project["id"])
+    with client.app.state.database.sessions() as session:
+        row = session.get(AgentSession, conversation["id"])
+        row.thread_id = "old-persistent-thread"
+        session.commit()
+
+    actions: list[tuple[Any, ...]] = []
+
+    async def unexpected_action(*args: Any, **_kwargs: Any) -> None:
+        actions.append(args)
+
+    client.app.state.codex_adapter = SimpleNamespace(
+        archive_thread=unexpected_action,
+        unarchive_thread=unexpected_action,
+        delete_thread=unexpected_action,
+    )
+    assert client.post(f"/api/generation-conversations/{conversation['id']}/archive").status_code == 200
+    assert client.post(f"/api/generation-conversations/{conversation['id']}/unarchive").status_code == 200
+    assert client.delete(f"/api/generation-conversations/{conversation['id']}").status_code == 204
+    assert actions == []
 
 
 def test_document_source_hash_alias_is_canonicalized_without_accepting_stale_hashes():

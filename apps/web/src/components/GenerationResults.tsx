@@ -1,6 +1,6 @@
 import { SelectMenu } from "./SelectMenu";
-import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useEffect, useRef, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { CheckCircle } from "@phosphor-icons/react";
 import { createRunRemediation, fetchRunInspection, runEvidenceUrl } from "../lib/api";
 import type { GenerationBatch, GameAsset } from "../types";
@@ -8,9 +8,23 @@ import { GenerationAssetPreview } from "./GenerationAssetPreview";
 import { RunInspectorDrawer } from "./RunInspectorDrawer";
 const labels: Record<string,string> = { queued:"排队中",running:"生成中",confirmed:"已确认",hard_qa:"质量检查",candidate_ready:"生成成功 · 待批准",succeeded:"已完成",completed:"已完成",failed:"失败",qa_failed:"QA 未通过",awaiting_user:"执行已暂停",credentials_locked:"等待解锁凭据",output_received:"产物已接收",cancelled:"已取消" };
 export function GenerationResults({ batches, assets, onOpenAsset }: { batches: GenerationBatch[]; assets: GameAsset[]; onOpenAsset?: (id:string)=>void }) {
+  const queryClient = useQueryClient();
+  const refreshedCandidates = useRef(new Set<string>());
   const [selected, setSelected] = useState<string | null>(null);
   const batch = batches.find(x=>x.plan_id === selected) ?? batches.at(-1);
   const query = useQuery({ queryKey:["generation-result",batch?.plan_id], queryFn:()=>fetchRunInspection(batch!.plan_id), enabled:!!batch, refetchInterval:3000 });
+  useEffect(() => {
+    const stale = query.data?.jobs.filter(job => {
+      if (!job.result_revision_id || !job.request.asset_id) return false;
+      const asset = assets.find(item => item.id === job.request.asset_id);
+      if (asset?.candidateRevisionId === job.result_revision_id || asset?.approvedRevisionId === job.result_revision_id) return false;
+      const key = `${job.id}:${job.result_revision_id}`;
+      if (refreshedCandidates.current.has(key)) return false;
+      refreshedCandidates.current.add(key);
+      return true;
+    });
+    if (stale?.length) void queryClient.invalidateQueries({queryKey:["workbench"]});
+  }, [assets, query.data, queryClient]);
   const [inspect, setInspect] = useState(false);
   const [recovering, setRecovering] = useState<string | null>(null);
   const [recoveryError, setRecoveryError] = useState("");
@@ -36,7 +50,9 @@ export function GenerationResults({ batches, assets, onOpenAsset }: { batches: G
     {query.data?.jobs.map(job=>{
       const asset=assets.find(x=>x.id===job.request.asset_id);
       const approved = asset?.reviewStatus === "approved" && !asset.candidateRevisionId;
-      const candidate=query.data!.evidence.find(e=>e.job_id===job.id && e.kind==="candidate" && e.media_type?.startsWith("image/") && e.path);
+      const candidate=query.data!.evidence.find(e=>
+        e.job_id===job.id && e.revision_id===job.result_revision_id && e.kind==="candidate" && e.media_type?.startsWith("image/") && e.path,
+      );
       const currentLabel = approved && job.status === "candidate_ready" ? "生成成功 · 已批准" : labels[job.status] ?? job.status;
       return <article className="generation-result-card" key={job.id}><header><strong>{asset?.name ?? job.task_id}</strong><span>{job.blocking_reason && ["queued", "running"].includes(job.status) ? "正在重试" : currentLabel}</span></header><progress max={100} value={job.progress} aria-label={`${job.task_id}进度`} />
         {job.status === "candidate_ready" && <div className="generation-candidate-ready" role="status"><CheckCircle size={20} weight="fill" /><span><strong>{approved ? "生成、QA 与批准均已完成" : "生成与 QA 已完成"}</strong><small>{approved ? "资产已晋升为不可变批准版本，可加入 Release 后执行交付。" : "当前产物是待批准候选；批准后才会进入可发布资产。"}</small></span></div>}
@@ -45,7 +61,7 @@ export function GenerationResults({ batches, assets, onOpenAsset }: { batches: G
         {job.recovery_eligible && <button type="button" className="button primary" disabled={!!recovering} onClick={()=>void recover(job.id, job.attempt_count)}>{recovering === job.id ? "正在恢复…" : "继续执行已确认任务"}</button>}
         <div className="generation-result-actions">
           {job.result_revision_id && asset && <button type="button" className="button secondary" onClick={()=>setPreview({asset,revisionId:job.result_revision_id})}>查看候选大图与版本</button>}
-          {job.result_revision_id && asset && onOpenAsset && <button className="button primary" type="button" onClick={()=>onOpenAsset(asset.id)}>{approved ? "查看已批准资产" : "前往资产库批准候选"}</button>}
+          {job.result_revision_id && job.request.asset_id && onOpenAsset && <button className="button primary" type="button" onClick={()=>onOpenAsset(job.request.asset_id)}>{approved ? "查看已批准资产" : "前往资产库批准候选"}</button>}
         </div>
         <details><summary>生成与 QA 详情</summary><p>{String(job.provider_snapshot.model ?? job.request.model ?? "")} · 尝试 {job.attempt_count} 次</p><p>{labels[["awaiting_user", "failed", "credentials_locked"].includes(job.status) ? job.status : job.stage] ?? job.stage}</p>{query.data!.findings.filter(x=>x.job_id===job.id).map(x=><p key={x.id}>{x.code}</p>)}</details>
       </article>;

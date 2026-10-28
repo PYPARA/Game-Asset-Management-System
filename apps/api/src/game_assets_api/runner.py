@@ -449,9 +449,64 @@ class JobRunner:
             for task_id in dependencies
         )
 
+    def _recover_blocked_dependents(self, session: Session) -> None:
+        """Requeue untouched jobs once every formerly blocked input is ready."""
+
+        blocked_jobs = session.scalars(
+            select(GenerationJob).where(
+                GenerationJob.status == GenerationStatus.AWAITING_USER.value,
+                GenerationJob.error_category == ErrorCategory.VALIDATION.value,
+                GenerationJob.attempt_count == 0,
+                GenerationJob.pending_action_id.is_(None),
+                GenerationJob.cancel_requested.is_(False),
+            )
+        ).all()
+        for job in blocked_jobs:
+            dependencies = list(job.request_json.get("depends_on", []))
+            if not dependencies or job.error_message not in {
+                f"dependency {task_id} requires attention" for task_id in dependencies
+            }:
+                continue
+            upstream = {
+                row.task_id: row for row in session.scalars(
+                    select(GenerationJob).where(
+                        GenerationJob.plan_id == job.plan_id,
+                        GenerationJob.task_id.in_(dependencies),
+                    )
+                ).all()
+            }
+            if not all(
+                task_id in upstream
+                and upstream[task_id].status in READY_DEPENDENCY_STATUSES
+                and upstream[task_id].result_revision_id
+                for task_id in dependencies
+            ):
+                continue
+            job.status = GenerationStatus.QUEUED.value
+            job.error_category = None
+            job.error_message = None
+            job.updated_at = utcnow()
+            asset = session.get(Asset, str(job.request_json.get("asset_id")))
+            if asset:
+                asset.generation_status = job.status
+            plan = session.get(GenerationPlan, job.plan_id)
+            if plan:
+                refresh_plan_status(session, plan)
+            record_run_event(
+                session,
+                plan_id=job.plan_id,
+                project_id=job.project_id,
+                job_id=job.id,
+                asset_id=str(job.request_json.get("asset_id")),
+                event_type="run.resumed",
+                stage=job.stage,
+                data={"reason": "dependencies recovered"},
+            )
+
     def _claim_ready_jobs(self, *, limit: int = 64) -> list[tuple[str, str]]:
         with self.sessions() as session:
             self._expire_stale_leases(session)
+            self._recover_blocked_dependents(session)
             now = utcnow()
             active_jobs = list(
                 session.scalars(
@@ -662,7 +717,8 @@ class JobRunner:
                 }
             )
         request["upstream_outputs"] = upstream
-        prompt = str(request.get("prompt", ""))
+        source_prompt = str(request.get("prompt", ""))
+        prompt = source_prompt
         if upstream:
             prompt += "\n\n[UPSTREAM_OUTPUTS]\n" + json.dumps(
                 upstream, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -670,12 +726,16 @@ class JobRunner:
         if action:
             parameters = action.parameters_json
             if isinstance(parameters.get("prompt"), str):
-                prompt = str(parameters["prompt"])
+                source_prompt = str(parameters["prompt"])
+                prompt = source_prompt
             if isinstance(parameters.get("prompt_suffix"), str):
-                prompt += "\n" + str(parameters["prompt_suffix"])
+                suffix = "\n" + str(parameters["prompt_suffix"])
+                source_prompt += suffix
+                prompt += suffix
             if action.action == RemediationKind.IMAGE_EDIT.value:
                 request["kind"] = TaskKind.IMAGE_EDIT.value
         request["prompt"] = prompt
+        request["source_prompt"] = source_prompt
 
         reference_path = request.get("reference_path")
         reference_task_id = request.get("reference_task_id")
@@ -1402,7 +1462,7 @@ class JobRunner:
                     asset_id=asset.id,
                     format=RevisionFormat.MEDIA,
                     content={
-                        "prompt": request["prompt"],
+                        "prompt": request.get("source_prompt", job.request_json.get("prompt", "")),
                         "width": info["width"],
                         "height": info["height"],
                         "color_key_removed": info["color_key_removed"],
@@ -1877,6 +1937,8 @@ class JobRunner:
             }
             content = dict(parent_revision.content_json) if isinstance(parent_revision.content_json, dict) else {}
             content["rendition"] = rendition_data
+            if "color_key_removed" in info:
+                content["color_key_removed"] = info["color_key_removed"]
             content["remediation"] = {
                 "action_id": action.id,
                 "strategy": action.strategy,
@@ -1929,7 +1991,11 @@ class JobRunner:
                     rendition_id=rendition.id,
                     expected_width=job.request_json.get("width"),
                     expected_height=job.request_json.get("height"),
-                    require_alpha=bool(job.request_json.get("transparent")),
+                    require_alpha=(
+                        bool(job.request_json.get("transparent"))
+                        or action.strategy in {"color_key", "smart_matte"}
+                        or bool(parameters.get("transparent"))
+                    ),
                     max_bytes=job.request_json.get("max_bytes"),
                 ),
             )

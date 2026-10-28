@@ -155,21 +155,18 @@ input[type="checkbox"] {
 }
 
 .project-switcher {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 18px;
   width: 148px;
-  height: 34px;
-  padding: 0 12px;
-  border: 1px solid var(--line-soft);
-  border-radius: 6px;
-  background: var(--surface-1);
-  color: var(--text-soft);
-  font-size: 13px;
 }
 
-.project-switcher:hover,
+.project-switcher .select-menu-trigger {
+  width: 100%;
+  height: 34px;
+}
+
+.project-switcher .select-menu-list {
+  min-width: 220px;
+}
+
 .icon-button:hover,
 .button.secondary:hover {
   background: var(--surface-3);
@@ -1583,6 +1580,12 @@ input[type="checkbox"] {
 
 .prompt-field textarea:focus {
   border-color: #6e4c47;
+}
+
+.prompt-context-note {
+  margin: -4px 0 12px;
+  color: var(--muted);
+  font-size: 10px;
 }
 
 .save-prompt {
@@ -3324,6 +3327,7 @@ input[type="checkbox"] {
 .generation-preview-task-heading strong { color: var(--chat-copy); font-size: 11px; }
 .generation-preview-task-heading small { color: var(--chat-faint); font-family: ui-monospace, monospace; font-size: 8px; overflow-wrap: anywhere; }
 .generation-preview-tasks code { display: block; overflow-wrap: anywhere; padding: 6px 8px; background: #111411; color: #9bb394; font-family: ui-monospace, monospace; font-size: 8px; }
+.generation-preview-relation { color: var(--chat-green); font-size: 9px; }
 .generation-preview-prompt { color: var(--chat-muted); font-size: 9px; line-height: 1.55; }
 .generation-preview-prompt p { margin: 0; color: inherit; font-size: inherit; line-height: inherit; }
 .generation-preview-references { display: grid; gap: 3px; padding-top: 5px; border-top: 1px solid var(--chat-line-soft); color: var(--chat-faint); font-size: 8px; }

@@ -525,6 +525,12 @@ def create_relation(session: Session, payload: RelationCreate) -> AssetRelation:
     target = require(session, Asset, payload.target_asset_id, "target asset")
     if source.project_id != payload.project_id or target.project_id != payload.project_id:
         raise ServiceError(422, "both assets must belong to the relation project")
+    refresh_media = (
+        (payload.relation_type.value == "depicts" and source.subtype == "portrait" and target.subtype == "character")
+        or (payload.relation_type.value == "represents" and source.subtype == "icon" and target.subtype == "item")
+    ) and source.kind == "media" and target.kind == "entity"
+    previous_approval = _valid_media_approval(session, source) if refresh_media else None
+    previous_publication_status = source.publication_status
     relation = AssetRelation(
         id=new_id(),
         project_id=payload.project_id,
@@ -537,6 +543,12 @@ def create_relation(session: Session, payload: RelationCreate) -> AssetRelation:
     try:
         session.flush()
         project = require(session, Project, payload.project_id, "project")
+        if previous_approval is not None:
+            _refresh_media_relation_approval(
+                session, project, source, previous_approval,
+                notes="Relation linked after media approval; dependency hash refreshed",
+                publication_status=previous_publication_status,
+            )
         rows = session.scalars(
             select(AssetRelation).where(AssetRelation.project_id == payload.project_id)
         ).all()
@@ -1433,6 +1445,77 @@ def dependency_hash(session: Session, revision: AssetRevision) -> str:
     )
 
 
+def _valid_media_approval(session: Session, asset: Asset) -> ReviewDecision | None:
+    if asset.kind != "media" or not asset.current_revision_id:
+        return None
+    approval = session.scalar(
+        select(ReviewDecision)
+        .where(
+            ReviewDecision.asset_id == asset.id,
+            ReviewDecision.revision_id == asset.current_revision_id,
+            ReviewDecision.verdict == ReviewVerdict.APPROVE.value,
+            ReviewDecision.is_valid.is_(True),
+        )
+        .order_by(ReviewDecision.created_at.desc())
+        .limit(1)
+    )
+    revision = session.get(AssetRevision, asset.current_revision_id)
+    if approval is None or revision is None or approval.dependency_hash != dependency_hash(session, revision):
+        return None
+    return approval
+
+
+def _refresh_media_relation_approval(
+    session: Session, project: Project, source: Asset, previous: ReviewDecision,
+    *, notes: str, publication_status: str,
+) -> None:
+    revision = session.get(AssetRevision, previous.revision_id)
+    if revision is None or source.current_revision_id != revision.id or revision.review_status != "approved":
+        return
+    refreshed_hash = dependency_hash(session, revision)
+    if refreshed_hash == previous.dependency_hash:
+        return
+    now = utcnow()
+    bindings = [
+        {"artifact_id": binding.artifact_id, "role": binding.role, "sha256": binding.sha256}
+        for binding in previous.artifact_bindings
+    ]
+    session.execute(
+        ReviewDecision.__table__.update()
+        .where(ReviewDecision.asset_id == source.id, ReviewDecision.is_valid.is_(True))
+        .values(is_valid=False)
+    )
+    refreshed = ReviewDecision(
+        id=new_id(), revision_id=revision.id, asset_id=source.id,
+        verdict=ReviewVerdict.APPROVE.value, notes=notes,
+        dependency_hash=refreshed_hash, is_valid=True, created_at=now,
+    )
+    session.add(refreshed)
+    session.flush()
+    for binding in bindings:
+        session.add(ReviewArtifact(
+            id=stable_id("review_artifact", refreshed.id, binding["artifact_id"], binding["role"]),
+            review_id=refreshed.id, artifact_id=binding["artifact_id"],
+            role=binding["role"], sha256=binding["sha256"],
+        ))
+    source.publication_status = publication_status
+    source.updated_at = now
+    store = ProjectStore(project.root_path)
+    store.write_review(kind=source.kind, key=source.key, review={
+        "id": refreshed.id, "asset_id": source.id, "revision_id": revision.id,
+        "verdict": refreshed.verdict, "notes": notes,
+        "dependency_hash": refreshed_hash, "artifacts": bindings,
+        "created_at": now.isoformat(),
+    })
+    store.update_asset_approval(
+        kind=source.kind, key=source.key, title=source.title,
+        content_status=source.content_status, publication_status=source.publication_status,
+        current_revision_id=source.current_revision_id,
+        latest_candidate_revision_id=source.latest_candidate_revision_id,
+        updated_at=now.isoformat(),
+    )
+
+
 def _image_source_metadata(path: Path) -> tuple[str, str, int, int]:
     formats = {
         "PNG": ("png", "image/png"),
@@ -1783,6 +1866,26 @@ def create_review(session: Session, payload: ReviewCreate) -> ReviewDecision:
             project=project,
             payload=payload,
         )
+    first_approval_media: list[tuple[Asset, ReviewDecision, str]] = []
+    if payload.verdict == ReviewVerdict.APPROVE and asset.current_revision_id is None and asset.kind == "entity":
+        relation_type = {"character": "depicts", "item": "represents"}.get(asset.subtype)
+        media_subtype = {"character": "portrait", "item": "icon"}.get(asset.subtype)
+        if relation_type is not None:
+            sources = session.scalars(
+                select(Asset)
+                .join(AssetRelation, AssetRelation.source_asset_id == Asset.id)
+                .where(
+                    AssetRelation.project_id == project.id,
+                    AssetRelation.target_asset_id == asset.id,
+                    AssetRelation.relation_type == relation_type,
+                    Asset.kind == "media", Asset.subtype == media_subtype,
+                )
+            ).all()
+            for source in sources:
+                previous = _valid_media_approval(session, source)
+                source_revision = session.get(AssetRevision, source.current_revision_id) if source.current_revision_id else None
+                if previous is not None and source_revision is not None and previous.dependency_hash == dependency_hash(session, source_revision):
+                    first_approval_media.append((source, previous, source.publication_status))
     if payload.verdict == ReviewVerdict.APPROVE:
         renditions = session.scalars(select(Rendition).where(Rendition.revision_id == revision.id)).all()
         for rendition in renditions:
@@ -1963,6 +2066,16 @@ def create_review(session: Session, payload: ReviewCreate) -> ReviewDecision:
         except (StorageError, IntegrityError) as exc:
             session.rollback()
             raise ServiceError(409, str(exc)) from exc
+    try:
+        for source, previous, publication_status in first_approval_media:
+            _refresh_media_relation_approval(
+                session, project, source, previous,
+                notes="Linked entity received its first approval; dependency hash refreshed",
+                publication_status=publication_status,
+            )
+    except (StorageError, IntegrityError) as exc:
+        session.rollback()
+        raise ServiceError(409, str(exc)) from exc
     session.commit()
     return decision
 

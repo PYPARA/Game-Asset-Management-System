@@ -342,6 +342,7 @@ def record_agent_event(
     data: dict[str, Any] | None = None,
     turn_id: str | None = None,
 ) -> AgentEvent:
+    thread_id = None if agent_session.purpose == "generation_planning" else agent_session.thread_id
     event = AgentEvent(
         id=new_id(),
         session_id=agent_session.id,
@@ -350,7 +351,7 @@ def record_agent_event(
         job_id=agent_session.job_id,
         asset_id=agent_session.asset_id,
         event_type=event_type,
-        thread_id=agent_session.thread_id,
+        thread_id=thread_id,
         turn_id=turn_id,
         data_json=_redact(data or {}),
         created_at=utcnow(),
@@ -370,7 +371,7 @@ def record_agent_event(
             event_type=event_type,
             data={
                 "agent_session_id": agent_session.id,
-                "thread_id": agent_session.thread_id,
+                "thread_id": thread_id,
                 "turn_id": turn_id,
                 **_redact(data or {}),
             },

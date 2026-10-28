@@ -42,7 +42,8 @@ it("候选就绪明确显示为生成成功，并且结果栏只展示候选而�
       stage:"candidate_ready", progress:100, attempt_count:2, result_revision_id:"revision-candidate",
       provider_snapshot:{model:"gpt-image-2.5"}, blocking_reason:null, recovery_eligible:false}],
     evidence:[
-      {id:"candidate", job_id:"job", kind:"candidate", label:"当前候选", path:"candidate.webp", media_type:"image/webp"},
+      {id:"old-candidate", job_id:"job", revision_id:"old-revision", kind:"candidate", label:"旧候选", path:"old-candidate.webp", media_type:"image/webp"},
+      {id:"candidate", job_id:"job", revision_id:"revision-candidate", kind:"candidate", label:"当前候选", path:"candidate.webp", media_type:"image/webp"},
       {id:"overlay", job_id:"job", kind:"overlay", label:"50% 叠加", path:"overlay.webp", media_type:"image/webp"},
       {id:"difference", job_id:"job", kind:"difference", label:"像素差异", path:"difference.webp", media_type:"image/webp"},
     ],
@@ -54,10 +55,25 @@ it("候选就绪明确显示为生成成功，并且结果栏只展示候选而�
 
   expect((await screen.findAllByText("生成成功 · 待批准")).length).toBeGreaterThan(0);
   expect(screen.getByText("生成与 QA 已完成")).toBeInTheDocument();
-  expect(screen.getByRole("img", {name:"林月 当前候选"})).toBeInTheDocument();
+  expect(screen.getByRole("img", {name:"林月 当前候选"})).toHaveAttribute("src", "/api/run-evidence/candidate/content");
   expect(screen.queryByRole("img", {name:"50% 叠加"})).not.toBeInTheDocument();
   expect(screen.queryByRole("img", {name:"像素差异"})).not.toBeInTheDocument();
   expect(screen.getByRole("button", {name:"查看候选大图与版本"})).toBeEnabled();
   expect(screen.getByRole("button", {name:"前往资产库批准候选"})).toBeEnabled();
   expect(screen.getByRole("button", {name:"查看运行详情与 QA 证据"})).toBeEnabled();
+});
+
+it("资产缓存尚未包含新候选时仍可前往资产库", async()=>{
+  vi.stubGlobal("fetch", vi.fn(async ()=>new Response(JSON.stringify({
+    jobs:[{id:"job", request:{asset_id:"new-asset"}, task_id:"character", status:"candidate_ready",
+      stage:"candidate_ready", progress:100, attempt_count:1, result_revision_id:"new-revision",
+      provider_snapshot:{}, blocking_reason:null, recovery_eligible:false}],
+    evidence:[], findings:[],
+  }), {status:200})));
+  const client = new QueryClient({defaultOptions:{queries:{retry:false}}});
+  const onOpenAsset = vi.fn();
+  render(<QueryClientProvider client={client}><GenerationResults batches={[batch]} assets={[]} onOpenAsset={onOpenAsset} /></QueryClientProvider>);
+
+  await userEvent.setup().click(await screen.findByRole("button", {name:"前往资产库批准候选"}));
+  expect(onOpenAsset).toHaveBeenCalledWith("new-asset");
 });

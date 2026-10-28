@@ -4,7 +4,6 @@ import {
   type ColumnDef,
   flexRender,
   getCoreRowModel,
-  getSortedRowModel,
   type RowSelectionState,
   type SortingState,
   useReactTable,
@@ -58,6 +57,7 @@ import {
   emptyWorkbenchPayload,
   createAssetRevision,
   fetchAssetDetails,
+  fetchGenerationConversation,
   fetchGenerationProviders,
   fetchGenerationConversations,
   fetchNarrativeMap,
@@ -68,7 +68,7 @@ import {
 } from "./lib/api";
 import { readCredential } from "./lib/credentials";
 import { assetSubtypeLabel } from "./lib/labels";
-import type { GameAsset, GenerationConversationSummary, JobSummary, NarrativeMap, ProjectSummary, ReviewStatus } from "./types";
+import type { GameAsset, GenerationConversation, GenerationConversationSummary, JobSummary, NarrativeMap, ProjectSummary, ReviewStatus } from "./types";
 
 const GenerationChatPage = lazy(() =>
   import("./components/GenerationChatPage").then((module) => ({
@@ -317,12 +317,27 @@ function AssetPreview({ asset }: { asset: GameAsset }) {
 }
 
 export function Workbench() {
+  const [selectedProjectId, setSelectedProjectId] = useState(() => window.localStorage.getItem("gams.selectedProjectId") ?? "");
+  const [generationSessionId, setGenerationSessionId] = useState<string | null>(()=>decodeURIComponent(window.location.pathname.split("/")[2]??"")||null);
+  const linkedConversationQuery = useQuery<GenerationConversation>({
+    queryKey: ["generation-conversation", generationSessionId],
+    queryFn: () => fetchGenerationConversation(generationSessionId as string),
+    enabled: Boolean(generationSessionId),
+    retry: false,
+  });
+  const requestedProjectId = linkedConversationQuery.data?.project_id ?? selectedProjectId;
   const { data: queryData, error, isError, isFetching, isLoading, refetch } = useQuery({
-    queryKey: ["workbench"],
-    queryFn: fetchWorkbench,
+    queryKey: ["workbench", requestedProjectId],
+    queryFn: () => fetchWorkbench(requestedProjectId),
   });
   const providerBootstrapStarted = useRef(false);
   const data = isError ? emptyWorkbenchPayload : (queryData ?? emptyWorkbenchPayload);
+  useEffect(() => {
+    if (!data.project.id || !queryData || (generationSessionId && !linkedConversationQuery.data)) return;
+    if (requestedProjectId && queryData.projects?.some((project) => project.id === requestedProjectId) && data.project.id !== requestedProjectId) return;
+    if ((selectedProjectId || generationSessionId) && selectedProjectId !== data.project.id) setSelectedProjectId(data.project.id);
+    window.localStorage.setItem("gams.selectedProjectId", data.project.id);
+  }, [data.project.id, generationSessionId, linkedConversationQuery.data, queryData, requestedProjectId, selectedProjectId]);
   const narrativeQuery = useQuery<NarrativeMap>({
     queryKey: ["narrative-map", data.project.id],
     queryFn: () => fetchNarrativeMap(data.project.id),
@@ -358,7 +373,6 @@ export function Workbench() {
   const [deliveryOpen, setDeliveryOpen] = useState(false);
   const [versionControlOpen, setVersionControlOpen] = useState(false);
   const [generationCenterOpen, setGenerationCenterOpen] = useState(()=>window.location.pathname.startsWith("/generation"));
-  const [generationSessionId, setGenerationSessionId] = useState<string | null>(()=>decodeURIComponent(window.location.pathname.split("/")[2]??"")||null);
   const [generationSeedAssetIds, setGenerationSeedAssetIds] = useState<string[]>([]);
   const [generationCreateOnMount, setGenerationCreateOnMount] = useState(false);
   const navigateGeneration = (sessionId: string|null, opened=true) => {
@@ -366,6 +380,19 @@ export function Workbench() {
     if (window.location.pathname!==path) window.history.pushState({},"",path);
     setGenerationCenterOpen(opened);
     if(opened)setGenerationSessionId(sessionId);
+  };
+  const switchProject = (projectId: string) => {
+    if (projectId === data.project.id) return;
+    setSelectedProjectId(projectId);
+    window.localStorage.setItem("gams.selectedProjectId", projectId);
+    setSelectedAssetId(null);
+    setEditingAssetId(null);
+    setRunInspectorPlanId(null);
+    setNarrativeFocusSceneId(null);
+    setRowSelection({});
+    setGenerationSeedAssetIds([]);
+    setGenerationCreateOnMount(false);
+    navigateGeneration(null, generationCenterOpen);
   };
   useEffect(()=>{
     const restore=()=>{setGenerationCenterOpen(window.location.pathname.startsWith("/generation"));setGenerationSessionId(decodeURIComponent(window.location.pathname.split("/")[2]??"")||null);setGenerationCreateOnMount(false);};
@@ -580,18 +607,26 @@ export function Workbench() {
       }),
     [activeView, activeViewId, followedAssetIds, indexedAssets, sceneChapterFilter, sceneCoverageFilter, search, statusFilter, typeFilter, workspaceFilter],
   );
+  const sortedAssets = useMemo(() => {
+    const field = sorting[0]?.id === "reviewStatus" ? "reviewStatus" : "updatedAt";
+    const direction = sorting[0]?.desc === false ? 1 : -1;
+    return [...filteredAssets].sort((left, right) => {
+      const order = left[field].localeCompare(right[field]);
+      return order * direction;
+    });
+  }, [filteredAssets, sorting]);
   const tableAssets = useMemo(
-    () => filteredAssets.slice(0, visibleLimit),
-    [filteredAssets, visibleLimit],
+    () => sortedAssets.slice(0, visibleLimit),
+    [sortedAssets, visibleLimit],
   );
 
   useEffect(() => {
     setSelectedAssetId((current) =>
-      current && filteredAssets.some((asset) => asset.id === current)
+      current && sortedAssets.some((asset) => asset.id === current)
         ? current
-        : (filteredAssets[0]?.id ?? null),
+        : (sortedAssets[0]?.id ?? null),
     );
-  }, [filteredAssets]);
+  }, [sortedAssets]);
 
   const columns = useMemo<ColumnDef<GameAsset>[]>(
     () => [
@@ -697,13 +732,11 @@ export function Workbench() {
   const table = useReactTable({
     data: tableAssets,
     columns,
-    state: { rowSelection, sorting },
+    state: { rowSelection },
     enableRowSelection: true,
     onRowSelectionChange: setRowSelection,
-    onSortingChange: setSorting,
     getRowId: (row) => row.id,
     getCoreRowModel: getCoreRowModel(),
-    getSortedRowModel: getSortedRowModel(),
   });
 
   const selectedAsset = indexedAssets.find((asset) => asset.id === selectedAssetId) ?? null;
@@ -825,6 +858,28 @@ export function Workbench() {
     setSelectedAssetId(target.id);
   };
 
+  const openGeneratedAsset = async (assetId: string) => {
+    try {
+      const refreshed = await refetch();
+      if (refreshed.error || !refreshed.data) throw refreshed.error ?? new Error("资产库暂时无法读取。");
+      const target = refreshed.data.assets.find((asset) => asset.id === assetId);
+      if (!target) throw new Error("当前 Project 中找不到该候选资产，请检查生成批次。");
+      setAssets(refreshed.data.assets);
+      setJob(refreshed.data.job);
+      setSearch(target.key);
+      setStatusFilter("all");
+      setWorkspaceFilter("all");
+      setTypeFilter("all");
+      const views = libraryGroupsFor(refreshed.data.assets).flatMap((group) => group.views);
+      setActiveViewId(views.find((view) => view.predicate(target))?.id ?? "all");
+      setSelectedAssetId(target.id);
+      setWorkspaceMode("assets");
+      navigateGeneration(null, false);
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "暂时无法打开候选资产。");
+    }
+  };
+
   const startGenerationSession = (seedAssetIds: string[] = []) => {
     if (!data.project.id || isError) return;
     setGenerationSessionId(null);
@@ -935,9 +990,15 @@ export function Workbench() {
           <span className="brand-mark"><CrownSimple size={23} weight="duotone" /></span>
           <strong>{workspaceMode === "narrative" ? "Narrative Atlas" : "游戏资产制作台"}</strong>
         </div>
-        <button className="project-switcher" type="button" disabled={isError} onClick={() => openProjectDialog(data.project.id ? data.project : null)}>
-          {isError ? "项目状态不可用" : data.project.name} <CaretDown size={14} />
-        </button>
+        <SelectMenu
+          className="project-switcher"
+          ariaLabel="当前 Project"
+          value={data.project.id}
+          options={(data.projects ?? []).map((project) => ({ value: project.id, label: project.name }))}
+          onChange={switchProject}
+          placeholder={isError ? "项目状态不可用" : data.project.name}
+          disabled={isError || !data.project.id}
+        />
         <nav className="workspace-mode-switch" aria-label="工作台视图">
           <button type="button" className={!generationCenterOpen && workspaceMode === "assets" ? "active" : ""} aria-pressed={!generationCenterOpen && workspaceMode === "assets"} onClick={() => {navigateGeneration(null,false); setNarrativeFocusSceneId(null); setWorkspaceMode("assets"); }}><SquaresFour size={16} /> 资产制作台</button>
           <button type="button" className={!generationCenterOpen && workspaceMode === "narrative" ? "active" : ""} aria-pressed={!generationCenterOpen && workspaceMode === "narrative"} onClick={() => {navigateGeneration(null,false);setWorkspaceMode("narrative");}}><TreeStructure size={16} /> 叙事地图</button>
@@ -1273,9 +1334,18 @@ export function Workbench() {
         onSave={saveAssetRevision}
       />
 
-      {generationCenterOpen ? (
+      {generationCenterOpen && generationSessionId && linkedConversationQuery.isError ? (
+        <div className="generation-drawer-loading" role="alert">无法打开生成会话：{linkedConversationQuery.error instanceof Error ? linkedConversationQuery.error.message : "会话不存在"}</div>
+      ) : generationCenterOpen && generationSessionId && linkedConversationQuery.data && queryData && !queryData.projects?.some((project) => project.id === linkedConversationQuery.data.project_id) ? (
+        <div className="generation-drawer-loading" role="alert">该生成会话所属的 Project 已不在管理列表中。</div>
+      ) : generationCenterOpen && generationSessionId && (!linkedConversationQuery.data || data.project.id !== linkedConversationQuery.data.project_id) ? (
+        <div className="generation-drawer-loading" role="status">正在切换到会话所属 Project…</div>
+      ) : generationCenterOpen && !data.project.id ? (
+        <div className="generation-drawer-loading" role="status">正在加载 Project…</div>
+      ) : generationCenterOpen ? (
         <Suspense fallback={<div className="generation-drawer-loading" role="status">正在打开生成中心…</div>}>
           <GenerationChatPage
+            key={data.project.id}
             sessionId={generationSessionId}
             seedAssetIds={generationSeedAssetIds}
             createOnMount={generationCreateOnMount}
@@ -1289,7 +1359,7 @@ export function Workbench() {
               setGenerationSeedAssetIds([]);
               void generationConversationsQuery.refetch();
             }}
-            onOpenAsset={(assetId)=>{navigateGeneration(null,false);setWorkspaceMode("assets");navigateToAsset(assetId);}}
+            onOpenAsset={(assetId)=>{void openGeneratedAsset(assetId);}}
             onConfirmed={confirmGenerationSurface}
             onSessionRemoved={generationSessionRemoved}
             workbenchData={data}

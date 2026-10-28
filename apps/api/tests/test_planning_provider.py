@@ -19,18 +19,22 @@ async def test_selected_provider_model_isolated_from_personal_defaults(client, m
     vault.unlock('selected', 'fixture-secret')
     observed = {}
     async def fake_turn(self, context, **kwargs):
-        observed.update(command=self.command, environment=self._environment(), model=kwargs['model'])
+        observed.update(command=self.command, environment=self._environment(), model=kwargs['model'], thread_id=kwargs['thread_id'])
         yield {'type':'turn.completed','data':{}}
     monkeypatch.setattr(AppServerCodexAdapter, 'plan_turn', fake_turn)
     monkeypatch.setenv('CODEX_HOME', str(tmp_path / 'personal'))
     settings = SimpleNamespace(state_dir=tmp_path)
     adapter = ProviderPlanningAdapter(AppServerCodexAdapter(('codex','app-server')), client.app.state.database.sessions, settings, vault)
     draft = {'settings':{'route_defaults':{'text':{'provider_profile_id':'selected','model':'gpt-5.6-sol','reasoning_effort':'high'}}}}
-    events = [event async for event in adapter.plan_turn({}, messages=[],draft=draft,budget=1,turn_id='t',model='gpt-6-astra')]
+    events = [event async for event in adapter.plan_turn({'project': {'id': 'project-a'}}, messages=[],draft=draft,budget=1,turn_id='t',model='gpt-6-astra',thread_id='legacy-thread')]
     assert observed['model'] == 'gpt-5.6-sol'
     assert 'model_reasoning_effort="high"' in observed['command']
     assert events[0]['data']['reasoning_effort'] == 'high'
     assert observed['environment']['CODEX_HOME'] != str(tmp_path / 'personal')
+    assert observed['thread_id'] is None
+    first_home = observed['environment']['CODEX_HOME']
+    _ = [event async for event in adapter.plan_turn({'project': {'id': 'project-b'}}, messages=[],draft=draft,budget=1,turn_id='t2')]
+    assert observed['environment']['CODEX_HOME'] != first_home
     assert observed['environment']['GAMS_PLANNING_API_KEY'] == 'fixture-secret'
     assert 'fixture-secret' not in str(observed['command']) + json.dumps(events)
     assert 'shell_environment_policy.inherit="none"' in observed['command']
@@ -53,23 +57,62 @@ async def test_memory_only_worker_credential_bridge(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_real_bridge_resume_protocol_failure_rebuilds(tmp_path, monkeypatch):
+async def test_planning_bridge_never_resumes_a_persistent_thread(tmp_path, monkeypatch):
+    adapter = AppServerCodexAdapter(('codex','app-server'))
+    calls = []
+    async def request(self, process, method, params):
+        calls.append((method, params))
+        return {'thread': {'id':'new', 'ephemeral': True}}
+    monkeypatch.setattr(AppServerCodexAdapter, '_request', request)
+    assert await adapter._open_thread(None, thread_id='old', model='gpt-5.6-sol', work_dir=tmp_path) == 'new'
+    assert [method for method, _ in calls] == ['thread/start']
+    assert calls[0][1]['ephemeral'] is True
+    assert calls[0][1]['cwd'] == str(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_unconfirmed_ephemeral_thread_never_starts_a_turn(tmp_path, monkeypatch):
     adapter = AppServerCodexAdapter(('codex','app-server'))
     calls = []
     async def request(self, process, method, params):
         calls.append(method)
-        if method == 'thread/resume':
-            raise CodexUnavailable('paginated_threads is not supported yet')
-        return {'thread': {'id':'new'}}
+        return {'thread': {'id': 'unexpected-persistent', 'ephemeral': False}}
     monkeypatch.setattr(AppServerCodexAdapter, '_request', request)
-    assert await adapter._open_thread(None, thread_id='old', model='gpt-5.6-sol', work_dir=tmp_path) == 'new'
-    assert calls == ['thread/resume','thread/start']
+    with pytest.raises(CodexUnavailable, match='ephemeral_threads_unsupported'):
+        await adapter._open_thread(None, thread_id=None, model=None, work_dir=tmp_path)
+    assert calls == ['thread/start']
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_unsupported_does_not_fall_back_to_persistent(tmp_path, monkeypatch):
+    adapter = AppServerCodexAdapter(('codex','app-server'))
+    calls = []
+    async def request(self, process, method, params):
+        calls.append((method, params))
+        raise CodexUnavailable('unknown field ephemeral')
+    monkeypatch.setattr(AppServerCodexAdapter, '_request', request)
+    with pytest.raises(CodexUnavailable, match='ephemeral_threads_unsupported'):
+        await adapter._open_thread(None, thread_id='old', model=None, work_dir=tmp_path)
+    assert [method for method, _ in calls] == ['thread/start']
+    assert calls[0][1]['ephemeral'] is True
 
 
 def test_bridge_preserves_assistant_item_identity():
     adapter = AppServerCodexAdapter(('codex','app-server'))
     event = adapter._event_from_notification({'method':'item/agentMessage/delta','params':{'itemId':'final','delta':'x'}},local_turn_id='t',thread_id='thread',final_text=[])
     assert event['data']['item_id'] == 'final'
+
+
+@pytest.mark.parametrize('notification', [
+    {'method': 'turn/failed', 'params': {'error': 'error sending request for url (https://provider.test/v1/responses)'}},
+    {'method': 'turn/completed', 'params': {'turn': {'status': 'failed', 'error': {'message': 'error sending request'}}}},
+    {'method': 'turn/completed', 'params': {'turn': {'status': 'failed', 'reason': 'error sending request'}}},
+])
+def test_bridge_preserves_turn_failure_reason(notification):
+    adapter = AppServerCodexAdapter(('codex','app-server'))
+    event = adapter._event_from_notification(notification, local_turn_id='t', thread_id='thread', final_text=[])
+    assert event['type'] == 'turn.failed'
+    assert 'error sending request' in event['data']['reason']
 
 @pytest.mark.asyncio
 async def test_bridge_drains_stderr_and_accepts_large_completed_frame(tmp_path):
@@ -90,6 +133,7 @@ def test_provider_timeouts_are_not_installation_errors():
     from game_assets_api.generation_planning import _planning_error
     assert _planning_error('Codex App Server turn timed out')['error_code'] == 'planning_timeout'
     assert _planning_error('Codex App Server turn/start failed: model unavailable')['error_code'] == 'turn_failed'
+    assert _planning_error('error sending request for url (https://provider.test/v1/responses)')['error_code'] == 'connection_lost'
 
 @pytest.mark.asyncio
 async def test_text_asset_request_carries_reasoning_effort(monkeypatch):

@@ -405,9 +405,8 @@ class _ActiveAppServerTurn:
 class AppServerCodexAdapter:
     """A small, read-only JSONL bridge to the local ``codex app-server``.
 
-    The app server is deliberately started per operation.  The durable Codex
-    thread id lives in ``AgentSession``; a later turn resumes that thread while
-    keeping the API process free from a long-lived provider connection.
+    The app server is started per operation. Planning threads are ephemeral;
+    the application's AgentSession owns the durable conversation instead.
     """
 
     command: tuple[str, ...]
@@ -605,32 +604,27 @@ class AppServerCodexAdapter:
     ) -> str:
         cwd = str(work_dir) if work_dir and work_dir.is_dir() else None
         sandbox = "read-only"
-        if thread_id:
-            params: dict[str, Any] = {"threadId": thread_id, "sandbox": sandbox, "developerInstructions": OfficialCodexAdapter._developer_instructions()}
-            if cwd:
-                params["cwd"] = cwd
-            if model:
-                params["model"] = model
-            try:
-                result = await self._request(process, "thread/resume", params)
-                return self._thread_id(result) or thread_id
-            except CodexUnavailable as exc:
-                if not any(token in str(exc).lower() for token in ("not found", "unknown thread", "paginated_threads", "not supported", "no rollout")):
-                    raise
+        del thread_id
         params = {
             "approvalPolicy": "never",
             "sandbox": sandbox,
             "developerInstructions": OfficialCodexAdapter._developer_instructions(),
+            "ephemeral": True,
         }
         if cwd:
             params["cwd"] = cwd
         if model:
             params["model"] = model
-        result = await self._request(
-            process,
-            "thread/start",
-            params,
-        )
+        try:
+            result = await self._request(process, "thread/start", params)
+        except CodexUnavailable as exc:
+            detail = str(exc).lower()
+            if any(token in detail for token in ("ephemeral", "unknown field", "unknown parameter")):
+                raise CodexUnavailable("ephemeral_threads_unsupported: 当前 Codex 运行时不支持临时会话；可继续人工编辑，不会创建持久会话。") from exc
+            raise
+        thread = result.get("thread")
+        if not isinstance(thread, dict) or thread.get("ephemeral") is not True:
+            raise CodexUnavailable("ephemeral_threads_unsupported: Codex 未确认临时会话；已停止规划以避免写入工作会话列表。")
         value = self._thread_id(result)
         if not value:
             raise CodexProtocolError("Codex App Server thread/start did not return a thread id")
@@ -649,7 +643,11 @@ class AppServerCodexAdapter:
                     parts.append(AppServerCodexAdapter._text(item.get("text", item.get("content", ""))))
             return "".join(parts)
         if isinstance(value, dict):
-            return AppServerCodexAdapter._text(value.get("text", value.get("content", value.get("message", ""))))
+            for key in ("text", "content", "message", "reason", "detail", "error"):
+                if key in value:
+                    result = AppServerCodexAdapter._text(value[key])
+                    if result:
+                        return result
         return ""
 
     @staticmethod
@@ -712,13 +710,12 @@ class AppServerCodexAdapter:
             tool = item.get("type") or item.get("command") or params.get("type") or "codex.tool"
             return {"type": "tool.result", "data": {"tool": str(tool), "item": item, **common}}
         if method in {"turn/failed", "turn/error"}:
-            error = params.get("error") if isinstance(params.get("error"), dict) else params
-            return {"type": "turn.failed", "data": {"reason": self._text(error) or "Codex turn failed", **common}}
+            return {"type": "turn.failed", "data": {"reason": self._text(params.get("error")) or self._text(params) or "Codex turn failed", **common}}
         if method == "turn/completed":
             turn = params.get("turn") if isinstance(params.get("turn"), dict) else params
             status = str(turn.get("status", "completed"))
             if status in {"failed", "error"}:
-                return {"type": "turn.failed", "data": {"reason": self._text(turn.get("error")) or "Codex turn failed", **common}}
+                return {"type": "turn.failed", "data": {"reason": self._text(turn.get("error")) or self._text(turn) or "Codex turn failed", **common}}
             return {"type": "turn.completed", "data": {"status": status, **common}}
         if method in {"error", "turn/aborted"}:
             return {"type": "turn.failed", "data": {"reason": self._text(params) or "Codex turn failed", **common}}
@@ -743,14 +740,11 @@ class AppServerCodexAdapter:
             await self._initialize(process)
             active.thread_id = await self._open_thread(
                 process,
-                thread_id=thread_id,
+                thread_id=None,
                 model=model,
                 work_dir=work_dir,
             )
-            if active.thread_id != thread_id:
-                context = {**context, "rebuild_conversation": True}
-                if thread_id:
-                    yield {"type": "thread.rebuilt", "data": {"message": "已保留上下文继续规划。", "thread_id": active.thread_id}}
+            context = {**context, "rebuild_conversation": True}
             prompt = OfficialCodexAdapter._prompt(context, messages, draft, work_dir)
             prompt += ("\n\n若缺少可在本次对话立即回答的关键信息，优先调用 request_user_input，"
                        "一次最多三个问题；在得到回答前不要提交最终草案。开放设定可不提供选项。"
