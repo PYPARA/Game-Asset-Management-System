@@ -1,88 +1,262 @@
-# 游戏资产管理系统
+<div align="center">
 
-本地优先的游戏内容与媒体生产工作台。`Game-Projects` 父仓库统一记录所有正式 Project；游戏仓库只接收确定性导出的内容模块和已批准运行资源。
+# Game Asset Management System
 
-## 架构
+**游戏资产管理系统 · 本地优先的游戏内容与媒体生产工作台**
 
-- `apps/web`：React/Vite 制作台。
-- `apps/api`：仅监听本机回环地址的 FastAPI 服务。
-- Project 根目录：唯一权威数据源，必须包含 `format_version: 1` 的 `project.yaml`。
-- SQLite：位于本机 `~/Library/Application Support/Game-Asset-Management-System`，不进入 iCloud 或 Git，只保存可重建索引和任务状态。
+从资产编目、AI 生成、质量检查到人工审核与版本交付，让游戏内容在同一条可追溯的工作流中完成生产。
 
-Project 使用以下固定分区：
+![React](https://img.shields.io/badge/React-19-149ECA?logo=react&logoColor=white)
+![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?logo=typescript&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.13%2B-3776AB?logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)
+![Local First](https://img.shields.io/badge/Local--First-Desktop-555555)
 
-```text
-project.yaml
-catalog/       按领域分组的内容、实体、媒体和关系
-schemas/       项目数据 Schema
-production/    风格、Prompt 和 PNG 制作母版
-approved/      普通 Git 管理的批准 rendition
-history/       内容寻址修订与审核决定
-releases/      不可变发布清单
-workspace/     被 Git 忽略的候选、驳回、QA、缓存与日志
-```
+[快速开始](#快速开始) · [功能特性](#功能特性) · [项目结构](#项目结构) · [文档](#文档)
 
-系统只支持这一种项目契约，不探测隐藏目录、外部媒体协议或字段别名。
+</div>
 
-## 当前状态
+## 界面预览
 
-截至 2026-08-06，M0–M7 的 GAMS 能力已完成。系统已具备 Project 发现/扫描、资产与不可变修订、关系、多供应商模型路由、持久生成计划、硬 QA、人工审核、Release Manifest v2、可恢复 Delivery，以及隔离的 Codex 监督诊断；Web 制作台已接入真实 Project 数据，并提供 Agent 生成任务聊天工作台、运行检查器、Agent 诊断、Release 交付和 v1.1 叙事地图。
+以下截图均于 **2026-10-28** 从本地 Chrome 中运行的当前版本截取，展示 Emperor Simulator 项目的实际数据。点击图片可查看原图。
 
-M2 Controller 会冻结 DAG、Prompt、尺寸、调用预算和并发约束；Runner 实施 provider/plan 双重并发、lease、heartbeat、幂等 Attempt、上游产物注入和崩溃恢复。供应商输出依次经过 `output_received`、硬 QA、证据生成和 `candidate_ready`；QA fail 进入结构化 Finding 与 `awaiting_user`，用户可以在没有 Codex 的情况下选择 Worker 修复、重试、重新生成或图像编辑。未知供应商交付不会自动重试。
+### 资产制作台
 
-M2.1 允许同时配置多个 OpenAI 兼容供应商，独立保存文字/图片默认模型、模型目录、并发、重试和价格。全局文字与图片路由只用于创建新任务；每项任务可以覆盖供应商和模型，确认时会把实际路由和运行配置冻结到 Job。模型下线、拒绝或凭据锁定不会触发自动换模型或跨供应商回退，而是保留 DAG 等待关系并进入明确的人工处理状态。
+统一浏览角色与关联立绘，在检查器中查看内容、关系和修订。
 
-M5 Emperor-Simulator 试点脚本、旧媒体升级、显式资产子集 Release 和可审计 Delivery 已接通；M6 新增 `gams acceptance m6`/`scripts/m6_acceptance.py`，可离线演练真实 OpenAI-compatible HTTP 故障矩阵、并发、磁盘不足、Delivery 中断、SQLite 删除重建和格式边界，并输出结构化验收收据。隔离 checkout 的类型检查与构建通过，游戏侧 E2E 仍需在可启动浏览器的环境中重跑（当前沙箱出现 Playwright `EPERM`，且已有文案断言仍需维护者修正）。Codex SDK/App Server 不可用时会保留完整上下文并降级人工处理；代码、游戏仓库和手写文档变更只生成待批准 ChangeSet。Provider 返回图片不等于批准、Release 或 Delivery；Delivery 仍要求用户明确选择 checkout、Release 和验证动作。
+[![资产制作台与角色详情](docs/screenshots/workbench.jpg)](docs/screenshots/workbench.jpg)
 
-M7 叙事地图从同一 Project 资产、不可变修订、类型化关系和 rendition 聚合章节树、场景案卷、关系图与覆盖率。场景编辑仍创建普通候选 Revision；缺失需求先物化为普通 Catalog Asset，再进入现有 M2–M4 计划、预算、QA 和审核闭环，不引入第二套资产 ID、批准状态或发布语义。
+### 叙事地图
 
-实施顺序、P0 风险和每个里程碑的完成标准见 [路线图](docs/roadmap.md)。
+沿章节与场景浏览剧情，通过关系图谱和覆盖率面板检查资源就绪情况。
 
-## 安装与启动
+[![叙事地图、场景关系与资源覆盖](docs/screenshots/narrative-map.jpg)](docs/screenshots/narrative-map.jpg)
 
-要求 Node.js 20+、Python 3.13+ 和 [uv](https://docs.astral.sh/uv/)。
+### 生成中心
+
+在会话中梳理需求，在方案面板中复核资源、任务类型、模型和输出路径。
+
+[![生成中心与生成方案](docs/screenshots/generation-plan.jpg)](docs/screenshots/generation-plan.jpg)
+
+<details>
+<summary><strong>查看生成结果、媒体审核与运行检查器</strong></summary>
+
+#### 生成结果
+
+逐项查看生成与 QA 状态，并进入资产库审核候选。
+
+[![生成结果与候选状态](docs/screenshots/generation-results.jpg)](docs/screenshots/generation-results.jpg)
+
+#### 媒体审核
+
+对比候选与已批准修订，查看尺寸、透明通道、主体覆盖率与残余色键等硬 QA 结果。
+
+[![媒体版本比较与硬 QA](docs/screenshots/media-review.jpg)](docs/screenshots/media-review.jpg)
+
+#### 运行检查器
+
+检查任务 DAG、调用预算、流水线阶段、Attempt 台账与人工处理入口。
+
+[![运行检查器与调用台账](docs/screenshots/run-inspector.jpg)](docs/screenshots/run-inspector.jpg)
+
+</details>
+
+<details>
+<summary><strong>查看项目规范、供应商渠道与模型管理</strong></summary>
+
+#### 项目规范
+
+将风格圣经等制作规范作为正式资产管理，在检查器中阅读源文档。
+
+[![项目规范与风格圣经](docs/screenshots/project-specifications.jpg)](docs/screenshots/project-specifications.jpg)
+
+#### 供应商渠道
+
+集中查看渠道连接状态、模型同步情况与各模态模型数量。
+
+[![供应商渠道](docs/screenshots/provider-channels.jpg)](docs/screenshots/provider-channels.jpg)
+
+#### 模型管理
+
+搜索并配置渠道模型白名单，维护模型类型与可用状态。
+
+[![模型管理与模态分类](docs/screenshots/model-management.jpg)](docs/screenshots/model-management.jpg)
+
+</details>
+
+<details>
+<summary><strong>查看系统设置与 Release 交付</strong></summary>
+
+#### 系统设置
+
+分别配置文本、生图、视频与音频默认路由，以及新计划并发和网络重试默认值。
+
+[![系统设置与默认路由](docs/screenshots/system-settings.jpg)](docs/screenshots/system-settings.jpg)
+
+#### Release 与游戏交付
+
+绑定目标 checkout、选择 Release，并查看历史交付收据。截图中保留了试点的历史失败收据，用于展示交付审计界面。
+
+[![Release 与游戏交付](docs/screenshots/release-delivery.jpg)](docs/screenshots/release-delivery.jpg)
+
+</details>
+
+## 功能特性
+
+| 能力 | 说明 |
+| --- | --- |
+| 统一资产库 | 管理叙事、角色、物品、场景与媒体，维护类型化关系和不可变修订。 |
+| 生成工作台 | 通过会话整理需求、预览生成计划，确认后执行带依赖关系的任务。 |
+| 多供应商路由 | 接入 OpenAI 兼容供应商，分别设置文字和图片模型，支持任务级覆盖。 |
+| 可恢复任务 | 冻结 Prompt、模型、预算和并发配置，使用 lease、heartbeat 与持久化 Attempt 恢复执行。 |
+| QA 与人工审核 | 检查媒体输出、记录问题与证据，支持修复、重试、重新生成和人工批准。 |
+| 叙事地图 | 聚合章节、场景、关联资源与覆盖率，将缺失资源纳入现有生产流程。 |
+| 发布与交付 | 从已批准修订创建 Release，预检并交付到指定游戏 checkout，记录交付收据。 |
+
+生成结果需经过 QA 与人工审核才能进入发布流程。已确认任务保留供应商与模型快照，供应商故障不会自动触发跨供应商回退。
+
+## 快速开始
+
+### 环境要求
+
+- Node.js **20+**，以及 npm。
+- Python **3.13+**。
+- [uv](https://docs.astral.sh/uv/)：Python 依赖与虚拟环境管理工具。
+- 默认数据路径按 macOS 配置；其他环境请显式设置项目与状态目录。
+
+### 安装与启动
 
 ```bash
-npm --prefix apps/web install
+git clone https://github.com/PYPARA/Game-Asset-Management-System.git
+cd Game-Asset-Management-System
+
+# 安装前端和后端依赖
+npm --prefix apps/web ci
 uv sync --all-packages
+
+# 同时启动 Web 与 API
 npm run dev
 ```
 
-默认 Project 容器位于 `~/Library/Mobile Documents/com~apple~CloudDocs/Game-Projects`。可通过 `GAME_ASSETS_PROJECTS_ROOT` 和 `GAME_ASSETS_STATE_DIR` 环境变量覆盖项目与本地状态目录。
+| 服务 | 本地地址 |
+| --- | --- |
+| Web 制作台 | http://127.0.0.1:4173 |
+| API | http://127.0.0.1:8787 |
+| OpenAPI | http://127.0.0.1:8787/openapi.json |
 
-- Web：`http://127.0.0.1:4173`
-- API：`http://127.0.0.1:8787`
-- OpenAPI：`http://127.0.0.1:8787/openapi.json`
+### 首次使用
 
-## 测试
+1. 准备符合下方契约的 Project，并放入项目容器目录。
+2. 启动制作台，选择项目并扫描资产。
+3. 在供应商设置中配置 Base URL、文字/图片模型和凭据。
+4. 创建生成会话，复核计划与预算后执行；审核候选结果，再创建 Release 并交付。
 
-```bash
-npm run build
-npm test
+完整流程见[用户操作手册](docs/user-guide.md)。调用生成供应商可能产生费用，请在确认计划前核对模型与预算。
+
+### 自定义数据目录
+
+默认 Project 容器：
+
+```text
+~/Library/Mobile Documents/com~apple~CloudDocs/Game-Projects
 ```
 
-## 数据与安全边界
+默认本地状态目录：
 
-- iCloud 中的 `Game-Projects` 应保持“已下载”状态；不要在多台 Mac 上同时运行会写入同一 Project 的制作台，文件锁只在本机生效。
-- Project 文件可提交；`workspace`、`project.local.yaml` 和系统 SQLite 不提交。
-- PNG 母版与批准 WebP 作为普通 Git 文件由 `Game-Projects` 父仓库记录。
-- 浏览器按供应商隔离并加密保存 API Key；明文只在解锁后进入后端进程内存，不写入 Project、SQLite 或事件。
-- 发布操作使用临时文件、`fsync` 和原子替换；只有批准修订进入 Release。
-- 应用不会自动 commit、push 或修改 Git 历史。
+```text
+~/Library/Application Support/Game-Asset-Management-System
+```
+
+通过环境变量覆盖默认路径：
+
+```bash
+export GAME_ASSETS_PROJECTS_ROOT="$HOME/Game-Projects"
+export GAME_ASSETS_STATE_DIR="$HOME/.local/share/game-assets"
+npm run dev
+```
+
+Project 容器存放多个独立项目；SQLite 保存可重建索引和任务状态。环境变量应在启动 API 前设置。
+
+## 项目结构
+
+```text
+Game-Asset-Management-System/
+├── apps/
+│   ├── web/                 # React + TypeScript + Vite 制作台
+│   └── api/                 # FastAPI 服务、数据库迁移与测试
+├── packages/
+│   └── emperor_adapter/     # Emperor-Simulator 适配器
+├── scripts/                 # 开发启动、试点与验收脚本
+├── docs/                    # 架构、操作指南与实现文档
+├── package.json             # 开发、构建和测试命令
+├── pyproject.toml           # uv workspace 配置
+└── uv.lock                  # Python 依赖锁文件
+```
+
+### Project 数据契约
+
+每个 Project 根目录必须包含 `format_version: 1` 的 `project.yaml`：
+
+```text
+My-Game-Project/
+├── project.yaml             # 项目声明
+├── catalog/                 # 内容、实体、媒体与关系
+├── schemas/                 # 项目数据 Schema
+├── production/              # 风格、Prompt 与制作母版
+├── approved/                # 已批准的运行资源
+├── history/                 # 修订、审核、QA 与交付记录
+├── releases/                # 不可变发布清单
+└── workspace/               # 候选、驳回、缓存与日志（不提交）
+```
+
+Project 文件是权威数据源，SQLite 索引可通过扫描重建。项目格式与交付约束见[架构说明](docs/architecture.md)和[Release 与交付](docs/release-delivery.md)。
+
+## 开发与验证
+
+```bash
+# 分别启动前端或后端
+npm run dev:web
+npm run dev:api
+
+# 前端类型检查与生产构建
+npm run build
+
+# 全部测试，或仅运行一侧
+npm test
+npm run test:web
+npm run test:api
+
+# M6 离线验收
+npm run acceptance:m6
+```
+
+`npm run dev:web` 单独运行时使用 Vite 默认端口；`npm run dev` 将 Web 固定在 `4173`。验收范围与历史记录见[M6 发布验收](docs/m6-release.md)；功能进展见[路线图](docs/roadmap.md)。
+
+## 数据管理
+
+- API 仅监听本机回环地址；当前应用以本地工作流为基础。
+- 使用 iCloud 时，先确保项目已下载；同一 Project 的写入应在一台 Mac 上进行，文件锁仅在本机生效。
+- Project 正式内容、批准媒体与历史记录可由 Git 管理；`workspace/`、`project.local.yaml` 与本地 SQLite 不应提交。
+- 浏览器按供应商加密保存 API Key；解锁后的明文仅保存在后端进程内存，不写入 Project、SQLite 或任务事件。
+- Release 只包含已批准修订；交付需要明确选择 checkout、Release 与验证动作。
+- 应用不会自动提交、推送或修改 Git 历史。
 
 ## 文档
 
-- [路线图](docs/roadmap.md)
-- [系统主逻辑](docs/system-logic.md)
-- [架构说明](docs/architecture.md)
-- [Codex 监督式智能生产](docs/agentic-production.md)
-- [Release 与游戏项目交付](docs/release-delivery.md)
-- [M5 Emperor-Simulator 试点](docs/m5-pilot.md)
-- [M6 v1 发布验收](docs/m6-release.md)
-- [M7 v1.1 叙事地图验收](docs/m7-narrative-map.md)
-- [用户操作手册](docs/user-guide.md)
-- [故障手册](docs/troubleshooting.md)
-- [格式升级策略](docs/format-upgrades.md)
-- [资产库分类](docs/asset-library.md)
-- [API 说明](apps/api/README.md)
-- [设计参考](docs/design/README.md)
+| 文档 | 内容 |
+| --- | --- |
+| [用户操作手册](docs/user-guide.md) | 从首次启动到审核与交付 |
+| [系统主逻辑](docs/system-logic.md) | 核心概念与完整工作流 |
+| [架构说明](docs/architecture.md) | 数据边界、模块与项目契约 |
+| [资产库分类](docs/asset-library.md) | 资产类型与组织方式 |
+| [智能生产](docs/agentic-production.md) | 生成计划与监督诊断 |
+| [Release 与交付](docs/release-delivery.md) | 发布清单、验证与恢复 |
+| [API 说明](apps/api/README.md) | 后端接口与 CLI |
+| [故障手册](docs/troubleshooting.md) | 常见问题与恢复方法 |
+| [格式升级策略](docs/format-upgrades.md) | 数据格式演进 |
+| [路线图](docs/roadmap.md) | 里程碑与验收记录 |
+| [M5 试点](docs/m5-pilot.md) · [M6 验收](docs/m6-release.md) · [M7 叙事地图](docs/m7-narrative-map.md) | 分阶段验证与试点记录 |
+
+## 参与开发
+
+欢迎通过 [Issues](https://github.com/PYPARA/Game-Asset-Management-System/issues) 提交问题和功能建议。报告问题时请附上复现步骤、运行环境与脱敏后的错误信息；提交代码前请运行相关测试，并同步更新受影响的文档。

@@ -1,24 +1,42 @@
+# JavaScript dependencies and package-manager caches
 node_modules/
+node_cache/
 .npm-cache/
-.uv-cache
-.codex
-.playwright-cli
 .pnpm-store/
+
+# Build output and local browser artifacts
 dist/
 coverage/
-node_cache
-output
+output/
+.playwright-cli/
+playwright-report/
+test-results/
+*.tsbuildinfo
 
+# Python environments and caches
+.venv/
+.uv-cache/
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-.venv/
 *.egg-info/
 
+# Local environment and tool settings
+.env
+.env.*
+!.env.example
+!.env.*.example
+.codex/
+.claude/settings.local.json
+
+# Local runtime state and operating-system files
 .DS_Store
 *.log
 *.sqlite
 *.sqlite3
-
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
